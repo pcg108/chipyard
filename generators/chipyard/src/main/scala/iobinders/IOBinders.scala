@@ -3,6 +3,7 @@ package chipyard.iobinders
 import chisel3._
 import chisel3.reflect.DataMirror
 import chisel3.experimental.Analog
+import chisel3.util.Decoupled
 
 import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy._
@@ -39,7 +40,7 @@ import testchipip.cosim.{CanHaveTraceIO, TraceOutputTop, SpikeCosimConfig}
 import testchipip.tsi.{CanHavePeripheryUARTTSI, UARTTSIIO}
 import icenet.{CanHavePeripheryIceNIC, SimNetwork, NicLoopback, NICKey, NICIOvonly}
 import chipyard.{CanHaveMasterTLMemPort, ChipyardSystem, ChipyardSystemModule}
-import chipyard.example.{CanHavePeripheryGCD}
+import chipyard.example.{CanHavePeripheryGCD, CanHavePeripheryGraphics, GraphicsKey} 
 
 import scala.reflect.{ClassTag}
 
@@ -575,5 +576,18 @@ class WithOffchipBusSel extends OverrideIOBinder({
       val (port, cells) = IOCell.generateIOFromSignal(sel, "obus_sel", sys.p(IOCellKey))
       (Seq(OffchipSelPort(() => port)), cells)
     }.getOrElse(Nil, Nil)
+  }
+})
+
+// connects the port from the peripheral module (n) to a top-level port (n)
+class WithGraphicsIOPunchthrough extends OverrideIOBinder({
+  (system: CanHavePeripheryGraphics) => {
+    val ports = system.graphicsio.map ({ n =>
+      val p = GetSystemParameters(system)
+      val port = IO(new ClockedIO(new GraphicsPortPeripheralIO)).suggestName(s"graphicsTL")
+      port <> n
+      GraphicsPort(() => port, p(GraphicsKey).get)
+    }).toSeq
+    (ports, Nil)
   }
 })

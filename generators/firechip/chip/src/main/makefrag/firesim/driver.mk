@@ -21,7 +21,7 @@ testchipip_csrc_dir = $(chipyard_dir)/generators/testchipip/src/main/resources/t
 # fesvr and related srcs
 DRIVER_H += \
 		$(shell find $(testchipip_csrc_dir) -name "*.h") \
-		$(shell find $(firechip_bridgestubs_lib_dir)/fesvr -name "*.h")
+		$(shell find $(firechip_bridgestubs_lib_dir)/fesvr -name "*.h") 
 DRIVER_CC += \
 		$(testchipip_csrc_dir)/cospike_impl.cc \
 		$(testchipip_csrc_dir)/testchip_tsi.cc \

@@ -82,11 +82,11 @@ alveo_u250_firesim_rocket_quadcore_no_nic:
     deploy_quintuplet_override: null
     deploy_makefrag_override: ../../generators/firechip/chip/src/main/makefrag/firesim
     custom_runtime_config: null
-alveo_u250_firesim_boom_singlecore_no_nic:
-    bitstream_tar: https://raw.githubusercontent.com/firesim/firesim-public-bitstreams/94f0e9cbeebdf4f018533829e3bff503f382c943/xilinx_alveo_u250/alveo_u250_firesim_boom_singlecore_no_nic.tar.gz
-    deploy_quintuplet_override: null
-    deploy_makefrag_override: ../../generators/firechip/chip/src/main/makefrag/firesim
-    custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: https://raw.githubusercontent.com/firesim/firesim-public-bitstreams/94f0e9cbeebdf4f018533829e3bff503f382c943/xilinx_alveo_u250/alveo_u250_firesim_boom_singlecore_no_nic.tar.gz
+#     deploy_quintuplet_override: null
+#     deploy_makefrag_override: ../../generators/firechip/chip/src/main/makefrag/firesim
+#     custom_runtime_config: null
 alveo_u250_firesim_rocket_singlecore_nic:
     bitstream_tar: https://raw.githubusercontent.com/firesim/firesim-public-bitstreams/d8e0d2535f2cae6834d8acc25fdc0c9c26230d28/xilinx_alveo_u250/alveo_u250_firesim_rocket_singlecore_nic.tar.gz
     deploy_quintuplet_override: null
@@ -116,4 +116,8 @@ nitefury_firesim_rocket_singlecore_no_nic:
     bitstream_tar: https://raw.githubusercontent.com/firesim/firesim-public-bitstreams/4fed63d5a4836de28ac69edf2620d304615572c9/rhsresearch_nitefury_ii/nitefury_firesim_rocket_singlecore_no_nic.tar.gz
     deploy_quintuplet_override: null
     deploy_makefrag_override: ../../generators/firechip/chip/src/main/makefrag/firesim
+    custom_runtime_config: null
+alveo_u250_firesim_boom_singlecore_no_nic:
+    bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-08--22-28-17-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+    deploy_quintuplet_override: null
     custom_runtime_config: null

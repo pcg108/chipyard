@@ -10,6 +10,7 @@ import freechips.rocketchip.subsystem._
 import sifive.blocks.devices.uart._
 import testchipip.serdes.{DecoupledExternalSyncPhitIO}
 import testchipip.tsi.{SerialRAM}
+import testchipip.util.{ClockedIO}
 
 import chipyard.iocell._
 import chipyard.iobinders._
@@ -141,12 +142,18 @@ class WithSuccessBridge extends HarnessBinder({
   }
 })
 
+class WithGraphicsBridge extends HarnessBinder({
+  case (th: FireSim, port: GraphicsPort, chipId: Int) =>
+    GraphicsBridge(port.io.clock, port.io.bits, th.harnessBinderReset.asBool)(th.p)
+})
+
 // Shorthand to register all of the provided bridges above
 class WithDefaultFireSimBridges extends Config(
   new WithTSIBridgeAndHarnessRAMOverSerialTL ++
   new WithDMIBridge ++
   new WithNICBridge ++
   new WithUARTBridge ++
+  new WithGraphicsBridge ++
   new WithBlockDeviceBridge ++
   new WithFASEDBridge ++
   new WithFireSimMultiCycleRegfile ++

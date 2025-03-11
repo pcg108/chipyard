@@ -19,6 +19,11 @@ import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
 
+import chipyard.example.{GraphicsParams}
+import chisel3.util.Decoupled
+
+
+
 trait Port[T <: Data] {
   val getIO: () => T
   // port.io should only be called in the TestHarness context
@@ -115,3 +120,20 @@ case class GCDBusyPort     (val getIO: () => Bool)
 case class OffchipSelPort  (val getIO: () => UInt)
     extends Port[UInt]
 
+class GraphicsPortPeripheralIO extends Bundle {
+
+  val rx = Flipped(Decoupled(UInt(32.W)))
+  val hostTransmit = Input(Bool())
+
+  val tx = Decoupled(UInt(32.W))
+  val guestTransmit = Output(Bool())
+
+  val rx_stream = Flipped(Decoupled(UInt(512.W)))
+  val tx_stream = Decoupled(UInt(512.W))
+
+  val stream_req_rx = Flipped(Decoupled(UInt(32.W)))
+  val stream_req_tx = Flipped(Decoupled(UInt(32.W)))
+}
+
+case class GraphicsPort (val getIO: () => ClockedIO[GraphicsPortPeripheralIO], val params: GraphicsParams)
+    extends Port[ClockedIO[GraphicsPortPeripheralIO]]
