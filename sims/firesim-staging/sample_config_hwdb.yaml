@@ -117,7 +117,27 @@ nitefury_firesim_rocket_singlecore_no_nic:
     deploy_quintuplet_override: null
     deploy_makefrag_override: ../../generators/firechip/chip/src/main/makefrag/firesim
     custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-08--22-28-17-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+#     deploy_quintuplet_override: null
+#     custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-17--18-48-59-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+#     deploy_quintuplet_override: null
+#     custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-18--00-56-40-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-WithAutoILA_BaseXilinxAlveoU250Config/firesim.tar.gz
+#     deploy_quintuplet_override: null
+#     custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-19--23-56-47-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+#     deploy_quintuplet_override: null
+#     custom_runtime_config: null
+# alveo_u250_firesim_boom_singlecore_no_nic:
+#     bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-23--07-20-21-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+#     deploy_quintuplet_override: null
+#     custom_runtime_config: null
 alveo_u250_firesim_boom_singlecore_no_nic:
-    bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-08--22-28-17-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+    bitstream_tar: file:///scratch/prashanth/chipyard/sims/firesim/deploy/results-build/2025-03-24--01-17-07-alveo_u250_firesim_boom_singlecore_no_nic/cl_xilinx_alveo_u250-firesim-FireSim-FireSimLargeBoomConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
     deploy_quintuplet_override: null
     custom_runtime_config: null

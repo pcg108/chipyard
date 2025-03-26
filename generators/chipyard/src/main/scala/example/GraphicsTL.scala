@@ -50,7 +50,7 @@ class GraphicsTopIO extends Bundle {
   val guestTransmit = Output(Bool())
 
   // indicates if the DMA is in idle state
-  val memDone = Input(Bool())
+  // val memReady = Input(Bool())
 
 }
 
@@ -104,7 +104,7 @@ class GraphicsTL(params: GraphicsParams, beatBytes: Int)(implicit p: Parameters)
       val rx_data = Wire(Decoupled(UInt(params.width.W)))
       val hostTransmit = Wire(Bool())
 
-      val status = Wire(UInt(3.W))
+      val status = Wire(UInt(2.W))
 
       // Drive the Chip top level IO transmit with data coming from the target
       io.guestTransmit := guestTransmit
@@ -120,11 +120,12 @@ class GraphicsTL(params: GraphicsParams, beatBytes: Int)(implicit p: Parameters)
       // the status register should indicate to the target whether:
       // - we are ready to accept input data
       // - if there is valid output data
-      status := Cat(io.memDone, impl.io.tx.enq.ready, impl.io.rx.deq.valid)
+      status := Cat(impl.io.tx.enq.ready, impl.io.rx.deq.valid)
+      // status := Cat(io.memReady, impl.io.tx.enq.ready, impl.io.rx.deq.valid)
 
       node.regmap(
         0x00 -> Seq(
-          RegField.r(3, status)), // a read-only register capturing current status
+          RegField.r(2, status)), // a read-only register capturing current status
         0x04 -> Seq(
           RegField.w(params.width, tx_data)), // register to write tx_data
         0x08 -> Seq(
@@ -150,11 +151,11 @@ class GraphicsPortPeripheralIO extends Bundle {
   val tx = Decoupled(UInt(32.W))
   val guestTransmit = Output(Bool())
 
-  val rx_stream = Flipped(Decoupled(UInt(512.W)))
-  val tx_stream = Decoupled(UInt(512.W))
+  // val rx_stream = Flipped(Decoupled(UInt(512.W)))
+  // val tx_stream = Decoupled(UInt(512.W))
 
-  val stream_req_rx = Flipped(Decoupled(UInt(32.W)))
-  val stream_req_tx = Flipped(Decoupled(UInt(32.W)))
+  // val stream_req_rx = Flipped(Decoupled(UInt(32.W)))
+  // val stream_req_tx = Flipped(Decoupled(UInt(32.W)))
 }
 
 // this is a trait that instantiates the TL module defined above, and sends the ports to the toplevel of the chip
@@ -173,9 +174,9 @@ trait CanHavePeripheryGraphics { this: BaseSubsystem =>
 
 
       // instantiating the Graphics DMA module
-      val graphicsDMA = LazyModule(new GraphicsDMA(fbus.beatBytes)(p)) 
-      graphicsDMA.clockNode := fbus.fixedClockNode
-      fbus.coupleFrom("graphics-dma") { _ := graphicsDMA.node }
+      // val graphicsDMA = LazyModule(new GraphicsDMA(fbus.beatBytes)(p)) 
+      // graphicsDMA.clockNode := fbus.fixedClockNode
+      // fbus.coupleFrom("graphics-dma") { _ := graphicsDMA.node }
             
       // InModuleBody allows us to punch ports through to top level module (so that it can connect to bridge in this case)
       // so we connect the ports of the MMIOChiselModule we defined above to the ports that are exposed at the top
@@ -189,12 +190,12 @@ trait CanHavePeripheryGraphics { this: BaseSubsystem =>
         outer_io.bits.guestTransmit <> graphicsTL.module.io.guestTransmit
         
         // connect graphicsDMA IO to the outer IO 
-        outer_io.bits.rx_stream <> graphicsDMA.module.io.rx 
-        outer_io.bits.tx_stream <> graphicsDMA.module.io.tx
-        outer_io.bits.stream_req_rx <> graphicsDMA.module.io.req_rx
-        outer_io.bits.stream_req_tx <> graphicsDMA.module.io.req_tx
+        // outer_io.bits.rx_stream <> graphicsDMA.module.io.rx 
+        // outer_io.bits.tx_stream <> graphicsDMA.module.io.tx
+        // outer_io.bits.stream_req_rx <> graphicsDMA.module.io.req_rx
+        // outer_io.bits.stream_req_tx <> graphicsDMA.module.io.req_tx
 
-        graphicsTL.module.io.memDone := graphicsDMA.module.io.mem_done
+        // graphicsTL.module.io.memReady := graphicsDMA.module.io.mem_ready
 
         outer_io
       }

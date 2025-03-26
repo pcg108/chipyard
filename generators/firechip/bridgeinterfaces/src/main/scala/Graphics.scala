@@ -25,12 +25,12 @@ class GraphicsPortIO extends Bundle {
   val guestTransmit = Output(Bool())
 
   // DMA/Streaming ports
-  val rx_stream = Flipped(Decoupled(UInt(512.W)))
-  val tx_stream = Decoupled(UInt(512.W))
+  // val rx_stream = Flipped(Decoupled(UInt(512.W)))
+  // val tx_stream = Decoupled(UInt(512.W))
 
-  // stream request
-  val stream_req_rx = Flipped(Decoupled(UInt(32.W)))
-  val stream_req_tx = Flipped(Decoupled(UInt(32.W)))
+  // // stream request
+  // val stream_req_rx = Flipped(Decoupled(UInt(32.W)))
+  // val stream_req_tx = Flipped(Decoupled(UInt(32.W)))
 
 }
 

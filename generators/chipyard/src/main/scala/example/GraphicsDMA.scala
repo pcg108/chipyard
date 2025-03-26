@@ -7,6 +7,7 @@ import org.chipsalliance.cde.config.{Parameters, Field, Config}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.prci._
+import midas.targetutils.{SynthesizePrintf}
 
 /*
 Goal of DMA device is to write the data from the GraphicsTL peripheral to memory (rx_stream_data) 
@@ -35,7 +36,7 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
 
       val req_tx = Flipped(Decoupled(UInt(32.W)))   
 
-      val mem_done = Output(Bool())
+      val mem_ready = Output(Bool())
   
     })   
 
@@ -91,15 +92,15 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
       val reading = RegInit(false.B)
 
       // for reading read responses
+      // val shift_const: Int = beatBytes*8
+      // val shift_amt = RegInit(0.U(log2Ceil(blockBytes).W)) 
       val shift_amt: Int = beatBytes*8
 
       val addr = Reg(UInt(addrBits.W))
       val bytesLeft = RegInit(0.U(32.W))
 
       // indicate to target when memory operation is complete 
-      val memDone = RegInit(false.B)
-      dontTouch(memDone)
-      io.mem_done := memDone
+      io.mem_ready := (state == s_init).asBool
 
       // buffers to hold read/write data
       val write_buffer  = RegInit(0.U(512.W))
@@ -141,11 +142,10 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
           
           when(reqfifo_stream.io.deq.fire) {                // serve write request
             bytesLeft := reqfifo_stream.io.deq.bits
-            memDone := false.B
+            
             state := s_write 
           } .elsewhen(transfifo_stream.io.deq.fire) {       // serve read request
             bytesLeft := transfifo_stream.io.deq.bits
-            memDone := false.B
             reading := true.B
             read_buffer := 0.U(512.W)
             state := s_read 
@@ -163,6 +163,7 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
         }
         is(s_read) {
 
+          // SynthesizePrintf(printf("[DMA] Entered s_read: state: %d, reading: %d, read_buffer: %x, bytesLeft: %x, txfifo_stream.io.enq.ready: %d, txfifo_stream.io.enq.valid: %d, txfifo_stream.io.deq.ready: %d, txfifo_stream.io.deq.valid: %d \n", state, reading, read_buffer, bytesLeft, txfifo_stream.io.enq.ready, txfifo_stream.io.enq.valid, txfifo_stream.io.deq.ready, txfifo_stream.io.deq.valid))
           // When the txfifo is ready to accept the next chunk of data, we proceed to read it
           when(txfifo_stream.io.enq.ready) {
             state := s_chunk
@@ -171,6 +172,7 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
         }
         is(s_chunk) {
 
+          // SynthesizePrintf(printf("[DMA] Entered s_read: state: %d, reading: %d, read_buffer: %x, bytesLeft: %x, txfifo_stream.io.enq.ready: %d, txfifo_stream.io.enq.valid: %d, txfifo_stream.io.deq.ready: %d, txfifo_stream.io.deq.valid: %d \n", state, reading, read_buffer, bytesLeft, txfifo_stream.io.enq.ready, txfifo_stream.io.enq.valid, txfifo_stream.io.deq.ready, txfifo_stream.io.deq.valid))
           // on the last beat of this transaction on the A channel, move to response state to check D channel
           when(edge.done(mem.a)) {
             rw_bytes := rw_bytes + blockBytes.U      
@@ -189,13 +191,17 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
               // in a read, AccessAckData may take multiple beats to transfer the data for this chunk
               // stay in s_resp until all the beats for this are done, and accumulate the output data
 
-              read_buffer := (read_buffer << shift_amt) + mem.d.bits.data
+              // SynthesizePrintf(printf("[DMA] Entered s_read: state: %d, reading: %d, read_buffer: %x, bytesLeft: %x, txfifo_stream.io.enq.ready: %d, txfifo_stream.io.enq.valid: %d, txfifo_stream.io.deq.ready: %d, txfifo_stream.io.deq.valid: %d \n", state, reading, read_buffer, bytesLeft, txfifo_stream.io.enq.ready, txfifo_stream.io.enq.valid, txfifo_stream.io.deq.ready, txfifo_stream.io.deq.valid))
+
+              // read_buffer := (read_buffer << shift_amt) + mem.d.bits.data
+              // read_buffer := (mem.d.bits.data << shift_amt) + read_buffer
+              read_buffer := Cat(mem.d.bits.data, read_buffer(511, shift_amt))
 
               // when we have received all beats of AccessAckData, go back to s_init if that is the last chunk, or s_read if we have not read enough bytes yet 
               when (edge.done(mem.d)) {
                 when (bytesLeft === 0.U) {
+                  // SynthesizePrintf(printf("[DMA] all done"))
                   state := s_init
-                  memDone := true.B
                 }.otherwise {
                   state := s_read
                 }
@@ -206,7 +212,6 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
             }.otherwise {
               // in a write, AccessAck response only takes 1 beat so we can determine what to do on the next cycle
               when (bytesLeft === 0.U) {
-                memDone := true.B
                 state := s_init
               }.otherwise {
                 state := s_write
@@ -220,9 +225,9 @@ class GraphicsDMA(beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomai
         }
       }
 
-
     }
   }
+
 }
 
 

@@ -54,10 +54,6 @@ object GraphicsBridge {
     ep.io.graphics.guestTransmit := graphicsIO.guestTransmit
     graphicsIO.rx <> ep.io.graphics.rx
     graphicsIO.hostTransmit := ep.io.graphics.hostTransmit
-    graphicsIO.rx_stream <> ep.io.graphics.rx_stream
-    graphicsIO.tx_stream <> ep.io.graphics.tx_stream
-    graphicsIO.stream_req_rx <> ep.io.graphics.stream_req_rx
-    graphicsIO.stream_req_tx <> ep.io.graphics.stream_req_tx
     ep.io.clock := clock
     ep.io.reset := reset
     ep

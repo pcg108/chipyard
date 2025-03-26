@@ -18,8 +18,11 @@
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <algorithm>
 
-#define BUFWIDTH streaming_bridge_driver_t::STREAM_WIDTH_BYTES
+#include <cctype>
+
+#include <unordered_map>
 
 /**
  * Structure carrying the addresses of all fixed MMIO ports.
@@ -37,14 +40,6 @@ struct GRAPHICSBRIDGEMODULE_struct {
   
   uint64_t guest_transmit;
   uint64_t host_transmit;
-
-  uint64_t stream_req_rx_bits;
-  uint64_t stream_req_rx_valid;
-  uint64_t stream_req_rx_ready;
-
-  uint64_t stream_req_tx_bits;
-  uint64_t stream_req_tx_valid;
-  uint64_t stream_req_tx_ready;
 };
 
 class graphics_handler {
@@ -59,62 +54,65 @@ class graphics_handler {
 
   private:
     const char* SOCKET_PATH = "/tmp/kumquat-gpu-1";
-    const int BUFFER_SIZE = 1024;
-    int server_fd, client_fd;
-    struct sockaddr_un server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    char txbuffer[1024];
+    int sockfd;
+    struct sockaddr_un addr;
+    int BUFFER_SIZE = 1024;
+
+    uint8_t txbuffer[1024];
+    uint8_t rxbuffer[1024];
 
     uint32_t stream_packets[128];
 
     int stream_packet_send_total;
     int stream_packet_send_index;
     
-    char rxbuffer[1024];
     int stream_packet_receive_total;
     int stream_packet_receive_count;
-    
 
-    bool client_connected;
+    std::unordered_map<uint8_t, int> conn_to_rutabaga_id;
+
+    // copy buffer file descriptors
+    std::unordered_map<int, int> copy_buffers;
+
+    // XDMA file descriptors
+    int xdma_h2cfd;
+    int xdma_c2hfd;
+
+    // FPGA host memory size
+    unsigned long long target_dram_addr = (0x88000000 + 0x380000000) % 0x400000000;
+
+    uint8_t* dma_buffer;
+
+    void copy_from_dma(int rutabaga_id, int resource_size);
+    void copy_to_dma(int rutabaga_id, int resource_size);
+    int get_copy_buffer_fd(int rutabaga_id);
 };
 
 
-class graphics_t final : public streaming_bridge_driver_t {
+class graphics_t final : public bridge_driver_t {// public streaming_bridge_driver_t {
 public:
   /// The identifier for the bridge type used for casts.
   static char KIND;
 
   graphics_t(simif_t &simif,
-        StreamEngine &stream,
         const GRAPHICSBRIDGEMODULE_struct &mmio_addrs,
         int graphicsno,
-        const std::vector<std::string> &args,
-        int stream_to_cpu_idx,
-        int stream_to_cpu_depth,
-        int stream_from_cpu_idx,
-        int stream_from_cpu_depth);
+        const std::vector<std::string> &args);
 
   ~graphics_t() override;
 
   void tick() override;
   void finish() override;
 
+
 private:
   const GRAPHICSBRIDGEMODULE_struct mmio_addrs;
   std::unique_ptr<graphics_handler> handler;
 
-  serial_data_t<char> data;
+  serial_data_t<uint32_t> data;
 
   void send();
   void recv();
-
-  const int stream_to_cpu_idx;
-  const int stream_from_cpu_idx;
-  const int stream_to_cpu_depth;
-  const int stream_from_cpu_depth;
-
-  uint8_t* read_buf;
-  uint8_t* write_buf;
 
 };
 

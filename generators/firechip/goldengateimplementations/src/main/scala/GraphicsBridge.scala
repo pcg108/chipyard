@@ -12,6 +12,8 @@ import firesim.lib.bridgeutils._
 
 import firechip.bridgeinterfaces._
 
+import midas.targetutils.{FpgaDebug, SynthesizePrintf}
+
 //Note: This file is heavily commented as it serves as a bridge walkthrough
 //example in the FireSim docs
 
@@ -26,19 +28,12 @@ import firechip.bridgeinterfaces._
 // don't match, you'll only find out later when Golden Gate attempts to generate your module.
 class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters) 
   extends BridgeModule[HostPortIO[GraphicsBridgeTargetIO]]()(p) 
-  with StreamToHostCPU
-  with StreamFromHostCPU {
-
-  val fromHostCPUQueueDepth = 6144
-  val toHostCPUQueueDepth   = 6144
+  {
 
   lazy val module = new BridgeModuleImp(this) {
 
     val hostTransmit = RegInit(false.B)
     val guestTransmit = RegInit(false.B)
-
-    val stream_req_rx = Wire(Flipped(Decoupled(UInt(32.W))))
-    val stream_req_tx = Wire(Flipped(Decoupled(UInt(32.W))))
 
     // This creates the interfaces for all of the host-side transport
     // AXI4-lite for the simulation control bus, =
@@ -64,8 +59,8 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
 
     val fire = hPort.toHost.hValid &&   // We have a valid input token: toHost ~= leaving the transformed RTL
                hPort.fromHost.hReady && // We have space to enqueue a new output token
-               txfifo.io.enq.ready &&   // We have space to capture new TX data
-               streamEnq.ready          // An input from the stream engine saying that it is ready to accept data for sending to CPU
+               txfifo.io.enq.ready       // We have space to capture new TX data
+                                        // An input from the stream engine saying that it is ready to accept data for sending to CPU
     val targetReset = fire & hPort.hBits.reset
     rxfifo.reset := reset.asBool || targetReset
     txfifo.reset := reset.asBool || targetReset
@@ -104,20 +99,6 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
     target.hostTransmit := hostTransmit
     guestTransmit := target.guestTransmit
 
-    // connect DMA/streaming
-    // don't need intermediate registers to expose to MMIO for DMA because bridge driver uses push and pull to interface with streamEnq directly
-    // streamEnq goes from target -> host, so we write the bits that are sent to bridge driver
-    streamEnq.bits := target.tx_stream.bits
-    streamEnq.valid := target.tx_stream.valid && fire
-    target.tx_stream.ready := streamEnq.ready
-    
-    // streamDeq goes from host -> target, so we read the bits coming from bridge driver (chunks of 512 bits)
-    target.rx_stream.bits := streamDeq.bits 
-    target.rx_stream.valid := streamDeq.valid
-    streamDeq.ready := target.rx_stream.ready && fire
-
-    target.stream_req_rx <> stream_req_rx
-    target.stream_req_tx <> stream_req_tx
 
     // DOC include start: UART Bridge Footer
     // Exposed the head of the queue and the valid bit as a read-only registers
@@ -140,14 +121,6 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
 
     // the bridge driver will write to this register when the host is transmitting a stream message
     Pulsify(genWORegInit(hostTransmit, "host_transmit", false.B), pulseLength = 1)
-
-    genWOReg(stream_req_rx.bits, "stream_req_rx_bits")
-    Pulsify(genWORegInit(stream_req_rx.valid, "stream_req_rx_valid", false.B), pulseLength = 1)
-    genROReg(stream_req_rx.ready, "stream_req_rx_ready")
-
-    genWOReg(stream_req_tx.bits, "stream_req_tx_bits")
-    Pulsify(genWORegInit(stream_req_tx.valid, "stream_req_tx_valid", false.B), pulseLength = 1)
-    genROReg(stream_req_tx.ready, "stream_req_tx_ready")
     
 
     // This method invocation is required to wire up all of the MMIO registers to
@@ -160,14 +133,7 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
         base, 
         sb, 
         "graphics_t", 
-        "graphics", 
-        Seq(
-            UInt32(toHostStreamIdx),
-            UInt32(toHostCPUQueueDepth),
-            UInt32(fromHostStreamIdx),
-            UInt32(fromHostCPUQueueDepth),
-          ),
-        hasStreams = true)
+        "graphics")
     }
   }
 }
