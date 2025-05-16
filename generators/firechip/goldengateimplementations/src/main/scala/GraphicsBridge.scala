@@ -48,6 +48,13 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
     val rxfifo = Module(new Queue(UInt(32.W), 128))
     val txfifo = Module(new Queue(UInt(32.W), 128))
 
+    // when the bridge driver pulses hostTransmit, toggle the target pause state
+    // starts false so target starts running
+    val pauseTarget = RegInit(false.B)
+    when(hostTransmit.asBool) {
+      pauseTarget := ~pauseTarget
+    }
+
     val target = hPort.hBits.graphics
     // In general, your BridgeModule will not need to do work every host-cycle. In simple Bridges,
     // we can do everything in a single host-cycle -- fire captures all of the
@@ -59,8 +66,9 @@ class GraphicsBridgeModule(key: GraphicsBridgeKey)(implicit p: Parameters)
 
     val fire = hPort.toHost.hValid &&   // We have a valid input token: toHost ~= leaving the transformed RTL
                hPort.fromHost.hReady && // We have space to enqueue a new output token
-               txfifo.io.enq.ready       // We have space to capture new TX data
-                                        // An input from the stream engine saying that it is ready to accept data for sending to CPU
+               txfifo.io.enq.ready  &&     // We have space to capture new TX data
+               ~pauseTarget // target is not supposed to be paused
+               
     val targetReset = fire & hPort.hBits.reset
     rxfifo.reset := reset.asBool || targetReset
     txfifo.reset := reset.asBool || targetReset

@@ -42,50 +42,35 @@ struct GRAPHICSBRIDGEMODULE_struct {
   uint64_t host_transmit;
 };
 
+class graphics_t;
+
 class graphics_handler {
   public:
     virtual ~graphics_handler() = default;
 
-    graphics_handler();
+    graphics_handler(graphics_t* driver);
   
     std::optional<uint32_t> get();
     void put(uint32_t data);
     void close();
 
   private:
-    const char* SOCKET_PATH = "/tmp/kumquat-gpu-1";
+    const char* SOCKET_PATH = "/tmp/illixr-host";
     int sockfd;
     struct sockaddr_un addr;
     int BUFFER_SIZE = 1024;
 
-    uint8_t txbuffer[1024];
-    uint8_t rxbuffer[1024];
-
-    uint32_t stream_packets[128];
-
-    int stream_packet_send_total;
-    int stream_packet_send_index;
+    uint32_t txbuffer[50];
+    uint32_t rxbuffer[50];
     
-    int stream_packet_receive_total;
-    int stream_packet_receive_count;
+    int packet_receive_total;
+    int packet_receive_count;
 
-    std::unordered_map<uint8_t, int> conn_to_rutabaga_id;
+    uint32_t packet_send_total;
+    int packet_send_count;
 
-    // copy buffer file descriptors
-    std::unordered_map<int, int> copy_buffers;
+    graphics_t* driver;
 
-    // XDMA file descriptors
-    int xdma_h2cfd;
-    int xdma_c2hfd;
-
-    // FPGA host memory size
-    unsigned long long target_dram_addr = (0x88000000 + 0x380000000) % 0x400000000;
-
-    uint8_t* dma_buffer;
-
-    void copy_from_dma(int rutabaga_id, int resource_size);
-    void copy_to_dma(int rutabaga_id, int resource_size);
-    int get_copy_buffer_fd(int rutabaga_id);
 };
 
 
@@ -104,6 +89,9 @@ public:
   void tick() override;
   void finish() override;
 
+  void pause_target();
+  void resume_target();
+
 
 private:
   const GRAPHICSBRIDGEMODULE_struct mmio_addrs;
@@ -113,6 +101,8 @@ private:
 
   void send();
   void recv();
+
+  bool target_paused;
 
 };
 

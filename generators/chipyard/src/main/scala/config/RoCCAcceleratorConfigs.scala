@@ -15,10 +15,11 @@ class GemminiRocketConfig extends Config(
 // DOC include end: GemminiRocketConfig
 
 class FPGemminiRocketConfig extends Config(
-  new gemmini.GemminiFP32DefaultConfig ++                         // use FP32Gemmini systolic array GEMM accelerator
+  new gemmini.ChipFP32GemminiConfig ++                         // use FP32Gemmini systolic array GEMM accelerator
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.WithSystemBusWidth(128) ++
   new chipyard.config.AbstractConfig)
+
 
 class LeanGemminiRocketConfig extends Config(
   new gemmini.LeanGemminiConfig ++                                 // use Lean Gemmini systolic array GEMM accelerator

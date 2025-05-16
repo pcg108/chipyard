@@ -181,3 +181,50 @@ class GENV256D128ShuttleCosimConfig extends Config(
   new shuttle.common.WithNShuttleCores(1) ++
   new chipyard.config.AbstractConfig)
 
+
+class GENV256D128ShuttleConfigDualGemmini extends Config(
+  new rerocc.WithReRoCC ++
+  new gemmini.DefaultGemminiConfig ++                              
+  new gemmini.ChipFP32GemminiConfig ++ 
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.genParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class GENV256D128ShuttleConfigGemmini extends Config(
+  new gemmini.DefaultGemminiConfig ++                              
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.genParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+
+class GENV256D128ShuttleConfigFPGemmini extends Config(
+  new gemmini.ChipFP32GemminiConfig ++ 
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.genParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class GENV256D128QuadShuttleConfigGemmini extends Config(
+  new gemmini.DefaultGemminiConfig ++ 
+  new saturn.shuttle.WithShuttleVectorUnit(256, 128, VectorParams.genParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new shuttle.common.WithShuttleTileBeatBytes(16) ++
+  new shuttle.common.WithNShuttleCores(4) ++
+  new chipyard.config.AbstractConfig)
+
+class REFV256D128QuadRocketConfig extends Config(
+  new saturn.rocket.WithRocketVectorUnit(256, 128, VectorParams.refParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new freechips.rocketchip.rocket.WithNHugeCores(4) ++
+  new chipyard.config.AbstractConfig)
+
+class REFV256D128DualRocketConfig extends Config(
+  new saturn.rocket.WithRocketVectorUnit(256, 128, VectorParams.refParams) ++
+  new chipyard.config.WithSystemBusWidth(128) ++
+  new freechips.rocketchip.rocket.WithNHugeCores(2) ++
+  new chipyard.config.AbstractConfig)
