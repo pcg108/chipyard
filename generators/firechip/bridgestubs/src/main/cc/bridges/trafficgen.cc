@@ -233,83 +233,93 @@ void trafficgen_t::init() {
   completed_bundle_ids_read_issued = false;
   reserved_subpartitions_base_idx = 0;
   reserved_subpartitions_base_cycle = 0;
-  reserved_subpartitions_snapshot_words.fill(0);
+  reserved_subpartitions_words.fill(0);
   reserved_subpartitions_by_cycle.clear();
 }
 
 
 size_t trafficgen_t::process_reserved_subpartitions_stream() {
-  reserved_subpartitions_base_idx = static_cast<uint32_t>(
-      read(mmio_addrs.reserved_subpartitions_base_idx));
+
+  // get the start index of the reservedSubPartitions ring buffer
+  reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
   if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
     std::fprintf(stderr,
                  "[trafficgen] reservedSubPartitions baseIdx out of range: %u\n",
                  reserved_subpartitions_base_idx);
     std::abort();
   }
-  reserved_subpartitions_base_cycle =
-      (static_cast<std::uint64_t>(
-           read(mmio_addrs.reserved_subpartitions_base_cycle_high))
-       << 32) |
-      static_cast<std::uint64_t>(
-          read(mmio_addrs.reserved_subpartitions_base_cycle_low));
 
-  const size_t expected_bytes = STREAM_BATCH_BEATS * STREAM_WIDTH_BYTES;
-  std::vector<uint8_t> outbuf(expected_bytes, 0);
-  const auto bytes_received =
-      pull(this->stream_to_host_idx,
-           outbuf.data(),
-           expected_bytes,
-           expected_bytes);
+  // get the base cycle corresponding to the start index
+  reserved_subpartitions_base_cycle =
+      (static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_high)) << 32) |
+      static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_low));
+
+  // pull the entire reservedSubPartitionsByCycle ring buffer snapshot from the stream
+  // should be 1024 cycles x 256 subpartitions bits 
+  std::vector<uint8_t> outbuf(STREAM_BATCH_BYTES, 0);
+  const auto bytes_received = pull(this->stream_to_host_idx, outbuf.data(), STREAM_BATCH_BYTES, STREAM_BATCH_BYTES);
   if (bytes_received == 0) {
     return 0;
   }
-  if (bytes_received != expected_bytes) {
+  if (bytes_received != STREAM_BATCH_BYTES) {
     std::fprintf(stderr,
                  "[trafficgen] expected %zu bytes for reservedSubPartitionsByCycle, got %zu\n",
-                 expected_bytes,
+                 STREAM_BATCH_BYTES,
                  bytes_received);
     std::abort();
   }
 
+  // bridge module packed 2 256-bit bitmaps into a single beat, so unpack them
+  // first into [1024 entries][256 bits = 4 x 64-bit words per entry]
   const auto *words = reinterpret_cast<const uint64_t *>(outbuf.data());
+  // for each beat taken to transmit the reservedSubPartitionsByCycle
   for (size_t beat = 0; beat < STREAM_BATCH_BEATS; ++beat) {
     const size_t beat_word_base = beat * STREAM_WORDS_PER_BEAT;
     const size_t entry_base = beat * 2 * STREAM_WORDS_PER_ENTRY;
-    std::memcpy(&reserved_subpartitions_snapshot_words[entry_base],
+    std::memcpy(&reserved_subpartitions_words[entry_base],
                 &words[beat_word_base],
                 STREAM_WORDS_PER_ENTRY * sizeof(uint64_t));
-    std::memcpy(&reserved_subpartitions_snapshot_words[entry_base + STREAM_WORDS_PER_ENTRY],
+    std::memcpy(&reserved_subpartitions_words[entry_base + STREAM_WORDS_PER_ENTRY],
                 &words[beat_word_base + STREAM_WORDS_PER_ENTRY],
                 STREAM_WORDS_PER_ENTRY * sizeof(uint64_t));
   }
 
+  // decode each logical cycle entry
   reserved_subpartitions_by_cycle.clear();
+  // iterate through every cycle
   for (size_t offset = 0; offset < STREAM_WORD_COUNT; ++offset) {
-    const size_t ring_idx =
-        (static_cast<size_t>(reserved_subpartitions_base_idx) + offset) %
-        STREAM_WORD_COUNT;
+
+    // starting at base index, wrap around the ring buffer 
+    const size_t ring_idx = (static_cast<size_t>(reserved_subpartitions_base_idx) + offset) % STREAM_WORD_COUNT;
+    // get to the 256 bit bitmap for that cycle
     const size_t word_base = ring_idx * STREAM_WORDS_PER_ENTRY;
+
     bool any_reserved = false;
     std::unordered_set<unsigned> reserved_subpartitions;
+    // loop through the 256 bits in 64-bit chunks
     for (size_t word_idx = 0; word_idx < STREAM_WORDS_PER_ENTRY; ++word_idx) {
-      const uint64_t word = reserved_subpartitions_snapshot_words[word_base + word_idx];
+
+      const uint64_t word = reserved_subpartitions_words[word_base + word_idx];
+
+      // skip when no subpartitions are reserved for this chunk
       if (word == 0) {
         continue;
       }
+
+      // if any bit is set, then add that index to the reserved subpartitions for this cycle
       any_reserved = true;
       for (unsigned bit_idx = 0; bit_idx < 64; ++bit_idx) {
         if ((word & (1ULL << bit_idx)) != 0) {
-          reserved_subpartitions.insert(
-              static_cast<unsigned>(word_idx * 64 + bit_idx));
+          reserved_subpartitions.insert(static_cast<unsigned>(word_idx * 64 + bit_idx));
         }
       }
     }
     if (!any_reserved) {
       continue;
     }
-    const std::uint64_t cycle =
-        reserved_subpartitions_base_cycle + static_cast<std::uint64_t>(offset);
+
+    // add this to the reserved_subpartitions_by_cycle map for the given cycle
+    const std::uint64_t cycle = reserved_subpartitions_base_cycle + static_cast<std::uint64_t>(offset);
     reserved_subpartitions_by_cycle.emplace(cycle, std::move(reserved_subpartitions));
   }
 
@@ -461,7 +471,8 @@ void trafficgen_t::tick() {
                  "driver finished streaming\n");
   }
 
-  if (read(mmio_addrs.completed_bundle_ids_snapshot_valid) &&
+  if (read(mmio_addrs.completed_bundle_ids_valid) &&
+      read(mmio_addrs.completed_bundle_count_valid) &&
       !completed_bundle_ids_read_issued) {
     write(mmio_addrs.read_completed_bundle_ids, 1);
     completed_bundle_ids_read_issued = true;

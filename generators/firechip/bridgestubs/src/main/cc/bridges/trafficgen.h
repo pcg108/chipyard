@@ -30,7 +30,8 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t reserved_subpartitions_base_idx;
   uint64_t reserved_subpartitions_base_cycle_low;
   uint64_t reserved_subpartitions_base_cycle_high;
-  uint64_t completed_bundle_ids_snapshot_valid;
+  uint64_t completed_bundle_ids_valid;
+  uint64_t completed_bundle_count_valid;
   uint64_t completed_bundle_count;
 };
 
@@ -70,10 +71,8 @@ public:
   static char KIND;
   static constexpr size_t STREAM_WORD_BITS = 256;
   static constexpr size_t STREAM_WORD_COUNT = 1024;
-  static constexpr size_t STREAM_BATCH_BYTES =
-      (STREAM_WORD_COUNT * STREAM_WORD_BITS) / 8;
-  static constexpr size_t STREAM_BATCH_BEATS =
-      STREAM_BATCH_BYTES / STREAM_WIDTH_BYTES;
+  static constexpr size_t STREAM_BATCH_BYTES = (STREAM_WORD_COUNT * STREAM_WORD_BITS) / 8;
+  static constexpr size_t STREAM_BATCH_BEATS = STREAM_BATCH_BYTES / STREAM_WIDTH_BYTES;
   static constexpr size_t STREAM_WORDS_PER_ENTRY = STREAM_WORD_BITS / 64;
   static constexpr size_t STREAM_WORDS_PER_BEAT = STREAM_WIDTH_BYTES / sizeof(uint64_t);
   static constexpr size_t L2_ACCESS_STREAM_BYTES = STREAM_WIDTH_BYTES;
@@ -117,7 +116,7 @@ private:
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
   std::array<uint64_t, STREAM_WORD_COUNT * STREAM_WORDS_PER_ENTRY>
-      reserved_subpartitions_snapshot_words{};
+      reserved_subpartitions_words{};
   L2SubpartitionReservationsByCycle reserved_subpartitions_by_cycle;
   std::array<uint32_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;

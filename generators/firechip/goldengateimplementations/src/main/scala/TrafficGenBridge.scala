@@ -62,6 +62,17 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val completedBundleIds = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
     val completedBundleCount = RegInit(0.U(6.W))
     val completedBundleIdsValid = RegInit(true.B)
+    val completedBundleCountValid = RegInit(true.B)
+
+    // target can write completed bundle IDs as they occur during traffic generation
+    when(target.completedBundleIdWriteEn) {
+      completedBundleIds(target.completedBundleIdWriteIdx) := target.completedBundleIdWriteData
+      completedBundleIdsValid := true.B
+    }
+    when(target.completedBundleCountWriteEn) {
+      completedBundleCount := target.completedBundleCountWriteData
+      completedBundleCountValid := true.B
+    }
 
     // trigger for bridge driver to read completedBundleIds 
     val readCompletedBundleIds = Wire(Bool())
@@ -74,44 +85,33 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       completedBundleIdsPacked(beat) := Cat((0 until 16).reverse.map(idx => completedBundleIds(beat * 16 + idx)))
     }
 
-    //// streanEnq target->host for reservedSubPartitionsByCycle and completedBundleIds ////
+    //// streamEnq target->host for reservedSubPartitionsByCycle and completedBundleIds ////
 
     // stream is used for both reservedSubPartitionsByCycle and completedBundleIds
     val streamSourceIdle :: streamSourceReservedSubPartitions :: streamSourceCompletedBundleIds :: Nil = Enum(3)
     val streamSource = RegInit(streamSourceIdle)
-    
+
+    // stream bits are either the packed reservedSubPartitionsByCycle or the packed completedBundleIds
     streamEnq.bits := Mux(
       streamSource === streamSourceCompletedBundleIds,
-      completedBundleIdsPacked(streamBeatIdx(0)),
+      completedBundleIdsPacked(streamBeatIdx(0)), // only 2 beats, so only need the least significant bit of streamBeatIdx to index
       reservedStreamBits,
     )
-
-  
-    when(target.completedBundleIdWriteEn) {
-      completedBundleIds(target.completedBundleIdWriteIdx) := target.completedBundleIdWriteData
-      completedBundleIdsValid := true.B
-    }
-
-    when(target.completedBundleCountWriteEn) {
-      completedBundleCount := target.completedBundleCountWriteData
-      completedBundleIdsValid := true.B
-    }
-
-    
-
     val streamActive = streamSource =/= streamSourceIdle
+    val doStreamEnq = DecoupledHelper(streamActive, fire, streamEnq.ready)
+    streamEnq.valid := doStreamEnq.fire(streamEnq.ready)
+
     val streamLastBeat = Mux(
       streamSource === streamSourceCompletedBundleIds,
       streamBeatIdx === (completedBundleIdBeats - 1).U,
       streamBeatIdx === (reservedSubPartitionBeats - 1).U,
     )
-    val doStreamEnq = DecoupledHelper(streamActive, fire, streamEnq.ready)
-    streamEnq.valid := doStreamEnq.fire(streamEnq.ready)
 
+    // state machine to stream reservedSubPartitionsByCycle or completedBundleIds when triggered by bridge driver, and to keep track of stream beat index
     when(readReservedSubPartitions && !streamActive) {
       streamSource := streamSourceReservedSubPartitions
       streamBeatIdx := 0.U
-    }.elsewhen(readCompletedBundleIds && completedBundleIdsValid && !streamActive) {
+    }.elsewhen(readCompletedBundleIds && completedBundleIdsValid && completedBundleCountValid && !streamActive) {
       streamSource := streamSourceCompletedBundleIds
       streamBeatIdx := 0.U
     }.elsewhen(doStreamEnq.fire()) {
@@ -122,6 +122,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         streamBeatIdx := streamBeatIdx + 1.U
       }
     }
+    
 
     //// store L2Access vector from bridge driver to a backing store in the bridge module
     val accessStore = SyncReadMem(key.maxL2AccessEntries, new L2Access)
@@ -229,6 +230,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
+      completedBundleCountValid := true.B
     }
 
 
@@ -245,7 +247,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // bridge driver triggers to read reservedSubpartitionsByCycle from stream
     Pulsify(genWORegInit(readReservedSubPartitions, "read_reserved_subpartitions", false.B), pulseLength = 1)
+    // index into ring buffer
+    genROReg(reservedSubPartitionsBaseIdx, "reserved_subpartitions_base_idx")
+    // base cycle corresponding to the index (split into 2 32-bit registers to use MMIO)
+    genROReg(reservedSubPartitionsBaseCycle(31, 0), "reserved_subpartitions_base_cycle_low")
+    genROReg(reservedSubPartitionsBaseCycle(63, 32), "reserved_subpartitions_base_cycle_high")
 
+    // when completed bundle IDs or count are available, bridge driver can read them
+    genROReg(completedBundleIdsValid, "completed_bundle_ids_valid")
+    genROReg(completedBundleCountValid, "completed_bundle_count_valid")
 
     // generate register definitions for the bridge driver to interact with 
     genWORegInit(uploadCount, "upload_count", 0.U)
@@ -257,10 +267,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(uploadDone, "upload_done")
     genROReg(uploadOverflow, "upload_overflow")
     genROReg(blockedWarpUploadDone, "blocked_warp_upload_done")
-    genROReg(reservedSubPartitionsBaseIdx, "reserved_subpartitions_base_idx")
-    genROReg(reservedSubPartitionsBaseCycle(31, 0), "reserved_subpartitions_base_cycle_low")
-    genROReg(reservedSubPartitionsBaseCycle(63, 32), "reserved_subpartitions_base_cycle_high")
-    genROReg(completedBundleIdsValid, "completed_bundle_ids_snapshot_valid")
+    
+    
+    
     genROReg(completedBundleCount, "completed_bundle_count")
     
 
