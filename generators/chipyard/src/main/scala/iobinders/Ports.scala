@@ -2,6 +2,7 @@ package chipyard.iobinders
 
 import chisel3._
 import chisel3.experimental.{Analog}
+import chisel3.util.Decoupled
 import sifive.blocks.devices.uart.{UARTPortIO}
 import sifive.blocks.devices.spi.{SPIFlashParams, SPIPortIO}
 import sifive.blocks.devices.gpio.{GPIOPortIO}
@@ -19,6 +20,7 @@ import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, Slave
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
+import firechip.bridgeinterfaces.{BlockedWarpBitmap, L2Access}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -118,3 +120,31 @@ case class OffchipSelPort  (val getIO: () => UInt)
 
 case class CTCPort (val getIO: () => Data, val portId: Int) 
     extends Port[Data]
+
+class TrafficGenPortPeripheralIO(val nGenerators: Int) extends Bundle {
+  val targetBusy = Output(Bool())
+  val startTrafficGen = Output(Bool())
+  val currentCycleAfterIssue = Output(UInt(32.W))
+  val completedBundleIdWriteEn = Output(Bool())
+  val completedBundleIdWriteIdx = Output(UInt(5.W))
+  val completedBundleIdWriteData = Output(UInt(32.W))
+  val completedBundleCountWriteEn = Output(Bool())
+  val completedBundleCountWriteData = Output(UInt(6.W))
+  val trafficComplete = Input(Bool())
+  val minIssueCycle = Input(UInt(32.W))
+  val blockedWarpBitmapReady = Input(Bool())
+  val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
+  val blockedWarpQueryEn = Output(Bool())
+  val blockedWarpQueryResp = Input(Bool())
+  val blockedWarpQueryRespValid = Input(Bool())
+  val accessReadAddr = Output(UInt(32.W))
+  val accessReadEn = Output(Bool())
+  val accessReadData = Input(new L2Access)
+  val accessReadDataValid = Input(Bool())
+  val accessStoredCount = Input(UInt(32.W))
+  val uploadDone = Input(Bool())
+  val uploadOverflow = Input(Bool())
+}
+
+case class TrafficGenPort(val getIO: () => ClockedIO[TrafficGenPortPeripheralIO])
+    extends Port[ClockedIO[TrafficGenPortPeripheralIO]]

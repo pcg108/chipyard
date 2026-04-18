@@ -151,6 +151,12 @@ class WithSuccessBridge extends HarnessBinder({
   }
 })
 
+class WithTrafficGenBridge extends HarnessBinder({
+  case (th: FireSim, port: TrafficGenPort, chipId: Int) => {
+    TrafficGenBridge(port.io.clock, port.io.bits, th.harnessBinderReset.asBool)(th.p)
+  }
+})
+
 // Shorthand to register all of the provided bridges above
 class WithDefaultFireSimBridges extends Config(
   new WithTSIBridgeAndHarnessRAMOverSerialTL ++

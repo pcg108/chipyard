@@ -200,6 +200,12 @@ class FireSimRocketConfig extends Config(
   new chipyard.RocketConfig)
 // DOC include end: firesimconfig
 
+class FireSimRocketWithTrafficGenConfig extends Config(
+  new chipyard.example.WithTrafficGen ++
+  new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
+  new WithTrafficGenBridge ++
+  new FireSimRocketConfig)
+
 class FireSimRocket1GiBDRAMConfig extends Config(
   new freechips.rocketchip.subsystem.WithExtMemSize((1 << 30) * 1L) ++
   new FireSimRocketConfig)
@@ -360,5 +366,4 @@ class CTCFireSimConfig extends Config(
   new chipyard.iobinders.WithCTCPunchthrough ++ 
   new FireSimRocketConfig
 )
-
 

@@ -40,7 +40,7 @@ import testchipip.tsi.{CanHavePeripheryUARTTSI, UARTTSIIO}
 import testchipip.ctc.{CanHavePeripheryCTC}
 import icenet.{CanHavePeripheryIceNIC, SimNetwork, NicLoopback, NICKey, NICIOvonly}
 import chipyard.{CanHaveMasterTLMemPort, ChipyardSystem, ChipyardSystemModule}
-import chipyard.example.{CanHavePeripheryGCD}
+import chipyard.example.{CanHavePeripheryGCD, CanHaveTrafficGen}
 
 import scala.reflect.{ClassTag}
 
@@ -628,5 +628,17 @@ class WithCTCPunchthrough extends OverrideIOBinder({
       (CTCPort(() => port, id), Nil)
     }).unzip
     (ports.toSeq, cells.flatten.toSeq)
+  }
+})
+
+// exposes the target TrafficGen control interface to chip top level ports 
+class WithTrafficGenIOPunchthrough extends OverrideIOBinder({
+  (system: CanHaveTrafficGen) => {
+    val ports = system.trafficGenIO.map { n =>
+      val port = IO(new ClockedIO(new TrafficGenPortPeripheralIO)).suggestName("trafficgen")
+      port <> n
+      TrafficGenPort(() => port)
+    }.toSeq
+    (ports, Nil)
   }
 })

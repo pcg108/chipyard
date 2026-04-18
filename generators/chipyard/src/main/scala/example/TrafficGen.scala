@@ -1,0 +1,288 @@
+package chipyard.example
+
+import chisel3._
+import chisel3.util._
+
+import freechips.rocketchip.prci._
+import freechips.rocketchip.subsystem._
+import org.chipsalliance.cde.config.{Config, Field, Parameters}
+import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.regmapper.RegField
+import freechips.rocketchip.tilelink._
+
+import chipyard.iobinders.TrafficGenPortPeripheralIO
+import testchipip.util.ClockedIO
+import firechip.bridgeinterfaces.{BlockedWarpBitmap, L2Access}
+
+case class TrafficGenParams(
+  address: BigInt = 0x5000,
+  width: Int = 32,
+  base: BigInt = 0x88000000L,
+  size: BigInt = 500000000L,
+  numGenerators: Int = 4,
+  regionStride: BigInt = 0x400000L,
+  maxL2AccessEntries: Int = 32768
+)
+
+case object TrafficGenKey extends Field[Option[TrafficGenParams]](None)
+
+class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
+  val targetBusy = Output(Bool())
+  val startTrafficGen = Output(Bool())
+  val currentCycleAfterIssue = Output(UInt(32.W))
+  val completedBundleIdWriteEn = Output(Bool())
+  val completedBundleIdWriteIdx = Output(UInt(5.W))
+  val completedBundleIdWriteData = Output(UInt(32.W))
+  val completedBundleCountWriteEn = Output(Bool())
+  val completedBundleCountWriteData = Output(UInt(6.W))
+  val memActive = Input(Bool())
+  val trafficComplete = Input(Bool())
+  val minIssueCycle = Input(UInt(32.W))
+  val blockedWarpBitmapReady = Input(Bool())
+  val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
+  val blockedWarpQueryEn = Output(Bool())
+  val blockedWarpQueryResp = Input(Bool())
+  val blockedWarpQueryRespValid = Input(Bool())
+  val accessReadAddr = Output(UInt(32.W))
+  val accessReadEn = Output(Bool())
+  val accessReadData = Input(new L2Access)
+  val accessReadDataValid = Input(Bool())
+  val accessStoredCount = Input(UInt(32.W))
+  val uploadDone = Input(Bool())
+  val uploadOverflow = Input(Bool())
+  val issue = Vec(nGenerators, Decoupled(new L2Access))
+}
+
+trait HasTrafficGenTopIO {
+  def io: TrafficGenTopIO
+}
+
+class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Parameters)
+    extends ClockSinkDomain(ClockSinkParameters())(p) {
+  val device = new SimpleDevice("TrafficGenTL", Seq("ucbbar,TrafficGenTL"))
+  val node = TLRegisterNode(
+    Seq(AddressSet(params.address, 4096 - 1)),
+    device,
+    "reg/control",
+    beatBytes = beatBytes)
+
+  // TL client shell waits for bridge upload completion and exposes ready/status state.
+
+  override lazy val module = new TrafficGenImpl
+
+  class TrafficGenImpl extends Impl with HasTrafficGenTopIO {
+    val io = IO(new TrafficGenTopIO(params.width, params.numGenerators))
+
+    withClockAndReset(clock, reset) {
+
+      // indicate to target program that traffic generator is globally idle (not just in-between scheduling steps)
+      val trafficGenIdle = RegInit(true.B)
+      val startTrafficGen = RegInit(false.B)
+
+      // bridge driver will wait for startTrafficGen
+      io.startTrafficGen := startTrafficGen
+
+      // start traffic generator when target program writes to start register
+      val startTrafficGenPulse = Wire(Bool())
+      startTrafficGenPulse := false.B
+      when(startTrafficGenPulse) {
+        trafficGenIdle := false.B
+        startTrafficGen := true.B
+      }
+
+      // bridge driver will indicate trafficComplete 
+      when(io.trafficComplete) {
+        trafficGenIdle := true.B
+        startTrafficGen := false.B
+      }
+
+      val currentCycleAfterIssue = RegInit(0.U(32.W))
+      val patternReady = RegInit(false.B)
+      val blockedWarpDebugQueryIdx = RegInit(0.U(BlockedWarpBitmap.indexBits.W))
+      val blockedWarpDebugQueryReq = WireInit(0.U(1.W))
+      val blockedWarpDebugResp = RegInit(false.B)
+      val blockedWarpDebugRespValid = RegInit(false.B)
+
+      val completedBundleCountWriteEn = Wire(Bool())
+      val completedBundleCountWriteData = Wire(UInt(6.W))
+      val completedBundleIdWriteEn = Wire(Vec(32, Bool()))
+      val completedBundleIdWriteData = Wire(Vec(32, UInt(32.W)))
+
+      io.currentCycleAfterIssue := currentCycleAfterIssue
+      io.completedBundleIdWriteEn := completedBundleIdWriteEn.asUInt.orR
+      io.completedBundleIdWriteIdx := PriorityEncoder(completedBundleIdWriteEn)
+      io.completedBundleIdWriteData := Mux1H(completedBundleIdWriteEn, completedBundleIdWriteData)
+      io.completedBundleCountWriteEn := completedBundleCountWriteEn
+      io.completedBundleCountWriteData := completedBundleCountWriteData
+      io.blockedWarpQueryIdx := blockedWarpDebugQueryIdx
+      io.blockedWarpQueryEn := blockedWarpDebugQueryReq(0)
+      io.accessReadAddr := 0.U
+      io.accessReadEn := false.B
+      completedBundleCountWriteEn := false.B
+      completedBundleCountWriteData := 0.U
+      completedBundleIdWriteEn.foreach(_ := false.B)
+      completedBundleIdWriteData.foreach(_ := 0.U)
+      
+
+      for (i <- 0 until params.numGenerators) {
+        io.issue(i).valid := false.B
+        io.issue(i).bits := 0.U.asTypeOf(new L2Access)
+      }
+
+
+      when(io.uploadOverflow) {
+        patternReady := false.B
+      }.elsewhen(io.uploadDone && io.blockedWarpBitmapReady) {
+        patternReady := true.B
+      }
+
+      when(blockedWarpDebugQueryReq(0)) {
+        blockedWarpDebugRespValid := false.B
+      }
+
+      when(io.blockedWarpQueryRespValid) {
+        blockedWarpDebugResp := io.blockedWarpQueryResp
+        blockedWarpDebugRespValid := true.B
+      }
+
+      io.targetBusy := io.memActive
+
+      def writeCompletedBundleCount(valid: Bool, data: UInt): Bool = {
+        when(valid) {
+          completedBundleCountWriteEn := true.B
+          completedBundleCountWriteData := data
+        }
+        true.B
+      }
+
+      def writeCompletedBundleId(idx: Int)(valid: Bool, data: UInt): Bool = {
+        when(valid) {
+          completedBundleIdWriteEn(idx) := true.B
+          completedBundleIdWriteData(idx) := data
+        }
+        true.B
+      }
+
+      node.regmap(
+        0x00 -> Seq(RegField.r(1, trafficGenIdle)),
+        0x04 -> Seq(RegField.w(1, startTrafficGenPulse)),
+        0x08 -> Seq(RegField.r(1, io.targetBusy)),
+        0x0C -> Seq(RegField.r(1, io.uploadDone)),
+        0x10 -> Seq(RegField.r(1, io.uploadOverflow)),
+        0x14 -> Seq(RegField.r(32, io.accessStoredCount)),
+        0x18 -> Seq(RegField.r(1, patternReady)),
+        0x20 -> Seq(RegField.r(32, io.minIssueCycle)),
+        0x24 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
+        0x28 -> Seq(RegField(BlockedWarpBitmap.indexBits, blockedWarpDebugQueryIdx)),
+        0x2C -> Seq(RegField.w(1, blockedWarpDebugQueryReq)),
+        0x30 -> Seq(RegField.r(1, blockedWarpDebugRespValid)),
+        0x34 -> Seq(RegField.r(1, blockedWarpDebugResp)),
+        0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue)),
+        0xC0 -> Seq(RegField.w(6, writeCompletedBundleCount(_, _))),
+        0xC4 -> (0 until 32).map(idx => RegField.w(32, writeCompletedBundleId(idx)(_, _)))
+      )
+    }
+  }
+}
+
+class TrafficGenMem(id: Int, beatBytes: Int)(implicit p: Parameters)
+    extends ClockSinkDomain(ClockSinkParameters())(p) {
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(
+    clients = Seq(TLClientParameters(
+      name = s"trafficgenmem$id",
+      sourceId = IdRange(0, 4),
+      supportsProbe = TransferSizes(64, 64),
+      supportsGet = TransferSizes(64, 64),
+      supportsPutFull = TransferSizes(64, 64)
+    ))
+  )))
+
+  override lazy val module = new TrafficGenMemModuleImp(this)
+
+  class TrafficGenMemModuleImp(outer: TrafficGenMem) extends Impl {
+    val io = IO(new Bundle {
+      val active = Output(Bool())
+      val coreOffset = Input(UInt(32.W))
+      val req = Flipped(Decoupled(new L2Access))
+    })
+
+    withClockAndReset(clock, reset) {
+      val (mem, _) = outer.node.out(0)
+      dontTouch(io.coreOffset)
+
+      mem.a.valid := false.B
+      mem.a.bits := DontCare
+      mem.b.ready := true.B
+      mem.c.valid := false.B
+      mem.c.bits := DontCare
+      mem.d.ready := true.B
+      mem.e.valid := false.B
+      mem.e.bits := DontCare
+
+      io.req.ready := false.B
+      io.active := false.B
+    }
+  }
+}
+
+trait CanHaveTrafficGen { this: BaseSubsystem =>
+  private val portName = "TrafficGenTL"
+  private val pbus = locateTLBusWrapper(PBUS)
+  private val sbus = locateTLBusWrapper(SBUS)
+
+  val trafficGenIO = p(TrafficGenKey).map { params =>
+    val trafficGenTL = LazyModule(new TrafficGenTL(params, pbus.beatBytes)(p))
+    trafficGenTL.clockNode := pbus.fixedClockNode
+    pbus.coupleTo(portName) {
+      trafficGenTL.node := TLFragmenter(pbus.beatBytes, pbus.blockBytes) := _
+    }
+
+    val generators = (0 until params.numGenerators).map { i =>
+      val trafficGenMem = LazyModule(new TrafficGenMem(i, sbus.beatBytes)(p))
+      trafficGenMem.clockNode := sbus.fixedClockNode
+      sbus.coupleFrom(s"trafficgen-mem-$i") { _ := trafficGenMem.node }
+      trafficGenMem
+    }
+
+    InModuleBody {
+      val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO(params.numGenerators))).suggestName("trafficgen")
+      dontTouch(outerIO)
+
+      outerIO.clock := trafficGenTL.module.clock
+      outerIO.bits.targetBusy <> trafficGenTL.module.io.targetBusy
+      outerIO.bits.startTrafficGen <> trafficGenTL.module.io.startTrafficGen
+      outerIO.bits.currentCycleAfterIssue <> trafficGenTL.module.io.currentCycleAfterIssue
+      outerIO.bits.completedBundleIdWriteEn <> trafficGenTL.module.io.completedBundleIdWriteEn
+      outerIO.bits.completedBundleIdWriteIdx <> trafficGenTL.module.io.completedBundleIdWriteIdx
+      outerIO.bits.completedBundleIdWriteData <> trafficGenTL.module.io.completedBundleIdWriteData
+      outerIO.bits.completedBundleCountWriteEn <> trafficGenTL.module.io.completedBundleCountWriteEn
+      outerIO.bits.completedBundleCountWriteData <> trafficGenTL.module.io.completedBundleCountWriteData
+      outerIO.bits.trafficComplete <> trafficGenTL.module.io.trafficComplete
+      outerIO.bits.minIssueCycle <> trafficGenTL.module.io.minIssueCycle
+      outerIO.bits.blockedWarpBitmapReady <> trafficGenTL.module.io.blockedWarpBitmapReady
+      outerIO.bits.blockedWarpQueryIdx <> trafficGenTL.module.io.blockedWarpQueryIdx
+      outerIO.bits.blockedWarpQueryEn <> trafficGenTL.module.io.blockedWarpQueryEn
+      outerIO.bits.blockedWarpQueryResp <> trafficGenTL.module.io.blockedWarpQueryResp
+      outerIO.bits.blockedWarpQueryRespValid <> trafficGenTL.module.io.blockedWarpQueryRespValid
+      outerIO.bits.accessReadAddr <> trafficGenTL.module.io.accessReadAddr
+      outerIO.bits.accessReadEn <> trafficGenTL.module.io.accessReadEn
+      outerIO.bits.accessReadData <> trafficGenTL.module.io.accessReadData
+      outerIO.bits.accessReadDataValid <> trafficGenTL.module.io.accessReadDataValid
+      outerIO.bits.accessStoredCount <> trafficGenTL.module.io.accessStoredCount
+      outerIO.bits.uploadDone <> trafficGenTL.module.io.uploadDone
+      outerIO.bits.uploadOverflow <> trafficGenTL.module.io.uploadOverflow
+
+      trafficGenTL.module.io.memActive := generators.map(_.module.io.active).foldLeft(false.B)(_ || _)
+      generators.zipWithIndex.foreach { case (generator, i) =>
+        generator.module.io.coreOffset := (BigInt(i) * params.regionStride).U
+        generator.module.io.req <> trafficGenTL.module.io.issue(i)
+      }
+
+      outerIO
+    }
+  }
+}
+
+class WithTrafficGen extends Config((site, here, up) => {
+  case TrafficGenKey => Some(TrafficGenParams())
+})
