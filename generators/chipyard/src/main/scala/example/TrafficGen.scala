@@ -21,7 +21,7 @@ case class TrafficGenParams(
   size: BigInt = 500000000L,
   numGenerators: Int = 4,
   regionStride: BigInt = 0x400000L,
-  maxL2AccessEntries: Int = 32768
+  maxL2AccessEntries: Int = 262144 // 2^18
 )
 
 case object TrafficGenKey extends Field[Option[TrafficGenParams]](None)

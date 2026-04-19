@@ -6,8 +6,6 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.Parameters
-import freechips.rocketchip.util.DecoupledHelper
-
 import midas.widgets._
 import firesim.lib.bridgeutils._
 
@@ -39,21 +37,59 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     //// reservedSubPartitionsByCycle ////
 
-    // table that maps cycle to an occupancy mask, where each bit indicates whether that L2 subpartition is reserved by an L2 access in that cycle
-    val reservedSubPartitionsByCycle = RegInit(VecInit(Seq.tabulate(1024)(i => i.U(256.W))))
-    val reservedSubPartitionsBaseIdx = RegInit(0.U(log2Ceil(reservedSubPartitionsByCycle.length).W))
+    val reservedSubPartitionEntries = 4096
+    val reservedSubPartitionEntryWidth = 256
+
+    // Table that maps cycle to an occupancy mask. Use SyncReadMem so the larger
+    // snapshot stores in RAM resources instead of registers.
+    val reservedSubPartitionsByCycle =
+      SyncReadMem(reservedSubPartitionEntries, UInt(reservedSubPartitionEntryWidth.W))
+    val reservedSubPartitionsBaseIdx = RegInit(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedSubPartitionsBaseCycle = RegInit(0.U(64.W))
+
+    // Temporary initialization preserves the old placeholder contents until the
+    // target starts maintaining this table directly.
+    val reservedSubPartitionsInitActive = RegInit(true.B)
+    val reservedSubPartitionsInitIdx = RegInit(0.U(log2Ceil(reservedSubPartitionEntries).W))
+    when(reservedSubPartitionsInitActive) {
+      reservedSubPartitionsByCycle.write(
+        reservedSubPartitionsInitIdx,
+        reservedSubPartitionsInitIdx.asUInt.pad(reservedSubPartitionEntryWidth),
+      )
+      when(reservedSubPartitionsInitIdx === (reservedSubPartitionEntries - 1).U) {
+        reservedSubPartitionsInitActive := false.B
+      }.otherwise {
+        reservedSubPartitionsInitIdx := reservedSubPartitionsInitIdx + 1.U
+      }
+    }
 
     // trigger for bridge driver to read reservedSubPartitionsByCycle
     val readReservedSubPartitions = Wire(Bool())
 
-    // packing 2 elements of reservedSubPartitionsByCycle (2x256 = 512)
-    val reservedSubPartitionBeats = reservedSubPartitionsByCycle.length / 2
+    // Send one 256-bit entry per 512-bit beat and leave the upper half zeroed so
+    // the snapshot path only needs a single SyncReadMem read port.
+    val reservedSubPartitionBeats = reservedSubPartitionEntries
     val streamBeatIdx = RegInit(0.U(log2Ceil(reservedSubPartitionBeats).W))
-    val reservedWordBaseIdx = Cat(streamBeatIdx, 0.U(1.W))
-    val reservedWordNextIdx = reservedWordBaseIdx + 1.U
-    val reservedStreamBits =
-      Cat(reservedSubPartitionsByCycle(reservedWordNextIdx), reservedSubPartitionsByCycle(reservedWordBaseIdx))
+
+    // indicates that we have issued a read to the SyncReadMem and are waiting for data to return
+    val reservedStreamReadPending = RegInit(false.B)
+
+    val reservedStreamReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
+    val reservedStreamReadEn = WireDefault(false.B)
+    val reservedStreamEntryBits = reservedSubPartitionsByCycle.read(
+      reservedStreamReadIdx,
+      reservedStreamReadEn,
+    )
+
+    // latch read data from SyncReadMem in a register and pad to 512 bits for streaming
+    val reservedStreamEntryReg = Reg(UInt(reservedSubPartitionEntryWidth.W))
+
+    // indicates that we can stream the data returned from SyncReadMem to the bridge driver
+    val reservedStreamDataValid = RegInit(false.B)
+
+    // latch to hold start stream pulse from bridge driver until we begin
+    val reservedStreamStartPending = RegInit(false.B)
+    val reservedStreamBits = Cat(0.U(reservedSubPartitionEntryWidth.W), reservedStreamEntryReg)
     
     
     //// completedBundleIds ////
@@ -91,6 +127,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val streamSourceIdle :: streamSourceReservedSubPartitions :: streamSourceCompletedBundleIds :: Nil = Enum(3)
     val streamSource = RegInit(streamSourceIdle)
 
+    val streamPayloadValid = Mux(
+      streamSource === streamSourceCompletedBundleIds,
+      true.B,
+      reservedStreamDataValid,
+    )
+
     // stream bits are either the packed reservedSubPartitionsByCycle or the packed completedBundleIds
     streamEnq.bits := Mux(
       streamSource === streamSourceCompletedBundleIds,
@@ -98,8 +140,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservedStreamBits,
     )
     val streamActive = streamSource =/= streamSourceIdle
-    val doStreamEnq = DecoupledHelper(streamActive, fire, streamEnq.ready)
-    streamEnq.valid := doStreamEnq.fire(streamEnq.ready)
+    streamEnq.valid := streamActive && fire && streamPayloadValid
+    val doStreamEnq = streamEnq.valid && streamEnq.ready
 
     val streamLastBeat = Mux(
       streamSource === streamSourceCompletedBundleIds,
@@ -107,48 +149,100 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       streamBeatIdx === (reservedSubPartitionBeats - 1).U,
     )
 
+    // when the SyncReadMem returns, latch it in a register
+    // this introduces extra cycle, because at steady state:
+    // we issue a read to SyncReadMem while streaming previous data
+    // then, on the next cycle the reservedStreamEntryBits is latched in reservedStreamEntryReg
+    // and that is sent via stream on the following cycle
+    when(reservedStreamReadPending) {
+      reservedStreamEntryReg := reservedStreamEntryBits
+      reservedStreamReadPending := false.B
+      reservedStreamDataValid := true.B
+    }
+
     // state machine to stream reservedSubPartitionsByCycle or completedBundleIds when triggered by bridge driver, and to keep track of stream beat index
-    when(readReservedSubPartitions && !streamActive) {
+   
+    // bridge driver triggers to start streaming reservedSubPartitionsByCycle
+    when(readReservedSubPartitions) {
+      reservedStreamStartPending := true.B
+    }
+
+    when(reservedStreamStartPending && !streamActive && !reservedSubPartitionsInitActive) {
       streamSource := streamSourceReservedSubPartitions
       streamBeatIdx := 0.U
+
+      // to read from SyncReadMem
+      reservedStreamReadIdx := 0.U
+      reservedStreamReadEn := true.B
+
+      // set to latch the data from SyncReadMem into a register and indicate it is valid for streaming
+      reservedStreamReadPending := true.B
+      reservedStreamDataValid := false.B
+
+      reservedStreamStartPending := false.B
     }.elsewhen(readCompletedBundleIds && completedBundleIdsValid && completedBundleCountValid && !streamActive) {
       streamSource := streamSourceCompletedBundleIds
       streamBeatIdx := 0.U
-    }.elsewhen(doStreamEnq.fire()) {
-      when(streamLastBeat) {
-        streamSource := streamSourceIdle
-        streamBeatIdx := 0.U
+    }.elsewhen(doStreamEnq) {
+      when(streamSource === streamSourceCompletedBundleIds) {
+        when(streamLastBeat) {
+          streamSource := streamSourceIdle
+          streamBeatIdx := 0.U
+        }.otherwise {
+          streamBeatIdx := streamBeatIdx + 1.U
+        }
       }.otherwise {
-        streamBeatIdx := streamBeatIdx + 1.U
+        // when we are not on the last beat, issue next read to SyncReadMem
+        when(streamLastBeat) {
+          streamSource := streamSourceIdle
+          streamBeatIdx := 0.U
+          reservedStreamDataValid := false.B
+        }.otherwise {
+          val nextBeatIdx = streamBeatIdx + 1.U
+          streamBeatIdx := nextBeatIdx
+
+          // indicate next read from SyncReadMem is pending
+          reservedStreamReadIdx := nextBeatIdx
+          reservedStreamReadEn := true.B
+          reservedStreamReadPending := true.B
+
+          // only stream data once it is latched from SyncReadMem into a register
+          reservedStreamDataValid := false.B
+        }
       }
     }
     
+    /// streamDeq for host->target streaming of L2Accesses and blocked warp bitmap from bridge driver to bridge module
 
     //// store L2Access vector from bridge driver to a backing store in the bridge module
     val accessStore = SyncReadMem(key.maxL2AccessEntries, new L2Access)
+
+    // store the warps that are currently blocked in the scheduler, for the traffic generator to return on if it unblocks the scheduler
+    // stored as a vec of beats to make it easier to stream
     val blockedWarpBitmap = RegInit(VecInit(Seq.fill(BlockedWarpBitmap.streamBeatCount)(0.U(L2Access.streamWidthBits.W))))
+    
+    // state machine to receive streamed L2Access and blocked warp bitmap
+    val uploadStart = Wire(Bool())
+    val uploadCount = RegInit(0.U(32.W))
     val uploadActive = RegInit(false.B)
-    val uploadDone = RegInit(true.B)
-    val uploadOverflow = RegInit(false.B)
-    val blockedWarpUploadDone = RegInit(false.B)
+
     val uploadRecvCount = RegInit(0.U(32.W))
     val uploadStoredCount = RegInit(0.U(32.W))
     val blockedWarpBeatCount = RegInit(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
+
+    val uploadDone = RegInit(true.B)
+    val blockedWarpUploadDone = RegInit(false.B)
+    val uploadOverflow = RegInit(false.B)
+
     val uploadPhaseIdle :: uploadPhaseL2Accesses :: uploadPhaseBlockedWarpBitmap :: Nil = Enum(3)
     val uploadPhase = RegInit(uploadPhaseIdle)
 
-    // stream interface for bridge driver to write L2 access to backing store
-    val uploadCount = RegInit(0.U(32.W))
-    val minIssueCycle = RegInit(0.U(32.W))
-    val uploadStart = Wire(Bool())
-    val trafficComplete = Wire(Bool())
-    val uploadBits = L2Access.unpack(streamDeq.bits)
-    streamDeq.ready := uploadActive
-
     when(uploadStart) {
+
       uploadActive := true.B
       uploadDone := false.B
       uploadOverflow := false.B
+
       blockedWarpUploadDone := false.B
       uploadRecvCount := 0.U
       uploadStoredCount := 0.U
@@ -157,31 +251,41 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       blockedWarpBitmap.foreach(_ := 0.U)
     }
 
+    val uploadBits = L2Access.unpack(streamDeq.bits)
+    streamDeq.ready := uploadActive
+    
     when(streamDeq.fire && !uploadStart) {
       switch(uploadPhase) {
 
         // first, stream L2 access data into backing store
         is(uploadPhaseL2Accesses) {
-          val canStore = uploadStoredCount < key.maxL2AccessEntries.U
-          when(canStore) {
+
+          // 1 L2Access is transferred per 512-bit beat, so we can store 1 L2Access per beat
+          when(uploadStoredCount < key.maxL2AccessEntries.U) {
             accessStore.write(uploadStoredCount, uploadBits)
             uploadStoredCount := uploadStoredCount + 1.U
           }.otherwise {
+            // track to indicate when we overflow and can't store all L2 accesses
             uploadOverflow := true.B
           }
 
+          // move on to blocked warp bitmap when we've received all the L2 accesses
+          // and indicate that L2 access upload is done
           uploadRecvCount := uploadRecvCount + 1.U
           when(uploadRecvCount + 1.U === uploadCount) {
             uploadPhase := uploadPhaseBlockedWarpBitmap
+            uploadDone := true.B
           }
         }
 
         // next, stream blocked warp bitmap data into registers in the bridge module
         is(uploadPhaseBlockedWarpBitmap) {
+
           blockedWarpBitmap(blockedWarpBeatCount) := streamDeq.bits
+
+          // when completed, indicate to target and bridge driver that blocked warp ID upload done
           when(blockedWarpBeatCount === (BlockedWarpBitmap.streamBeatCount - 1).U) {
             uploadActive := false.B
-            uploadDone := true.B
             blockedWarpUploadDone := true.B
             uploadPhase := uploadPhaseIdle
           }.otherwise {
@@ -197,6 +301,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.blockedWarpBitmapReady := blockedWarpUploadDone
     target.uploadDone := uploadDone
     target.uploadOverflow := uploadOverflow
+
+    val minIssueCycle = RegInit(0.U(32.W))
 
     // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
     val blockedWarpQueryWordIdx =
@@ -227,12 +333,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(targetReset) {
       streamSource := streamSourceIdle
       streamBeatIdx := 0.U
+      reservedStreamReadPending := false.B
+      reservedStreamDataValid := false.B
+      reservedStreamStartPending := false.B
       completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
       completedBundleCountValid := true.B
     }
 
+    val trafficComplete = Wire(Bool())
 
     /////////// MMIO registers for bridge driver interaction ///////////
 
@@ -253,27 +363,36 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(reservedSubPartitionsBaseCycle(31, 0), "reserved_subpartitions_base_cycle_low")
     genROReg(reservedSubPartitionsBaseCycle(63, 32), "reserved_subpartitions_base_cycle_high")
 
+    // bridge driver triggers to start sending L2 Accesses and blocked warp bitmap to the bridge module
+    genWORegInit(uploadCount, "upload_count", 0.U)
+    Pulsify(genWORegInit(uploadStart, "upload_start", false.B), pulseLength = 1)
+
+    genROReg(uploadDone, "upload_done")
+    genROReg(uploadOverflow, "upload_overflow")
+    genROReg(blockedWarpUploadDone, "blocked_warp_upload_done")
+
+    // bridge driver writes the min_issue_cycle for the traffic generator to stop at
+    genWORegInit(minIssueCycle, "min_issue_cycle", 0.U)
+
     // when completed bundle IDs or count are available, bridge driver can read them
     genROReg(completedBundleIdsValid, "completed_bundle_ids_valid")
     genROReg(completedBundleCountValid, "completed_bundle_count_valid")
 
     // generate register definitions for the bridge driver to interact with 
-    genWORegInit(uploadCount, "upload_count", 0.U)
-    genWORegInit(minIssueCycle, "min_issue_cycle", 0.U)
+    
+    
     Pulsify(genWORegInit(trafficComplete, "traffic_complete", false.B), pulseLength = 1)
     Pulsify(genWORegInit(readCompletedBundleIds, "read_completed_bundle_ids", false.B), pulseLength = 1)
     
     genROReg(target.currentCycleAfterIssue, "current_cycle_after_issue")
-    genROReg(uploadDone, "upload_done")
-    genROReg(uploadOverflow, "upload_overflow")
-    genROReg(blockedWarpUploadDone, "blocked_warp_upload_done")
+    
     
     
     
     genROReg(completedBundleCount, "completed_bundle_count")
     
 
-    Pulsify(genWORegInit(uploadStart, "upload_start", false.B), pulseLength = 1)
+    
 
     genCRFile()
 

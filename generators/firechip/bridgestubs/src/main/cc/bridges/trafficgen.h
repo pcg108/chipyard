@@ -66,27 +66,41 @@ enum class trafficgen_upload_phase_t {
   done,
 };
 
+enum class trafficgen_state_t {
+  IDLE,
+  READ_RESERVED_PARTITIONS,
+  UPLOAD_SCHEDULE,
+  ISSUING_TRAFFIC,
+};
+
 class trafficgen_t final : public streaming_bridge_driver_t {
 public:
   static char KIND;
   static constexpr size_t STREAM_WORD_BITS = 256;
-  static constexpr size_t STREAM_WORD_COUNT = 1024;
-  static constexpr size_t STREAM_BATCH_BYTES = (STREAM_WORD_COUNT * STREAM_WORD_BITS) / 8;
-  static constexpr size_t STREAM_BATCH_BEATS = STREAM_BATCH_BYTES / STREAM_WIDTH_BYTES;
+  static constexpr size_t STREAM_WORD_COUNT = 4096;
   static constexpr size_t STREAM_WORDS_PER_ENTRY = STREAM_WORD_BITS / 64;
   static constexpr size_t STREAM_WORDS_PER_BEAT = STREAM_WIDTH_BYTES / sizeof(uint64_t);
+  static constexpr size_t STREAM_BATCH_BEATS = STREAM_WORD_COUNT;
+  static constexpr size_t STREAM_BATCH_BYTES = STREAM_BATCH_BEATS * STREAM_WIDTH_BYTES;
+
   static constexpr size_t L2_ACCESS_STREAM_BYTES = STREAM_WIDTH_BYTES;
-  static constexpr size_t BLOCKED_WARP_SM_BITS = 4;
-  static constexpr size_t BLOCKED_WARP_SCHEDULER_BITS = 3;
-  static constexpr size_t BLOCKED_WARP_WARP_BITS = 6;
+
+  // given that each warp is identified by (sm, scheduler, warp) 
+  // and we have 132 SMs, 4 schedulers per SM, and 16 warps per scheduler, 
+  // we can encode the blocked warp bitmap into a bit bitmap where each bit corresponds to a unique warp
+  static constexpr size_t BLOCKED_WARP_SM_BITS = 8;
+  static constexpr size_t BLOCKED_WARP_SCHEDULER_BITS = 2;
+  static constexpr size_t BLOCKED_WARP_WARP_BITS = 4;
   static constexpr size_t BLOCKED_WARP_INDEX_BITS =
-      BLOCKED_WARP_SM_BITS + BLOCKED_WARP_SCHEDULER_BITS +
-      BLOCKED_WARP_WARP_BITS;
+                                                BLOCKED_WARP_SM_BITS + 
+                                                BLOCKED_WARP_SCHEDULER_BITS +
+                                                BLOCKED_WARP_WARP_BITS;
+  // number of distinct warps we can represent in the bitmap
   static constexpr size_t BLOCKED_WARP_BITMAP_BITS = 1 << BLOCKED_WARP_INDEX_BITS;
-  static constexpr size_t BLOCKED_WARP_BITMAP_BEATS =
-      BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
-  static constexpr size_t BLOCKED_WARP_BITMAP_WORDS =
-      BLOCKED_WARP_BITMAP_BITS / 64;
+  // assuming we send in 8 64-bit words per beat
+  static constexpr size_t BLOCKED_WARP_BITMAP_BEATS = BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
+  static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
+  
   static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 32;
   static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 2;
 
@@ -115,19 +129,24 @@ private:
   uint32_t min_issue_cycle = 0;
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
-  std::array<uint64_t, STREAM_WORD_COUNT * STREAM_WORDS_PER_ENTRY>
+  std::array<uint64_t, STREAM_BATCH_BEATS * STREAM_WORDS_PER_BEAT>
       reserved_subpartitions_words{};
   L2SubpartitionReservationsByCycle reserved_subpartitions_by_cycle;
   std::array<uint32_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
+
   uint32_t reserved_subpartitions_base_idx = 0;
   std::uint64_t reserved_subpartitions_base_cycle = 0;
+  size_t reserved_subpartition_bytes_received = 0;
+  bool reserved_subpartitions_metadata_latched = false;
+  
   size_t upload_cursor = 0;
   size_t blocked_warp_bitmap_upload_cursor = 0;
   trafficgen_upload_phase_t upload_phase = trafficgen_upload_phase_t::l2_accesses;
   bool target_busy = false;
   bool reserved_subpartitions_read_issued = false;
   bool completed_bundle_ids_read_issued = false;
+  trafficgen_state_t state = trafficgen_state_t::IDLE;
 
   size_t process_reserved_subpartitions_stream();
   size_t process_completed_bundle_ids_stream();

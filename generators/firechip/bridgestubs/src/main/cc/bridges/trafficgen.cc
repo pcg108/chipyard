@@ -181,6 +181,8 @@ load_blocked_warp_bitmap(int trafficgenno, const std::vector<std::string> &args)
 
 static void pack_l2_access(const trafficgen_l2_access_t &access,
                            uint64_t *words) {
+
+  // serialize one L2 access struct into 8 64-bit ints
   words[0] = (static_cast<uint64_t>(access.address) << 32) | access.id;
   words[1] = (static_cast<uint64_t>(access.m_subpartition) << 32) |
              access.cycle_count;
@@ -212,7 +214,6 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       min_issue_cycle(load_min_issue_cycle(trafficgenno, args)),
       blocked_warp_bitmap(load_blocked_warp_bitmap(trafficgenno, args)),
       l2_accesses(load_l2_accesses(trafficgenno, args)) {
-  assert(stream_to_host_depth >= static_cast<int>(STREAM_BATCH_BEATS));
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
 }
@@ -220,11 +221,11 @@ trafficgen_t::trafficgen_t(simif_t &simif,
 trafficgen_t::~trafficgen_t() = default;
 
 void trafficgen_t::init() {
-  write(mmio_addrs.min_issue_cycle, min_issue_cycle);
-  write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
-  write(mmio_addrs.upload_start, 1);
+  
   completed_bundle_ids.fill(0);
   completed_bundle_count = 0;
+  reserved_subpartition_bytes_received = 0;
+  reserved_subpartitions_metadata_latched = false;
   upload_cursor = 0;
   blocked_warp_bitmap_upload_cursor = 0;
   upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
@@ -235,71 +236,77 @@ void trafficgen_t::init() {
   reserved_subpartitions_base_cycle = 0;
   reserved_subpartitions_words.fill(0);
   reserved_subpartitions_by_cycle.clear();
+  state = trafficgen_state_t::IDLE;
 }
 
 
 size_t trafficgen_t::process_reserved_subpartitions_stream() {
+  if (!reserved_subpartitions_metadata_latched) {
+    // Snapshot metadata must stay fixed while we accumulate a paused target snapshot.
 
-  // get the start index of the reservedSubPartitions ring buffer
-  reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
-  if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
-    std::fprintf(stderr,
-                 "[trafficgen] reservedSubPartitions baseIdx out of range: %u\n",
-                 reserved_subpartitions_base_idx);
-    std::abort();
+    // read base index into ring buffer
+    reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
+    if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
+      std::fprintf(stderr,
+                   "[trafficgen] reservedSubPartitions baseIdx out of range: %u\n",
+                   reserved_subpartitions_base_idx);
+      std::abort();
+    }
+
+    // read base cycle corresponding to that base index
+    reserved_subpartitions_base_cycle =
+        (static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_high)) << 32) |
+        static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_low));
+
+    reserved_subpartitions_metadata_latched = true;
   }
 
-  // get the base cycle corresponding to the start index
-  reserved_subpartitions_base_cycle =
-      (static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_high)) << 32) |
-      static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_low));
+  // stop if we have read the full buffer
+  if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
+    return 0;
+  }
 
-  // pull the entire reservedSubPartitionsByCycle ring buffer snapshot from the stream
-  // should be 1024 cycles x 256 subpartitions bits 
-  std::vector<uint8_t> outbuf(STREAM_BATCH_BYTES, 0);
-  const auto bytes_received = pull(this->stream_to_host_idx, outbuf.data(), STREAM_BATCH_BYTES, STREAM_BATCH_BYTES);
+  // Try to pull between 0 to remaining bytes into reserved_subpartitions_words
+  auto *snapshot_bytes = reinterpret_cast<uint8_t *>(reserved_subpartitions_words.data());
+  const size_t remaining_bytes = STREAM_BATCH_BYTES - reserved_subpartition_bytes_received;
+  const auto bytes_received = pull(this->stream_to_host_idx,
+                                    snapshot_bytes + reserved_subpartition_bytes_received,
+                                    remaining_bytes,
+                                    0);
+
+  // return if we have not pulled everything, if stream is empty, or we overflowed buffer                                    
   if (bytes_received == 0) {
     return 0;
   }
-  if (bytes_received != STREAM_BATCH_BYTES) {
+  if (bytes_received > remaining_bytes) {
     std::fprintf(stderr,
-                 "[trafficgen] expected %zu bytes for reservedSubPartitionsByCycle, got %zu\n",
-                 STREAM_BATCH_BYTES,
+                 "[trafficgen] reservedSubPartitionsByCycle overrun: "
+                 "remaining=%zu got=%zu\n",
+                 remaining_bytes,
                  bytes_received);
     std::abort();
   }
-
-  // bridge module packed 2 256-bit bitmaps into a single beat, so unpack them
-  // first into [1024 entries][256 bits = 4 x 64-bit words per entry]
-  const auto *words = reinterpret_cast<const uint64_t *>(outbuf.data());
-  // for each beat taken to transmit the reservedSubPartitionsByCycle
-  for (size_t beat = 0; beat < STREAM_BATCH_BEATS; ++beat) {
-    const size_t beat_word_base = beat * STREAM_WORDS_PER_BEAT;
-    const size_t entry_base = beat * 2 * STREAM_WORDS_PER_ENTRY;
-    std::memcpy(&reserved_subpartitions_words[entry_base],
-                &words[beat_word_base],
-                STREAM_WORDS_PER_ENTRY * sizeof(uint64_t));
-    std::memcpy(&reserved_subpartitions_words[entry_base + STREAM_WORDS_PER_ENTRY],
-                &words[beat_word_base + STREAM_WORDS_PER_ENTRY],
-                STREAM_WORDS_PER_ENTRY * sizeof(uint64_t));
+  if (reserved_subpartition_bytes_received + bytes_received < STREAM_BATCH_BYTES) {
+    return bytes_received;
   }
 
-  // decode each logical cycle entry
+  // The stream buffer now holds the full streamed snapshot with one 256-bit
+  // entry in the low half of each 512-bit beat; decode each logical cycle entry.
   reserved_subpartitions_by_cycle.clear();
   // iterate through every cycle
   for (size_t offset = 0; offset < STREAM_WORD_COUNT; ++offset) {
 
     // starting at base index, wrap around the ring buffer 
     const size_t ring_idx = (static_cast<size_t>(reserved_subpartitions_base_idx) + offset) % STREAM_WORD_COUNT;
-    // get to the 256 bit bitmap for that cycle
-    const size_t word_base = ring_idx * STREAM_WORDS_PER_ENTRY;
+    // get to the 256-bit payload in the low half of the streamed 512-bit beat
+    const size_t beat_word_base = ring_idx * STREAM_WORDS_PER_BEAT;
 
     bool any_reserved = false;
     std::unordered_set<unsigned> reserved_subpartitions;
     // loop through the 256 bits in 64-bit chunks
     for (size_t word_idx = 0; word_idx < STREAM_WORDS_PER_ENTRY; ++word_idx) {
 
-      const uint64_t word = reserved_subpartitions_words[word_base + word_idx];
+      const uint64_t word = reserved_subpartitions_words[beat_word_base + word_idx];
 
       // skip when no subpartitions are reserved for this chunk
       if (word == 0) {
@@ -375,101 +382,152 @@ void trafficgen_t::push_upload_data() {
     return;
   }
 
+  // first upload the L2 access pattern
   if (upload_phase == trafficgen_upload_phase_t::l2_accesses) {
-    if (upload_cursor >= l2_accesses.size()) {
+    const size_t total_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
+
+    // move on when all access uploaded
+    if (upload_cursor >= total_bytes) {
       upload_phase = trafficgen_upload_phase_t::blocked_warp_bitmap;
       return;
     }
 
-    const size_t chunk_entries = std::min(
-        l2_accesses.size() - upload_cursor,
-        static_cast<size_t>(stream_from_host_depth));
+    // find which l2_accesses entry contains the next unsent byte
+    const size_t entry_index = upload_cursor / L2_ACCESS_STREAM_BYTES;
+    // how far into that entry the next unsent byte is
+    const size_t entry_byte_offset = upload_cursor % L2_ACCESS_STREAM_BYTES;
+    // how much of the whole L2 access upload is still unsent 
+    const size_t remaining_bytes = total_bytes - upload_cursor;
+
+    // figure out how many whole entries we can pack into the next stream chunk given unsent byte offset and stream depth
+    const size_t chunk_bytes = std::min(remaining_bytes, static_cast<size_t>(stream_from_host_depth) * L2_ACCESS_STREAM_BYTES);
+    const size_t packed_bytes = entry_byte_offset + chunk_bytes;
+    const size_t chunk_entries = (packed_bytes + L2_ACCESS_STREAM_BYTES - 1) / L2_ACCESS_STREAM_BYTES;
+
+    // Pack enough whole entries to cover the byte range we still need to stream.
     std::vector<uint64_t> inbuf(chunk_entries * 8, 0);
     auto *words = inbuf.data();
+
+    // pack the chunk of L2 accesses starting from the entry containing the next unsent byte
     for (size_t i = 0; i < chunk_entries; ++i) {
-      pack_l2_access(l2_accesses[upload_cursor + i], words + (i * 8));
+      pack_l2_access(l2_accesses[entry_index + i], words + (i * 8));
     }
 
-    const auto bytes_to_push = chunk_entries * L2_ACCESS_STREAM_BYTES;
-    const auto bytes_pushed =
-        push(stream_from_host_idx, inbuf.data(), bytes_to_push, 0);
-    upload_cursor += bytes_pushed / L2_ACCESS_STREAM_BYTES;
-    if (upload_cursor >= l2_accesses.size()) {
+    // send bytes from entry_byte_offset onwards
+    auto *chunk_start = reinterpret_cast<uint8_t *>(inbuf.data()) + entry_byte_offset;
+    const auto bytes_pushed = push(stream_from_host_idx, chunk_start, chunk_bytes, 0);
+    upload_cursor += bytes_pushed;
+
+    // if we sent all of them, move on to blocked warp bitmap
+    if (upload_cursor >= total_bytes) {
       upload_phase = trafficgen_upload_phase_t::blocked_warp_bitmap;
     }
     return;
   }
 
+  // next upload the blocked warp bitmap
   if (upload_phase == trafficgen_upload_phase_t::blocked_warp_bitmap) {
-    if (blocked_warp_bitmap_upload_cursor >= BLOCKED_WARP_BITMAP_BEATS) {
+    const size_t total_bytes = BLOCKED_WARP_BITMAP_BEATS * STREAM_WIDTH_BYTES;
+
+    // complete when all accesses uploaded
+    if (blocked_warp_bitmap_upload_cursor >= total_bytes) {
       upload_phase = trafficgen_upload_phase_t::done;
       return;
     }
 
-    const size_t remaining_beats =
-        BLOCKED_WARP_BITMAP_BEATS - blocked_warp_bitmap_upload_cursor;
-    const size_t chunk_beats = std::min(
-        remaining_beats,
-        static_cast<size_t>(stream_from_host_depth));
-    const auto *bitmap_words =
-        blocked_warp_bitmap.data() + (blocked_warp_bitmap_upload_cursor * 8);
-    const auto bytes_to_push = chunk_beats * STREAM_WIDTH_BYTES;
+    const size_t remaining_bytes = total_bytes - blocked_warp_bitmap_upload_cursor;
+    const size_t chunk_bytes = std::min(
+        remaining_bytes,
+        static_cast<size_t>(stream_from_host_depth) * STREAM_WIDTH_BYTES);
+
+    auto *bitmap_bytes = reinterpret_cast<uint8_t *>(blocked_warp_bitmap.data());
     const auto bytes_pushed =
         push(stream_from_host_idx,
-             const_cast<uint64_t *>(bitmap_words),
-             bytes_to_push,
+             bitmap_bytes + blocked_warp_bitmap_upload_cursor,
+             chunk_bytes,
              0);
-    blocked_warp_bitmap_upload_cursor += bytes_pushed / STREAM_WIDTH_BYTES;
-    if (blocked_warp_bitmap_upload_cursor >= BLOCKED_WARP_BITMAP_BEATS) {
+    blocked_warp_bitmap_upload_cursor += bytes_pushed;
+
+    // complete when all beats sent
+    if (blocked_warp_bitmap_upload_cursor >= total_bytes) {
       upload_phase = trafficgen_upload_phase_t::done;
     }
   }
 }
 
 void trafficgen_t::tick() {
+  switch (state) {
+  case trafficgen_state_t::IDLE:
+    // Wait for the traffic generator to be kicked off.
 
-  // start traffic generation when target program writes to start register
-  if (!trafficGenActive && read(mmio_addrs.start_trafficgen)) {
-
-    std::fprintf(stderr, "[trafficgen] start signal received, starting traffic generation\n");
-    trafficGenActive = true;
-
-  } else {
-    
-    // if target not busy uploading a traffic pattern or running it, we can run the GPU model and upload the next traffic pattern if applicable
-    if (!read(mmio_addrs.target_busy)) {
+    if (read(mmio_addrs.start_trafficgen)) {
+      std::fprintf(stderr, "[trafficgen] start signal received, starting traffic generation\n");
       
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
 
       // trigger bridge module to send reservedSubPartitionsByCycle by stream
+      reserved_subpartition_bytes_received = 0;
+      reserved_subpartitions_metadata_latched = false;
+      reserved_subpartitions_base_idx = 0;
+      reserved_subpartitions_base_cycle = 0;
+      reserved_subpartitions_words.fill(0);
+      reserved_subpartitions_by_cycle.clear();
       write(mmio_addrs.read_reserved_subpartitions, 1);
-      process_reserved_subpartitions_stream();
 
-    } else {
-      
+      state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
     }
+
+    break;
+  case trafficgen_state_t::READ_RESERVED_PARTITIONS:
+  
+    // read from stream until we have received the full reservedSubPartitionByCycle bitmap
+    reserved_subpartitions_bytes_received += process_reserved_subpartitions_stream();
+    if (reserved_subpartitions_bytes_received >= STREAM_BATCH_BYTES) {
+      std::fprintf(stderr, "[trafficgen] completed reading reservedSubPartitionsByCycle stream data, bytes received=%zu\n", reserved_subpartitions_bytes_received);
+      
+      // todo: connect to GPU model and generate L2 accesses
+
+      // Reset upload progress and kick off host->target streaming.
+      upload_cursor = 0;
+      blocked_warp_bitmap_upload_cursor = 0;
+      upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
+                                         : trafficgen_upload_phase_t::l2_accesses;
+      write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
+      write(mmio_addrs.upload_start, 1);
+      write(mmio_addrs.min_issue_cycle, min_issue_cycle);
+      
+      state = trafficgen_state_t::UPLOAD_SCHEDULE;
+    }
+  
+    break;
+  case trafficgen_state_t::UPLOAD_SCHEDULE:
+
+    push_upload_data();
+
+    if (upload_phase == trafficgen_upload_phase_t::done &&
+        (l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
+        read(mmio_addrs.blocked_warp_upload_done)) {
+
+      std::fprintf(stderr, "[trafficgen] upload completed, entering traffic issuing stage\n");
+      state = trafficgen_state_t::ISSUING_TRAFFIC;
+    }
+
+    break;
+  case trafficgen_state_t::ISSUING_TRAFFIC:
+    // Active traffic issuing flow will live here.
+
+    // once target stops being busy, go back to READ_RESERVED_PARTITIONS or IDLE if we are done
+    if (!read(mmio_addrs.target_busy)) {
+      state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
+    }
+    break;
   }
 
 
-  push_upload_data();
-  const bool next_busy = read(mmio_addrs.target_busy);
-  if (next_busy != target_busy) {
-    std::fprintf(stderr, "[trafficgen] target busy=%d\n", next_busy ? 1 : 0);
-    target_busy = next_busy;
-  }
 
-  if (read(mmio_addrs.upload_done) && read(mmio_addrs.upload_overflow)) {
-    std::fprintf(stderr,
-                 "[trafficgen] upload overflow: target storage exhausted\n");
-  }
+  
 
-  if (read(mmio_addrs.blocked_warp_upload_done) &&
-      upload_phase != trafficgen_upload_phase_t::done) {
-    std::fprintf(stderr,
-                 "[trafficgen] blocked warp upload completed before host "
-                 "driver finished streaming\n");
-  }
 
   if (read(mmio_addrs.completed_bundle_ids_valid) &&
       read(mmio_addrs.completed_bundle_count_valid) &&
