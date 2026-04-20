@@ -510,6 +510,8 @@ void trafficgen_t::tick() {
         read(mmio_addrs.blocked_warp_upload_done)) {
 
       std::fprintf(stderr, "[trafficgen] upload completed, entering traffic issuing stage\n");
+
+      write(mmio_addrs.pause_target, 0);
       state = trafficgen_state_t::ISSUING_TRAFFIC;
     }
 

@@ -197,6 +197,13 @@ class TrafficGenMem(id: Int, beatBytes: Int)(implicit p: Parameters)
     ))
   )))
 
+  // traffic generator should:
+  //- continuously read from the L2 access store
+  //- issue accesses and depopulate reservedSubPartitionsByCycle, set baseCycle/Idx
+  //- track when issued acceses return and populate completedBundleIds
+  //- stop at min_issue_cycle or when unblocking a blocked warp
+  //- report currentCycle after issue
+
   override lazy val module = new TrafficGenMemModuleImp(this)
 
   class TrafficGenMemModuleImp(outer: TrafficGenMem) extends Impl {

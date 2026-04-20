@@ -42,10 +42,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // Table that maps cycle to an occupancy mask. Use SyncReadMem so the larger
     // snapshot stores in RAM resources instead of registers.
-    val reservedSubPartitionsByCycle =
-      SyncReadMem(reservedSubPartitionEntries, UInt(reservedSubPartitionEntryWidth.W))
+    val reservedSubPartitionsByCycle = SyncReadMem(reservedSubPartitionEntries, UInt(reservedSubPartitionEntryWidth.W))
     val reservedSubPartitionsBaseIdx = RegInit(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedSubPartitionsBaseCycle = RegInit(0.U(64.W))
+    val reservedSubPartitionIdxWidth = reservedSubPartitionsBaseIdx.getWidth
 
     // Temporary initialization preserves the old placeholder contents until the
     // target starts maintaining this table directly.
@@ -90,6 +90,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // latch to hold start stream pulse from bridge driver until we begin
     val reservedStreamStartPending = RegInit(false.B)
     val reservedStreamBits = Cat(0.U(reservedSubPartitionEntryWidth.W), reservedStreamEntryReg)
+
+    // Upload-side reservation updates use a read/modify/write sequence so
+    // multiple accesses to the same cycle accumulate into the 256-bit mask.
+    val reservedUploadReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
+    val reservedUploadReadEn = WireDefault(false.B)
+    val reservedUploadEntryBits = reservedSubPartitionsByCycle.read(
+      reservedUploadReadIdx,
+      reservedUploadReadEn,
+    )
+    // we take one cycle to read the current cycle bitmask for reservations and then write on next cycle
+    val reservedUploadPending = RegInit(false.B)
+    val reservedUploadIdxReg = Reg(UInt(log2Ceil(reservedSubPartitionEntries).W))
+    val reservedUploadMaskReg = Reg(UInt(reservedSubPartitionEntryWidth.W))
     
     
     //// completedBundleIds ////
@@ -252,7 +265,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
 
     val uploadBits = L2Access.unpack(streamDeq.bits)
-    streamDeq.ready := uploadActive
+
+    // while writing the L2 acceses into the backing store, also write them to reservedSubPartitionsByCycle
+    // one cycle after we set reservedUploadPending, we read the previous value and OR in the new reservation
+    val canAcceptL2Access = !reservedSubPartitionsInitActive && !reservedUploadPending
+    streamDeq.ready := uploadActive && Mux(uploadPhase === uploadPhaseL2Accesses, canAcceptL2Access, true.B)
+    when(reservedUploadPending) {
+      reservedSubPartitionsByCycle.write(
+        reservedUploadIdxReg,
+        reservedUploadEntryBits | reservedUploadMaskReg,
+      )
+      reservedUploadPending := false.B
+    }
     
     when(streamDeq.fire && !uploadStart) {
       switch(uploadPhase) {
@@ -266,6 +290,30 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
             uploadStoredCount := uploadStoredCount + 1.U
           }.otherwise {
             // track to indicate when we overflow and can't store all L2 accesses
+            uploadOverflow := true.B
+          }
+
+          // calculate which cycle and L2 subpartition in reservedSubPartitionsByCycle this L2 access corresponds to 
+          val accessCycle = uploadBits.cycleCount.pad(64)
+          val cycleDelta = accessCycle - reservedSubPartitionsBaseCycle
+          val cycleBeforeBase = accessCycle < reservedSubPartitionsBaseCycle
+          val cycleOutsideWindow = cycleBeforeBase || cycleDelta >= reservedSubPartitionEntries.U
+          val wrappedOffset = cycleDelta(reservedSubPartitionIdxWidth - 1, 0)
+          val reservationIdx =
+            (reservedSubPartitionsBaseIdx + wrappedOffset)(reservedSubPartitionIdxWidth - 1, 0)
+          val reservationMask = UIntToOH(
+            uploadBits.mSubpartition(log2Ceil(reservedSubPartitionEntryWidth) - 1, 0),
+            reservedSubPartitionEntryWidth,
+          ).asUInt
+
+          // read the current bitmask for the cycle and subpartition being reserved, so we can OR in the new reservation
+          reservedUploadReadIdx := reservationIdx
+          reservedUploadReadEn := true.B
+          reservedUploadIdxReg := reservationIdx
+          reservedUploadMaskReg := reservationMask
+          reservedUploadPending := true.B
+
+          when(cycleOutsideWindow) {
             uploadOverflow := true.B
           }
 
@@ -336,6 +384,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservedStreamReadPending := false.B
       reservedStreamDataValid := false.B
       reservedStreamStartPending := false.B
+      reservedUploadPending := false.B
       completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
