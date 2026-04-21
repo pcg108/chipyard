@@ -36,9 +36,10 @@ TARGET_CXX_FLAGS += \
 		-isystem $(RISCV)/include \
 		-Wno-inconsistent-missing-override
 TARGET_LD_FLAGS += \
-		-L$(RISCV)/lib \
-		-Wl,-rpath,$(RISCV)/lib \
-		$(LRISCV)
+	-L$(RISCV)/lib \
+	-Wl,-rpath,$(RISCV)/lib \
+	$(LRISCV) \
+	-lboost_serialization
 
 # top-level sources
 DRIVER_CC += $(addprefix $(firechip_lib_dir)/firesim/, $(addsuffix .cc, firesim_top))

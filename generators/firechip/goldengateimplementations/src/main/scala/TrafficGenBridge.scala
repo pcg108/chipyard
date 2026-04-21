@@ -344,13 +344,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
 
     target.accessStoredCount := uploadStoredCount
-    target.trafficComplete := trafficComplete
-    target.minIssueCycle := minIssueCycle
+
     target.blockedWarpBitmapReady := blockedWarpUploadDone
     target.uploadDone := uploadDone
     target.uploadOverflow := uploadOverflow
 
     val minIssueCycle = RegInit(0.U(32.W))
+    target.minIssueCycle := minIssueCycle
+
+    target.trafficComplete := trafficComplete
+    
+    
+    
 
     // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
     val blockedWarpQueryWordIdx =

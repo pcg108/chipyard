@@ -25,7 +25,8 @@ TARGET_CXX_FLAGS += \
 		-Wno-inconsistent-missing-override
 TARGET_LD_FLAGS += \
 		-L$(RISCV)/lib \
-		-Wl,-rpath,$(RISCV)/lib
+		-Wl,-rpath,$(RISCV)/lib \
+		-lboost_serialization
 
 # top-level testing sources
 DRIVER_H += $(shell find $(firechip_lib_dir)/bridges/test -name "*.h")

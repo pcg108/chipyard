@@ -3,16 +3,304 @@
 #include "trafficgen.h"
 #include "core/simif.h"
 
+#include <arpa/inet.h>
 #include <algorithm>
+#include <boost/archive/binary_iarchive.hpp>
+#include <boost/archive/binary_oarchive.hpp>
+#include <boost/serialization/access.hpp>
+#include <boost/serialization/library_version_type.hpp>
+#include <boost/serialization/set.hpp>
+#include <boost/serialization/string.hpp>
+#include <boost/serialization/unordered_map.hpp>
+#include <boost/serialization/unordered_set.hpp>
+#include <boost/serialization/vector.hpp>
 #include <cassert>
 #include <cinttypes>
+#include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 
 char trafficgen_t::KIND;
+
+namespace {
+
+constexpr std::uint16_t kGpuModelSocketPort = 50051;
+constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
+
+struct ReservationsMessage {
+  L2SubpartitionReservationsByCycle reservedSubpartitionsByCycle;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & reservedSubpartitionsByCycle;
+  }
+};
+
+struct socket_warp_key_t {
+  unsigned smId = 0;
+  unsigned schedulerId = 0;
+  unsigned warpId = 0;
+
+  bool operator<(const socket_warp_key_t &other) const {
+    return std::tie(smId, schedulerId, warpId) <
+           std::tie(other.smId, other.schedulerId, other.warpId);
+  }
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & smId;
+    ar & schedulerId;
+    ar & warpId;
+  }
+};
+
+struct socket_l2_access_t {
+  std::uint64_t mUniqueId = 0;
+  std::uint64_t mAddress = 0;
+  std::uint64_t mCycleCount = 0;
+  std::uint64_t mL1ToL2Cycle = 0;
+  unsigned mSubpartition = 0;
+  unsigned mSetIndex = 0;
+  std::uint64_t mTag = 0;
+  unsigned mMask = 0;
+  unsigned smId = 0;
+  unsigned schedulerId = 0;
+  unsigned warpId = 0;
+  bool mIsWrite = false;
+  std::uint64_t mBundleId = 0;
+  bool mWakeRelevantBundle = false;
+  std::string mKernelFolder;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & mUniqueId;
+    ar & mAddress;
+    ar & mCycleCount;
+    ar & mL1ToL2Cycle;
+    ar & mSubpartition;
+    ar & mSetIndex;
+    ar & mTag;
+    ar & mMask;
+    ar & smId;
+    ar & schedulerId;
+    ar & warpId;
+    ar & mIsWrite;
+    ar & mBundleId;
+    ar & mWakeRelevantBundle;
+    ar & mKernelFolder;
+  }
+};
+
+struct SchedulerRoundMessage {
+  std::vector<socket_l2_access_t> allL2TraceSteps;
+  std::uint64_t min_issue_cycle = 0;
+  std::set<socket_warp_key_t> blockedWarpIds;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & allL2TraceSteps;
+    ar & min_issue_cycle;
+    ar & blockedWarpIds;
+  }
+};
+
+std::string errno_message(const std::string &prefix) {
+  std::ostringstream oss;
+  oss << prefix << ": " << std::strerror(errno);
+  return oss.str();
+}
+
+std::uint64_t host_to_network_64(std::uint64_t value) {
+  const std::uint32_t high =
+      htonl(static_cast<std::uint32_t>(value >> 32));
+  const std::uint32_t low =
+      htonl(static_cast<std::uint32_t>(value & 0xffffffffULL));
+  return (static_cast<std::uint64_t>(low) << 32) | high;
+}
+
+std::uint64_t network_to_host_64(std::uint64_t value) {
+  const std::uint32_t high =
+      ntohl(static_cast<std::uint32_t>(value >> 32));
+  const std::uint32_t low =
+      ntohl(static_cast<std::uint32_t>(value & 0xffffffffULL));
+  return (static_cast<std::uint64_t>(low) << 32) | high;
+}
+
+void write_all(int fd, const void *buffer, std::size_t size) {
+  const char *cursor = static_cast<const char *>(buffer);
+  std::size_t remaining = size;
+  while (remaining > 0) {
+    const ssize_t written = send(fd, cursor, remaining, 0);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error(errno_message(
+          "[trafficgen] failed to send reservations to gpu_model_socket"));
+    }
+    if (written == 0) {
+      throw std::runtime_error(
+          "[trafficgen] failed to send reservations to gpu_model_socket: "
+          "peer disconnected");
+    }
+    cursor += written;
+    remaining -= static_cast<std::size_t>(written);
+  }
+}
+
+void read_all(int fd, void *buffer, std::size_t size) {
+  char *cursor = static_cast<char *>(buffer);
+  std::size_t remaining = size;
+  while (remaining > 0) {
+    const ssize_t received = recv(fd, cursor, remaining, 0);
+    if (received < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::runtime_error(errno_message(
+          "[trafficgen] failed to receive schedule from gpu_model_socket"));
+    }
+    if (received == 0) {
+      throw std::runtime_error(
+          "[trafficgen] failed to receive schedule from gpu_model_socket: "
+          "peer disconnected");
+    }
+    cursor += received;
+    remaining -= static_cast<std::size_t>(received);
+  }
+}
+
+std::string serialize_reservations_message(
+    const L2SubpartitionReservationsByCycle &reserved_subpartitions_by_cycle) {
+  ReservationsMessage message;
+  message.reservedSubpartitionsByCycle = reserved_subpartitions_by_cycle;
+
+  std::ostringstream oss(std::ios::binary);
+  boost::archive::binary_oarchive archive(oss);
+  archive << message;
+  return oss.str();
+}
+
+template <typename T>
+T deserialize_message(const std::string &payload) {
+  std::istringstream iss(payload, std::ios::binary);
+  boost::archive::binary_iarchive archive(iss);
+  T message{};
+  archive >> message;
+  return message;
+}
+
+template <typename T>
+std::uint32_t checked_u32(T value, const char *field_name) {
+  if (value > static_cast<T>(UINT32_MAX)) {
+    std::fprintf(stderr,
+                 "[trafficgen] %s out of range for target upload: %" PRIu64
+                 "\n",
+                 field_name,
+                 static_cast<std::uint64_t>(value));
+    std::abort();
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+} // namespace
+
+class trafficgen_t::socket_client_t {
+public:
+  socket_client_t() = default;
+  ~socket_client_t() {
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+
+  socket_client_t(const socket_client_t &) = delete;
+  socket_client_t &operator=(const socket_client_t &) = delete;
+
+  void connect_loopback(std::uint16_t port) {
+    if (fd >= 0) {
+      close(fd);
+      fd = -1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      throw std::runtime_error(
+          errno_message("[trafficgen] failed to create gpu_model socket"));
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(kGpuModelSocketAddr);
+
+    if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) <
+        0) {
+      const std::string message = errno_message(
+          "[trafficgen] failed to connect to gpu_model_socket at "
+          "127.0.0.1:50051");
+      close(fd);
+      fd = -1;
+      throw std::runtime_error(message);
+    }
+  }
+
+  void send_frame(const std::string &payload) const {
+    if (fd < 0) {
+      throw std::runtime_error(
+          "[trafficgen] gpu_model socket is not connected");
+    }
+
+    const std::uint64_t payload_size =
+        host_to_network_64(static_cast<std::uint64_t>(payload.size()));
+    write_all(fd, &payload_size, sizeof(payload_size));
+    if (!payload.empty()) {
+      write_all(fd, payload.data(), payload.size());
+    }
+  }
+
+  template <typename T>
+  T recv_message() const {
+    if (fd < 0) {
+      throw std::runtime_error(
+          "[trafficgen] gpu_model socket is not connected");
+    }
+
+    std::uint64_t payload_size_network = 0;
+    read_all(fd, &payload_size_network, sizeof(payload_size_network));
+    const std::uint64_t payload_size =
+        network_to_host_64(payload_size_network);
+
+    std::string payload(static_cast<std::size_t>(payload_size), '\0');
+    if (payload_size > 0) {
+      read_all(fd, payload.data(), payload.size());
+    }
+    return deserialize_message<T>(payload);
+  }
+
+private:
+  int fd = -1;
+};
 
 static uint32_t blocked_warp_index(uint32_t sm_id,
                                    uint32_t scheduler_id,
@@ -38,147 +326,6 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
          (scheduler_id << trafficgen_t::BLOCKED_WARP_WARP_BITS) | warp_id;
 }
 
-static uint32_t load_min_issue_cycle(int trafficgenno,
-                                     const std::vector<std::string> &args) {
-  const std::string arg_prefix =
-      "+trafficgen-min-issue-cycle" + std::to_string(trafficgenno) + "=";
-  for (const auto &arg : args) {
-    if (arg.find(arg_prefix) == 0) {
-      return static_cast<uint32_t>(
-          std::strtoul(arg.substr(arg_prefix.length()).c_str(), nullptr, 0));
-    }
-  }
-  return 0;
-}
-
-static std::vector<trafficgen_l2_access_t>
-load_l2_accesses(int trafficgenno, const std::vector<std::string> &args) {
-  const std::string arg_prefix =
-      "+trafficgen-l2access-file" + std::to_string(trafficgenno) + "=";
-  std::string path;
-  for (const auto &arg : args) {
-    if (arg.find(arg_prefix) == 0) {
-      path = arg.substr(arg_prefix.length());
-      break;
-    }
-  }
-
-  if (path.empty()) {
-    return {};
-  }
-
-  std::ifstream input(path);
-  if (!input) {
-    std::fprintf(stderr,
-                 "[trafficgen] could not open L2 access file '%s'\n",
-                 path.c_str());
-    std::abort();
-  }
-
-  std::vector<trafficgen_l2_access_t> accesses;
-  std::string line;
-  while (std::getline(input, line)) {
-    auto comment = line.find('#');
-    if (comment != std::string::npos) {
-      line.erase(comment);
-    }
-    if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
-      continue;
-    }
-
-    for (auto &ch : line) {
-      if (ch == ',') {
-        ch = ' ';
-      }
-    }
-
-    std::stringstream parser(line);
-    trafficgen_l2_access_t access{};
-    unsigned is_write = 0;
-    if (!(parser >> access.id >> access.address >> access.cycle_count >>
-          access.m_subpartition >> access.m_set_index >> access.m_tag >>
-          access.m_mask >> access.sm_id >> access.scheduler_id >>
-          access.warp_id >> is_write >> access.m_bundle_id >>
-          access.m_wake_relevant_bundle)) {
-      std::fprintf(stderr,
-                   "[trafficgen] malformed L2 access line: %s\n",
-                   line.c_str());
-      std::abort();
-    }
-    access.m_is_write = is_write != 0;
-    accesses.push_back(access);
-  }
-
-  std::stable_sort(accesses.begin(),
-                   accesses.end(),
-                   [](const trafficgen_l2_access_t &lhs,
-                      const trafficgen_l2_access_t &rhs) {
-                     return lhs.cycle_count < rhs.cycle_count;
-                   });
-  return accesses;
-}
-
-static std::array<uint64_t, trafficgen_t::BLOCKED_WARP_BITMAP_WORDS>
-load_blocked_warp_bitmap(int trafficgenno, const std::vector<std::string> &args) {
-  const std::string arg_prefix =
-      "+trafficgen-blocked-warps-file" + std::to_string(trafficgenno) + "=";
-  std::string path;
-  for (const auto &arg : args) {
-    if (arg.find(arg_prefix) == 0) {
-      path = arg.substr(arg_prefix.length());
-      break;
-    }
-  }
-
-  std::array<uint64_t, trafficgen_t::BLOCKED_WARP_BITMAP_WORDS> bitmap{};
-  bitmap.fill(0);
-
-  if (path.empty()) {
-    return bitmap;
-  }
-
-  std::ifstream input(path);
-  if (!input) {
-    std::fprintf(stderr,
-                 "[trafficgen] could not open blocked warp file '%s'\n",
-                 path.c_str());
-    std::abort();
-  }
-
-  std::string line;
-  while (std::getline(input, line)) {
-    auto comment = line.find('#');
-    if (comment != std::string::npos) {
-      line.erase(comment);
-    }
-    if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
-      continue;
-    }
-
-    for (auto &ch : line) {
-      if (ch == ',') {
-        ch = ' ';
-      }
-    }
-
-    std::stringstream parser(line);
-    trafficgen_blocked_warp_t blocked_warp{};
-    if (!(parser >> blocked_warp.sm_id >> blocked_warp.scheduler_id >>
-          blocked_warp.warp_id)) {
-      std::fprintf(stderr,
-                   "[trafficgen] malformed blocked warp line: %s\n",
-                   line.c_str());
-      std::abort();
-    }
-
-    const auto index = blocked_warp_index(
-        blocked_warp.sm_id, blocked_warp.scheduler_id, blocked_warp.warp_id);
-    bitmap[index / 64] |= (1ULL << (index % 64));
-  }
-
-  return bitmap;
-}
-
 static void pack_l2_access(const trafficgen_l2_access_t &access,
                            uint64_t *words) {
 
@@ -199,8 +346,8 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
 trafficgen_t::trafficgen_t(simif_t &simif,
                            StreamEngine &stream,
                            const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
-                           int trafficgenno,
-                           const std::vector<std::string> &args,
+                           int /*trafficgenno*/,
+                           const std::vector<std::string> & /*args*/,
                            int stream_to_host_idx,
                            int stream_to_host_depth,
                            int stream_from_host_idx,
@@ -210,10 +357,7 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       stream_to_host_idx(stream_to_host_idx),
       stream_to_host_depth(stream_to_host_depth),
       stream_from_host_idx(stream_from_host_idx),
-      stream_from_host_depth(stream_from_host_depth),
-      min_issue_cycle(load_min_issue_cycle(trafficgenno, args)),
-      blocked_warp_bitmap(load_blocked_warp_bitmap(trafficgenno, args)),
-      l2_accesses(load_l2_accesses(trafficgenno, args)) {
+      stream_from_host_depth(stream_from_host_depth) {
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
 }
@@ -221,15 +365,18 @@ trafficgen_t::trafficgen_t(simif_t &simif,
 trafficgen_t::~trafficgen_t() = default;
 
 void trafficgen_t::init() {
-  
+  connect_gpu_model_socket();
+
   completed_bundle_ids.fill(0);
   completed_bundle_count = 0;
   reserved_subpartition_bytes_received = 0;
   reserved_subpartitions_metadata_latched = false;
+  min_issue_cycle = 0;
+  l2_accesses.clear();
+  blocked_warp_bitmap.fill(0);
   upload_cursor = 0;
   blocked_warp_bitmap_upload_cursor = 0;
-  upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
-                                     : trafficgen_upload_phase_t::l2_accesses;
+  upload_phase = trafficgen_upload_phase_t::done;
   reserved_subpartitions_read_issued = false;
   completed_bundle_ids_read_issued = false;
   reserved_subpartitions_base_idx = 0;
@@ -237,6 +384,99 @@ void trafficgen_t::init() {
   reserved_subpartitions_words.fill(0);
   reserved_subpartitions_by_cycle.clear();
   state = trafficgen_state_t::IDLE;
+}
+
+void trafficgen_t::connect_gpu_model_socket() {
+  if (!gpu_model_socket_client) {
+    gpu_model_socket_client = std::make_unique<socket_client_t>();
+  }
+
+  gpu_model_socket_client->connect_loopback(kGpuModelSocketPort);
+  std::fprintf(stderr,
+               "[trafficgen] connected to gpu_model_socket at 127.0.0.1:%u\n",
+               static_cast<unsigned>(kGpuModelSocketPort));
+}
+
+void trafficgen_t::send_reserved_subpartitions_snapshot() const {
+  if (!gpu_model_socket_client) {
+    throw std::runtime_error(
+        "[trafficgen] gpu_model socket client is not initialized");
+  }
+
+  const std::string payload =
+      serialize_reservations_message(reserved_subpartitions_by_cycle);
+  gpu_model_socket_client->send_frame(payload);
+
+  std::fprintf(
+      stderr,
+      "[trafficgen] sent reservedSubPartitionsByCycle to gpu_model_socket: "
+      "cycles=%zu payload_bytes=%zu\n",
+      reserved_subpartitions_by_cycle.size(),
+      payload.size());
+}
+
+void trafficgen_t::receive_schedule_from_gpu_model() {
+  if (!gpu_model_socket_client) {
+    throw std::runtime_error(
+        "[trafficgen] gpu_model socket client is not initialized");
+  }
+
+  const SchedulerRoundMessage message =
+      gpu_model_socket_client->recv_message<SchedulerRoundMessage>();
+
+  min_issue_cycle = message.min_issue_cycle;
+  l2_accesses.clear();
+  l2_accesses.reserve(message.allL2TraceSteps.size());
+  for (const auto &wire_access : message.allL2TraceSteps) {
+    trafficgen_l2_access_t access{};
+    access.id = checked_u32(wire_access.mUniqueId, "l2 access unique id");
+    access.address = checked_u32(wire_access.mAddress, "l2 access address");
+    access.cycle_count =
+        checked_u32(wire_access.mCycleCount, "l2 access cycle count");
+    access.m_subpartition = checked_u32(
+        static_cast<std::uint64_t>(wire_access.mSubpartition),
+        "l2 access subpartition");
+    access.m_set_index = checked_u32(
+        static_cast<std::uint64_t>(wire_access.mSetIndex),
+        "l2 access set index");
+    access.m_tag = checked_u32(wire_access.mTag, "l2 access tag");
+    access.m_mask = checked_u32(
+        static_cast<std::uint64_t>(wire_access.mMask), "l2 access mask");
+    access.sm_id = checked_u32(
+        static_cast<std::uint64_t>(wire_access.smId), "l2 access sm id");
+    access.scheduler_id = checked_u32(
+        static_cast<std::uint64_t>(wire_access.schedulerId),
+        "l2 access scheduler id");
+    access.warp_id = checked_u32(
+        static_cast<std::uint64_t>(wire_access.warpId), "l2 access warp id");
+    access.m_bundle_id =
+        checked_u32(wire_access.mBundleId, "l2 access bundle id");
+    access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle ? 1u : 0u;
+    access.m_is_write = wire_access.mIsWrite;
+    l2_accesses.push_back(access);
+  }
+
+  std::stable_sort(l2_accesses.begin(),
+                   l2_accesses.end(),
+                   [](const trafficgen_l2_access_t &lhs,
+                      const trafficgen_l2_access_t &rhs) {
+                     return lhs.cycle_count < rhs.cycle_count;
+                   });
+
+  blocked_warp_bitmap.fill(0);
+  for (const auto &warp_key : message.blockedWarpIds) {
+    const auto index =
+        blocked_warp_index(warp_key.smId, warp_key.schedulerId, warp_key.warpId);
+    blocked_warp_bitmap[index / 64] |= (1ULL << (index % 64));
+  }
+
+  std::fprintf(stderr,
+               "[trafficgen] received schedule from gpu_model_socket: "
+               "l2_accesses=%zu blocked_warps=%zu min_issue_cycle=%" PRIu64
+               "\n",
+               l2_accesses.size(),
+               message.blockedWarpIds.size(),
+               min_issue_cycle);
 }
 
 
@@ -482,11 +722,13 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::READ_RESERVED_PARTITIONS:
   
     // read from stream until we have received the full reservedSubPartitionByCycle bitmap
-    reserved_subpartitions_bytes_received += process_reserved_subpartitions_stream();
-    if (reserved_subpartitions_bytes_received >= STREAM_BATCH_BYTES) {
-      std::fprintf(stderr, "[trafficgen] completed reading reservedSubPartitionsByCycle stream data, bytes received=%zu\n", reserved_subpartitions_bytes_received);
+    reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
+    if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
+      std::fprintf(stderr, "[trafficgen] completed reading reservedSubPartitionsByCycle stream data, bytes received=%zu\n", reserved_subpartition_bytes_received);
       
-      // todo: connect to GPU model and generate L2 accesses
+      // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
+      send_reserved_subpartitions_snapshot();
+      receive_schedule_from_gpu_model();
 
       // Reset upload progress and kick off host->target streaming.
       upload_cursor = 0;
@@ -495,7 +737,8 @@ void trafficgen_t::tick() {
                                          : trafficgen_upload_phase_t::l2_accesses;
       write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
       write(mmio_addrs.upload_start, 1);
-      write(mmio_addrs.min_issue_cycle, min_issue_cycle);
+      write(mmio_addrs.min_issue_cycle,
+            checked_u32(min_issue_cycle, "min issue cycle"));
       
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
     }

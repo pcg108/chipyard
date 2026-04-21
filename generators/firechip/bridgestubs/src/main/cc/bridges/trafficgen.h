@@ -7,6 +7,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -121,12 +123,14 @@ public:
   void finish() override;
 
 private:
+  class socket_client_t;
+
   const TRAFFICGENBRIDGEMODULE_struct mmio_addrs;
   const int stream_to_host_idx;
   const int stream_to_host_depth;
   const int stream_from_host_idx;
   const int stream_from_host_depth;
-  uint32_t min_issue_cycle = 0;
+  std::uint64_t min_issue_cycle = 0;
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
   std::array<uint64_t, STREAM_BATCH_BEATS * STREAM_WORDS_PER_BEAT>
@@ -147,10 +151,14 @@ private:
   bool reserved_subpartitions_read_issued = false;
   bool completed_bundle_ids_read_issued = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
+  std::unique_ptr<socket_client_t> gpu_model_socket_client;
 
   size_t process_reserved_subpartitions_stream();
   size_t process_completed_bundle_ids_stream();
   void push_upload_data();
+  void connect_gpu_model_socket();
+  void send_reserved_subpartitions_snapshot() const;
+  void receive_schedule_from_gpu_model();
 
   bool trafficGenActive = false;
 };
