@@ -47,6 +47,18 @@ private:
   }
 };
 
+struct SchedulingRoundStateMessage {
+  bool mainLoopComplete = false;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & mainLoopComplete;
+  }
+};
+
 struct socket_warp_key_t {
   unsigned smId = 0;
   unsigned schedulerId = 0;
@@ -124,6 +136,64 @@ private:
   }
 };
 
+struct IssuedAccessPoint {
+  std::uint64_t requestUid = 0;
+  std::uint64_t address = 0;
+  std::uint64_t cycleIssued = 0;
+  std::uint64_t l1ToL2Cycle = 0;
+  std::uint64_t elapsedCycle = 0;
+  unsigned smId = 0;
+  unsigned schedulerId = 0;
+  unsigned warpId = 0;
+  bool isWrite = false;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & requestUid;
+    ar & address;
+    ar & cycleIssued;
+    ar & l1ToL2Cycle;
+    ar & elapsedCycle;
+    ar & smId;
+    ar & schedulerId;
+    ar & warpId;
+    ar & isWrite;
+  }
+};
+
+struct IssueScheduleResult {
+  std::vector<IssuedAccessPoint> issuedAccesses;
+  std::vector<std::uint64_t> completedBundleIds;
+  std::uint64_t currentCycleAfterIssue = 0;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & issuedAccesses;
+    ar & completedBundleIds;
+    ar & currentCycleAfterIssue;
+  }
+};
+
+struct TrafficGenResultMessage {
+  IssueScheduleResult trafficGenResult;
+  bool hasPendingWork = false;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & trafficGenResult;
+    ar & hasPendingWork;
+  }
+};
+
 std::string errno_message(const std::string &prefix) {
   std::ostringstream oss;
   oss << prefix << ": " << std::strerror(errno);
@@ -190,11 +260,8 @@ void read_all(int fd, void *buffer, std::size_t size) {
   }
 }
 
-std::string serialize_reservations_message(
-    const L2SubpartitionReservationsByCycle &reserved_subpartitions_by_cycle) {
-  ReservationsMessage message;
-  message.reservedSubpartitionsByCycle = reserved_subpartitions_by_cycle;
-
+template <typename T>
+std::string serialize_message(const T &message) {
   std::ostringstream oss(std::ios::binary);
   boost::archive::binary_oarchive archive(oss);
   archive << message;
@@ -343,6 +410,24 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
   words[7] = 0ULL;
 }
 
+static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
+  trafficgen_l2_access_t access{};
+  access.id = static_cast<uint32_t>(words[0] & 0xffffffffULL);
+  access.address = static_cast<uint32_t>(words[0] >> 32);
+  access.cycle_count = static_cast<uint32_t>(words[1] & 0xffffffffULL);
+  access.m_subpartition = static_cast<uint32_t>(words[1] >> 32);
+  access.m_set_index = static_cast<uint32_t>(words[2] & 0xffffffffULL);
+  access.m_tag = static_cast<uint32_t>(words[2] >> 32);
+  access.m_mask = static_cast<uint32_t>(words[3] & 0xffffffffULL);
+  access.sm_id = static_cast<uint32_t>(words[3] >> 32);
+  access.scheduler_id = static_cast<uint32_t>(words[4] & 0xffffffffULL);
+  access.warp_id = static_cast<uint32_t>(words[4] >> 32);
+  access.m_bundle_id = static_cast<uint32_t>(words[5] & 0xffffffffULL);
+  access.m_wake_relevant_bundle = static_cast<uint32_t>(words[5] >> 32);
+  access.m_is_write = (words[6] & 0x1ULL) != 0;
+  return access;
+}
+
 trafficgen_t::trafficgen_t(simif_t &simif,
                            StreamEngine &stream,
                            const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
@@ -369,6 +454,14 @@ void trafficgen_t::init() {
 
   completed_bundle_ids.fill(0);
   completed_bundle_count = 0;
+  completed_bundle_stream_bytes.fill(0);
+  completed_bundle_bytes_received = 0;
+  completed_bundle_read_issued = false;
+  issued_access_writeback_entries.clear();
+  issued_access_writeback_stream_bytes.clear();
+  issued_access_writeback_count = 0;
+  issued_access_writeback_bytes_received = 0;
+  issued_access_writeback_read_issued = false;
   reserved_subpartition_bytes_received = 0;
   reserved_subpartitions_metadata_latched = false;
   min_issue_cycle = 0;
@@ -378,7 +471,6 @@ void trafficgen_t::init() {
   blocked_warp_bitmap_upload_cursor = 0;
   upload_phase = trafficgen_upload_phase_t::done;
   reserved_subpartitions_read_issued = false;
-  completed_bundle_ids_read_issued = false;
   reserved_subpartitions_base_idx = 0;
   reserved_subpartitions_base_cycle = 0;
   reserved_subpartitions_words.fill(0);
@@ -397,14 +489,30 @@ void trafficgen_t::connect_gpu_model_socket() {
                static_cast<unsigned>(kGpuModelSocketPort));
 }
 
+bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
+  if (!gpu_model_socket_client) {
+    throw std::runtime_error(
+        "[trafficgen] gpu_model socket client is not initialized");
+  }
+
+  const SchedulingRoundStateMessage message =
+      gpu_model_socket_client->recv_message<SchedulingRoundStateMessage>();
+  std::fprintf(stderr,
+               "[trafficgen] received scheduling round state from "
+               "gpu_model_socket: mainLoopComplete=%s\n",
+               message.mainLoopComplete ? "true" : "false");
+  return message.mainLoopComplete;
+}
+
 void trafficgen_t::send_reserved_subpartitions_snapshot() const {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
         "[trafficgen] gpu_model socket client is not initialized");
   }
 
-  const std::string payload =
-      serialize_reservations_message(reserved_subpartitions_by_cycle);
+  ReservationsMessage message;
+  message.reservedSubpartitionsByCycle = reserved_subpartitions_by_cycle;
+  const std::string payload = serialize_message(message);
   gpu_model_socket_client->send_frame(payload);
 
   std::fprintf(
@@ -580,24 +688,34 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
 }
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
-  std::vector<uint8_t> outbuf(COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES, 0);
+  const size_t total_bytes = COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES;
+  if (completed_bundle_bytes_received >= total_bytes) {
+    return 0;
+  }
+
+  const size_t remaining_bytes = total_bytes - completed_bundle_bytes_received;
   const auto bytes_received =
       pull(this->stream_to_host_idx,
-           outbuf.data(),
-           COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES,
-           COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES);
+           completed_bundle_stream_bytes.data() + completed_bundle_bytes_received,
+           remaining_bytes,
+           0);
   if (bytes_received == 0) {
     return 0;
   }
-  if (bytes_received != COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES) {
+  if (bytes_received > remaining_bytes) {
     std::fprintf(stderr,
-                 "[trafficgen] expected %zu bytes for completedBundleIds, got %zu\n",
-                 COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES,
+                 "[trafficgen] completedBundleIds overrun: remaining=%zu got=%zu\n",
+                 remaining_bytes,
                  bytes_received);
     std::abort();
   }
+  completed_bundle_bytes_received += bytes_received;
+  if (completed_bundle_bytes_received < total_bytes) {
+    return bytes_received;
+  }
 
-  auto *bundle_ids = reinterpret_cast<const uint32_t *>(outbuf.data());
+  auto *bundle_ids =
+      reinterpret_cast<const uint32_t *>(completed_bundle_stream_bytes.data());
   for (size_t i = 0; i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
     completed_bundle_ids[i] = bundle_ids[i];
   }
@@ -614,6 +732,54 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
                  completed_bundle_ids[i]);
   }
 
+  return bytes_received;
+}
+
+size_t
+trafficgen_t::process_issued_access_writeback_stream() {
+  if (issued_access_writeback_count == 0) {
+    return 0;
+  }
+  const size_t total_bytes =
+      static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES;
+  if (issued_access_writeback_bytes_received >= total_bytes) {
+    return 0;
+  }
+
+  const size_t remaining_bytes = total_bytes - issued_access_writeback_bytes_received;
+  const auto bytes_received =
+      pull(this->stream_to_host_idx,
+           issued_access_writeback_stream_bytes.data() +
+               issued_access_writeback_bytes_received,
+           remaining_bytes,
+           0);
+  if (bytes_received == 0) {
+    return 0;
+  }
+  if (bytes_received > remaining_bytes) {
+    std::fprintf(stderr,
+                 "[trafficgen] issuedAccessWriteback overrun: remaining=%zu got=%zu\n",
+                 remaining_bytes,
+                 bytes_received);
+    std::abort();
+  }
+  issued_access_writeback_bytes_received += bytes_received;
+  if (issued_access_writeback_bytes_received < total_bytes) {
+    return bytes_received;
+  }
+
+  issued_access_writeback_entries.clear();
+  issued_access_writeback_entries.reserve(issued_access_writeback_count);
+  for (uint32_t access_idx = 0; access_idx < issued_access_writeback_count; ++access_idx) {
+    const auto *beat_words = reinterpret_cast<const uint64_t *>(
+        issued_access_writeback_stream_bytes.data() +
+        static_cast<size_t>(access_idx) * STREAM_WIDTH_BYTES);
+    issued_access_writeback_entries.push_back(unpack_l2_access(beat_words));
+  }
+
+  std::fprintf(stderr,
+               "[trafficgen] issuedAccessWriteback count=%u\n",
+               issued_access_writeback_count);
   return bytes_received;
 }
 
@@ -706,6 +872,11 @@ void trafficgen_t::tick() {
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
 
+      if (receive_main_loop_complete_from_gpu_model()) {
+        state = trafficgen_state_t::IDLE;
+        break;
+      }
+
       // trigger bridge module to send reservedSubPartitionsByCycle by stream
       reserved_subpartition_bytes_received = 0;
       reserved_subpartitions_metadata_latched = false;
@@ -713,13 +884,23 @@ void trafficgen_t::tick() {
       reserved_subpartitions_base_cycle = 0;
       reserved_subpartitions_words.fill(0);
       reserved_subpartitions_by_cycle.clear();
-      write(mmio_addrs.read_reserved_subpartitions, 1);
+      reserved_subpartitions_read_issued = false;
 
       state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
     }
 
     break;
   case trafficgen_state_t::READ_RESERVED_PARTITIONS:
+    if (!reserved_subpartitions_read_issued) {
+      reserved_subpartition_bytes_received = 0;
+      reserved_subpartitions_metadata_latched = false;
+      reserved_subpartitions_base_idx = 0;
+      reserved_subpartitions_base_cycle = 0;
+      reserved_subpartitions_words.fill(0);
+      reserved_subpartitions_by_cycle.clear();
+      write(mmio_addrs.read_reserved_subpartitions, 1);
+      reserved_subpartitions_read_issued = true;
+    }
   
     // read from stream until we have received the full reservedSubPartitionByCycle bitmap
     reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
@@ -728,6 +909,8 @@ void trafficgen_t::tick() {
       
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
       send_reserved_subpartitions_snapshot();
+
+      // read the L2 access schedule, blocked warp IDs, and min issue cycle from gpu_model via socket
       receive_schedule_from_gpu_model();
 
       // Reset upload progress and kick off host->target streaming.
@@ -739,6 +922,7 @@ void trafficgen_t::tick() {
       write(mmio_addrs.upload_start, 1);
       write(mmio_addrs.min_issue_cycle,
             checked_u32(min_issue_cycle, "min issue cycle"));
+      reserved_subpartitions_read_issued = false;
       
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
     }
@@ -746,6 +930,7 @@ void trafficgen_t::tick() {
     break;
   case trafficgen_state_t::UPLOAD_SCHEDULE:
 
+    // write schedule to bridge module via stream
     push_upload_data();
 
     if (upload_phase == trafficgen_upload_phase_t::done &&
@@ -754,32 +939,117 @@ void trafficgen_t::tick() {
 
       std::fprintf(stderr, "[trafficgen] upload completed, entering traffic issuing stage\n");
 
-      write(mmio_addrs.pause_target, 0);
+      write(mmio_addrs.start_round, 1);
+      // pause_target is a pulse-driven toggle in the bridge module.
+      write(mmio_addrs.pause_target, 1);
       state = trafficgen_state_t::ISSUING_TRAFFIC;
     }
 
     break;
   case trafficgen_state_t::ISSUING_TRAFFIC:
-    // Active traffic issuing flow will live here.
+    // Wait for the target to finish generating memory traffic for the current round.
 
-    // once target stops being busy, go back to READ_RESERVED_PARTITIONS or IDLE if we are done
-    if (!read(mmio_addrs.target_busy)) {
-      state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
+    // Pause the target before reading back round results.
+    if (!read(mmio_addrs.target_busy) && read(mmio_addrs.round_complete)) {
+      write(mmio_addrs.pause_target, 1);
+      issued_access_writeback_entries.clear();
+      issued_access_writeback_stream_bytes.clear();
+      issued_access_writeback_count = 0;
+      issued_access_writeback_bytes_received = 0;
+      issued_access_writeback_read_issued = false;
+      completed_bundle_stream_bytes.fill(0);
+      completed_bundle_bytes_received = 0;
+      completed_bundle_read_issued = false;
+      state = trafficgen_state_t::READING_TRAFFICGEN_OUTPUT;
     }
     break;
-  }
+  case trafficgen_state_t::READING_TRAFFICGEN_OUTPUT:
+    {
 
+      // read issued accesses with writeback info, completed bundle IDs, and other round results from the target via MMIO and stream, then send them to gpu_model via socket
+      if (!issued_access_writeback_read_issued) {
+        issued_access_writeback_count = static_cast<uint32_t>(read(mmio_addrs.issued_access_writeback_count));
+        issued_access_writeback_stream_bytes.assign(static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES, 0);
+        issued_access_writeback_bytes_received = 0;
+        issued_access_writeback_entries.clear();
+        if (issued_access_writeback_count != 0) {
+          write(mmio_addrs.read_issued_access_writeback, 1);
+        }
+        issued_access_writeback_read_issued = true;
+      }
+      if (issued_access_writeback_bytes_received < static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES) {
+        process_issued_access_writeback_stream();
+      }
+      if (issued_access_writeback_bytes_received < static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES) {
+        break;
+      }
 
+      if (!completed_bundle_read_issued) {
+        completed_bundle_stream_bytes.fill(0);
+        completed_bundle_bytes_received = 0;
+        write(mmio_addrs.read_completed_bundle_ids, 1);
+        completed_bundle_read_issued = true;
+      }
+      if (completed_bundle_bytes_received < COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES) {
+        process_completed_bundle_ids_stream();
+      }
+      if (completed_bundle_bytes_received < COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES) {
+        break;
+      }
 
-  
+      TrafficGenResultMessage message;
+      message.trafficGenResult.issuedAccesses.reserve(issued_access_writeback_entries.size());
+      for (const auto &access : issued_access_writeback_entries) {
+        IssuedAccessPoint issued_access_point{};
+        issued_access_point.requestUid = access.id;
+        issued_access_point.address = access.address;
+        issued_access_point.cycleIssued = access.cycle_count;
+        issued_access_point.l1ToL2Cycle = 0;
+        issued_access_point.elapsedCycle = 0;
+        issued_access_point.smId = access.sm_id;
+        issued_access_point.schedulerId = access.scheduler_id;
+        issued_access_point.warpId = access.warp_id;
+        issued_access_point.isWrite = access.m_is_write;
+        message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
+      }
 
+      message.trafficGenResult.completedBundleIds.clear();
+      message.trafficGenResult.completedBundleIds.reserve(completed_bundle_count);
+      for (size_t i = 0; i < completed_bundle_count && i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
+        message.trafficGenResult.completedBundleIds.push_back(completed_bundle_ids[i]);
+      }
+      message.trafficGenResult.currentCycleAfterIssue =
+          static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue));
+      message.hasPendingWork = read(mmio_addrs.has_pending_work) != 0;
 
-  if (read(mmio_addrs.completed_bundle_ids_valid) &&
-      read(mmio_addrs.completed_bundle_count_valid) &&
-      !completed_bundle_ids_read_issued) {
-    write(mmio_addrs.read_completed_bundle_ids, 1);
-    completed_bundle_ids_read_issued = true;
-    process_completed_bundle_ids_stream();
+      if (!gpu_model_socket_client) {
+        throw std::runtime_error(
+            "[trafficgen] gpu_model socket client is not initialized");
+      }
+      gpu_model_socket_client->send_frame(serialize_message(message));
+
+      if (receive_main_loop_complete_from_gpu_model()) {
+        state = trafficgen_state_t::IDLE;
+      } else {
+        issued_access_writeback_entries.clear();
+        issued_access_writeback_stream_bytes.clear();
+        issued_access_writeback_count = 0;
+        issued_access_writeback_bytes_received = 0;
+        issued_access_writeback_read_issued = false;
+        completed_bundle_stream_bytes.fill(0);
+        completed_bundle_bytes_received = 0;
+        completed_bundle_read_issued = false;
+        reserved_subpartition_bytes_received = 0;
+        reserved_subpartitions_metadata_latched = false;
+        reserved_subpartitions_base_idx = 0;
+        reserved_subpartitions_base_cycle = 0;
+        reserved_subpartitions_words.fill(0);
+        reserved_subpartitions_by_cycle.clear();
+        reserved_subpartitions_read_issued = false;
+        state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
+      }
+    }
+    break;
   }
 }
 

@@ -3,7 +3,7 @@
 package firechip.bridgeinterfaces
 
 import chisel3._
-import chisel3.util.Decoupled
+import chisel3.util._
 
 // hardware record type to represent an L2 access from host 
 class L2Access extends Bundle {
@@ -88,16 +88,25 @@ object BlockedWarpBitmap {
     )
 }
 
+class ReservationClearRequest extends Bundle {
+  val cycle = UInt(32.W)
+  val subpartition = UInt(32.W)
+}
+
 class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val targetBusy = Output(Bool())
+  val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
+  val roundComplete = Output(Bool())
   val currentCycleAfterIssue = Output(UInt(32.W))
+  val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
+  val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(5.W))
   val completedBundleIdWriteData = Output(UInt(32.W))
   val completedBundleCountWriteEn = Output(Bool())
   val completedBundleCountWriteData = Output(UInt(6.W))
-  val trafficComplete = Input(Bool())
+  val startRound = Input(Bool())
   val minIssueCycle = Input(UInt(32.W))
   val blockedWarpBitmapReady = Input(Bool())
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
@@ -108,9 +117,7 @@ class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val accessReadEn = Output(Bool())
   val accessReadData = Input(new L2Access)
   val accessReadDataValid = Input(Bool())
-  val accessStoredCount = Input(UInt(32.W))
   val uploadDone = Input(Bool())
-  val uploadOverflow = Input(Bool())
 }
 
 case class TrafficGenBridgeKey(maxL2AccessEntries: Int, nGenerators: Int)

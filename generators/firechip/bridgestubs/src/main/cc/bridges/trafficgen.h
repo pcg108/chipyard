@@ -15,25 +15,28 @@
 #include <vector>
 
 struct TRAFFICGENBRIDGEMODULE_struct {
-  uint64_t target_busy;
   uint64_t start_trafficgen;
-  uint64_t current_cycle_after_issue;
+  uint64_t target_busy;
+  uint64_t has_pending_work;
   uint64_t pause_target;
+  uint64_t start_round;
   uint64_t read_reserved_subpartitions;
-  uint64_t read_completed_bundle_ids;
-  uint64_t traffic_complete;
-  uint64_t min_issue_cycle;
-  uint64_t upload_count;
-  uint64_t upload_start;
-  uint64_t upload_done;
-  uint64_t upload_overflow;
-  uint64_t blocked_warp_upload_done;
-  uint64_t reserved_subpartitions_snapshot_valid;
   uint64_t reserved_subpartitions_base_idx;
   uint64_t reserved_subpartitions_base_cycle_low;
   uint64_t reserved_subpartitions_base_cycle_high;
+  uint64_t upload_count;
+  uint64_t upload_start;
+  uint64_t round_complete;
+  uint64_t upload_done;
+  uint64_t upload_overflow;
+  uint64_t blocked_warp_upload_done;
+  uint64_t min_issue_cycle;
   uint64_t completed_bundle_ids_valid;
   uint64_t completed_bundle_count_valid;
+  uint64_t read_completed_bundle_ids;
+  uint64_t read_issued_access_writeback;
+  uint64_t current_cycle_after_issue;
+  uint64_t issued_access_writeback_count;
   uint64_t completed_bundle_count;
 };
 
@@ -73,6 +76,7 @@ enum class trafficgen_state_t {
   READ_RESERVED_PARTITIONS,
   UPLOAD_SCHEDULE,
   ISSUING_TRAFFIC,
+  READING_TRAFFICGEN_OUTPUT,
 };
 
 class trafficgen_t final : public streaming_bridge_driver_t {
@@ -138,6 +142,15 @@ private:
   L2SubpartitionReservationsByCycle reserved_subpartitions_by_cycle;
   std::array<uint32_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
+  std::array<uint8_t, COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES>
+      completed_bundle_stream_bytes{};
+  size_t completed_bundle_bytes_received = 0;
+  bool completed_bundle_read_issued = false;
+  std::vector<trafficgen_l2_access_t> issued_access_writeback_entries;
+  std::vector<uint8_t> issued_access_writeback_stream_bytes;
+  uint32_t issued_access_writeback_count = 0;
+  size_t issued_access_writeback_bytes_received = 0;
+  bool issued_access_writeback_read_issued = false;
 
   uint32_t reserved_subpartitions_base_idx = 0;
   std::uint64_t reserved_subpartitions_base_cycle = 0;
@@ -149,14 +162,15 @@ private:
   trafficgen_upload_phase_t upload_phase = trafficgen_upload_phase_t::l2_accesses;
   bool target_busy = false;
   bool reserved_subpartitions_read_issued = false;
-  bool completed_bundle_ids_read_issued = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
   std::unique_ptr<socket_client_t> gpu_model_socket_client;
 
   size_t process_reserved_subpartitions_stream();
   size_t process_completed_bundle_ids_stream();
+  size_t process_issued_access_writeback_stream();
   void push_upload_data();
   void connect_gpu_model_socket();
+  bool receive_main_loop_complete_from_gpu_model() const;
   void send_reserved_subpartitions_snapshot() const;
   void receive_schedule_from_gpu_model();
 

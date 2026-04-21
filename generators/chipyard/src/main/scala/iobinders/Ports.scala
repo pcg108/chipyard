@@ -20,7 +20,7 @@ import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, Slave
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
-import firechip.bridgeinterfaces.{BlockedWarpBitmap, L2Access}
+import firechip.bridgeinterfaces.{BlockedWarpBitmap, L2Access, ReservationClearRequest}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -123,14 +123,18 @@ case class CTCPort (val getIO: () => Data, val portId: Int)
 
 class TrafficGenPortPeripheralIO(val nGenerators: Int) extends Bundle {
   val targetBusy = Output(Bool())
+  val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
+  val roundComplete = Output(Bool())
   val currentCycleAfterIssue = Output(UInt(32.W))
+  val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
+  val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(5.W))
   val completedBundleIdWriteData = Output(UInt(32.W))
   val completedBundleCountWriteEn = Output(Bool())
   val completedBundleCountWriteData = Output(UInt(6.W))
-  val trafficComplete = Input(Bool())
+  val startRound = Input(Bool())
   val minIssueCycle = Input(UInt(32.W))
   val blockedWarpBitmapReady = Input(Bool())
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
@@ -141,9 +145,7 @@ class TrafficGenPortPeripheralIO(val nGenerators: Int) extends Bundle {
   val accessReadEn = Output(Bool())
   val accessReadData = Input(new L2Access)
   val accessReadDataValid = Input(Bool())
-  val accessStoredCount = Input(UInt(32.W))
   val uploadDone = Input(Bool())
-  val uploadOverflow = Input(Bool())
 }
 
 case class TrafficGenPort(val getIO: () => ClockedIO[TrafficGenPortPeripheralIO])

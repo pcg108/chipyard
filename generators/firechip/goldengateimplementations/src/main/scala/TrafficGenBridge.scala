@@ -24,7 +24,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key)))
     val target = hPort.hBits.trafficgen
 
-    //// toggled by bridge driver to pause/resume target while generating traffic patterns
+    //// STEP 1: toggled by bridge driver to pause/resume target while generating traffic patterns
     val pauseTarget = RegInit(false.B)
     val targetPaused = RegInit(false.B)
     when(pauseTarget.asBool) {
@@ -35,7 +35,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       hPort.fromHost.hReady &&
       !targetPaused
 
-    //// reservedSubPartitionsByCycle ////
+    //// STEP 2: get reserved sub-partitions by cycle
 
     val reservedSubPartitionEntries = 4096
     val reservedSubPartitionEntryWidth = 256
@@ -46,6 +46,38 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val reservedSubPartitionsBaseIdx = RegInit(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedSubPartitionsBaseCycle = RegInit(0.U(64.W))
     val reservedSubPartitionIdxWidth = reservedSubPartitionsBaseIdx.getWidth
+
+    // logic to clear bits in reservedSubPartition table based on reservation clear requests from target 
+    val reservedSubPartitionSelectWidth = log2Ceil(reservedSubPartitionEntryWidth)
+
+    class ReservationUpdate extends Bundle {
+      val idx = UInt(reservedSubPartitionIdxWidth.W)
+      val mask = UInt(reservedSubPartitionEntryWidth.W)
+      val setNotClear = Bool()
+    }
+
+    class ReservationLookup extends Bundle {
+      val cycle = UInt(32.W)
+      val subpartition = UInt(32.W)
+    }
+
+    // get one-hot encoding of sub-partition for updating the reservation table
+    def reservationMaskForSubpartition(subpartition: UInt): UInt =
+      UIntToOH(
+        subpartition(reservedSubPartitionSelectWidth - 1, 0),
+        reservedSubPartitionEntryWidth,
+      ).asUInt
+
+    def reservationWindowLookup(cycle: UInt): (Bool, UInt) = {
+      val cycle64 = cycle.pad(64)
+      val cycleDelta = cycle64 - reservedSubPartitionsBaseCycle
+      val cycleBeforeBase = cycle64 < reservedSubPartitionsBaseCycle
+      val cycleOutsideWindow = cycleBeforeBase || cycleDelta >= reservedSubPartitionEntries.U
+      val wrappedOffset = cycleDelta(reservedSubPartitionIdxWidth - 1, 0)
+      val reservationIdx =
+        (reservedSubPartitionsBaseIdx + wrappedOffset)(reservedSubPartitionIdxWidth - 1, 0)
+      (!cycleOutsideWindow, reservationIdx)
+    }
 
     // Temporary initialization preserves the old placeholder contents until the
     // target starts maintaining this table directly.
@@ -66,14 +98,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // trigger for bridge driver to read reservedSubPartitionsByCycle
     val readReservedSubPartitions = Wire(Bool())
 
+    // need 2 beats to stream 32 32-bit bundle IDs (32x32 = 1024 bits = 2x512)
+    val completedBundleIdBeats = 2
+
     // Send one 256-bit entry per 512-bit beat and leave the upper half zeroed so
     // the snapshot path only needs a single SyncReadMem read port.
     val reservedSubPartitionBeats = reservedSubPartitionEntries
-    val streamBeatIdx = RegInit(0.U(log2Ceil(reservedSubPartitionBeats).W))
+    val streamBeatIdxWidth = log2Ceil(math.max(math.max(reservedSubPartitionBeats, key.maxL2AccessEntries), completedBundleIdBeats) + 1)
+    val streamBeatIdx = RegInit(0.U(streamBeatIdxWidth.W))
 
     // indicates that we have issued a read to the SyncReadMem and are waiting for data to return
     val reservedStreamReadPending = RegInit(false.B)
 
+    // index and enable signals to read from SyncReadMem for streaming out reserved sub-partition data
     val reservedStreamReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedStreamReadEn = WireDefault(false.B)
     val reservedStreamEntryBits = reservedSubPartitionsByCycle.read(
@@ -91,21 +128,72 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val reservedStreamStartPending = RegInit(false.B)
     val reservedStreamBits = Cat(0.U(reservedSubPartitionEntryWidth.W), reservedStreamEntryReg)
 
-    // Upload-side reservation updates use a read/modify/write sequence so
-    // multiple accesses to the same cycle accumulate into the 256-bit mask.
-    val reservedUploadReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
-    val reservedUploadReadEn = WireDefault(false.B)
-    val reservedUploadEntryBits = reservedSubPartitionsByCycle.read(
-      reservedUploadReadIdx,
-      reservedUploadReadEn,
+    // buffer reservation updates from both uploads and reservation clear requests, and apply them to the reservedSubPartitionsByCycle table one at a time since SyncReadMem doesn't support read-modify-write
+    val reservationUpdateReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
+    val reservationUpdateReadEn = WireDefault(false.B)
+    val reservationUpdateReadBits = reservedSubPartitionsByCycle.read(
+      reservationUpdateReadIdx,
+      reservationUpdateReadEn,
     )
-    // we take one cycle to read the current cycle bitmask for reservations and then write on next cycle
-    val reservedUploadPending = RegInit(false.B)
-    val reservedUploadIdxReg = Reg(UInt(log2Ceil(reservedSubPartitionEntries).W))
-    val reservedUploadMaskReg = Reg(UInt(reservedSubPartitionEntryWidth.W))
+    val reservationUpdateReadPending = RegInit(false.B)
+    val reservationUpdateReqReg = Reg(new ReservationUpdate)
+
+    val clearQueueDepth = 4
+    val reservationClearQueues = Seq.fill(key.nGenerators) {
+      Module(new Queue(new ReservationLookup, clearQueueDepth))
+    }
+
+    // target drives reservation clear requests, which are enqueued and arbitrated before being applied to the reservation table
+    for ((queue, lane) <- reservationClearQueues.zipWithIndex) {
+      queue.io.enq.valid := target.reservationClear(lane).valid
+      queue.io.enq.bits.cycle := target.reservationClear(lane).bits.cycle
+      queue.io.enq.bits.subpartition := target.reservationClear(lane).bits.subpartition
+      target.reservationClear(lane).ready := queue.io.enq.ready
+    }
+
+    // we pick one clear request in this cycle
+    val reservationClearArb = Module(new RRArbiter(new ReservationLookup, key.nGenerators))
+    for ((queue, lane) <- reservationClearQueues.zipWithIndex) {
+      reservationClearArb.io.in(lane) <> queue.io.deq
+    }
+
+    // Buffer target-issued L2 accesses before appending them into a per-round writeback store.
+    val issuedAccessWritebackStore = SyncReadMem(key.maxL2AccessEntries, new L2Access)
+    val issuedAccessWritebackCount = RegInit(0.U(32.W))
+    val issuedAccessWritebackIdx = RegInit(0.U(32.W))
+    val issuedAccessWritebackQueueDepth = 4
+    val issuedAccessWritebackQueues = Seq.fill(key.nGenerators) {
+      Module(new Queue(new L2Access, issuedAccessWritebackQueueDepth))
+    }
+    for ((queue, lane) <- issuedAccessWritebackQueues.zipWithIndex) {
+      queue.io.enq <> target.issuedAccessWriteback(lane)
+    }
+    val issuedAccessWritebackArb = Module(new RRArbiter(new L2Access, key.nGenerators))
+    for ((queue, lane) <- issuedAccessWritebackQueues.zipWithIndex) {
+      issuedAccessWritebackArb.io.in(lane) <> queue.io.deq
+    }
+    val doIssuedAccessWriteback = issuedAccessWritebackArb.io.out.valid &&
+      issuedAccessWritebackIdx < key.maxL2AccessEntries.U
+    issuedAccessWritebackArb.io.out.ready := doIssuedAccessWriteback
+    when(doIssuedAccessWriteback) {
+      issuedAccessWritebackStore.write(issuedAccessWritebackIdx, issuedAccessWritebackArb.io.out.bits)
+      issuedAccessWritebackIdx := issuedAccessWritebackIdx + 1.U
+      issuedAccessWritebackCount := issuedAccessWritebackCount + 1.U
+    }
+    // send the issued access back to the bridge driver when requested
+    val readIssuedAccessWriteback = Wire(Bool())
+    val issuedAccessStreamReadIdx = WireDefault(0.U(streamBeatIdxWidth.W))
+    val issuedAccessStreamReadEn = WireDefault(false.B)
+    val issuedAccessStreamEntryBits = issuedAccessWritebackStore.read(
+      issuedAccessStreamReadIdx,
+      issuedAccessStreamReadEn,
+    )
+    val issuedAccessStreamEntryReg = Reg(new L2Access)
+    val issuedAccessStreamReadPending = RegInit(false.B)
+    val issuedAccessStreamDataValid = RegInit(false.B)
     
     
-    //// completedBundleIds ////
+    //// STEP 5: get completed bundle IDs from TG
 
     // vector of integers to store completed bundle IDs completed by target, to be read by bridge driver 
     val completedBundleIds = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
@@ -126,8 +214,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // trigger for bridge driver to read completedBundleIds 
     val readCompletedBundleIds = Wire(Bool())
 
-    // need 2 beats to stream 32 32-bit bundle IDs (32x32 = 1024 bits = 2x512)
-    val completedBundleIdBeats = 2
     // completedBundleIdsPacked(0) contains completedBundleIds(15, 0) and completedBundleIdsPacked(1) contains completedBundleIds(31, 16)
     val completedBundleIdsPacked = Wire(Vec(completedBundleIdBeats, UInt(L2Access.streamWidthBits.W)))
     for (beat <- 0 until completedBundleIdBeats) {
@@ -136,30 +222,45 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     //// streamEnq target->host for reservedSubPartitionsByCycle and completedBundleIds ////
 
-    // stream is used for both reservedSubPartitionsByCycle and completedBundleIds
-    val streamSourceIdle :: streamSourceReservedSubPartitions :: streamSourceCompletedBundleIds :: Nil = Enum(3)
+    // stream is used for reservedSubPartitionsByCycle, completedBundleIds, and issuedAccessWriteback
+    val (
+      streamSourceIdle ::
+      streamSourceReservedSubPartitions ::
+      streamSourceCompletedBundleIds ::
+      streamSourceIssuedAccessWriteback ::
+      Nil
+    ) = Enum(4)
     val streamSource = RegInit(streamSourceIdle)
 
-    val streamPayloadValid = Mux(
-      streamSource === streamSourceCompletedBundleIds,
-      true.B,
+    val streamPayloadValid = MuxLookup(
+      streamSource,
       reservedStreamDataValid,
+      Seq(
+        streamSourceCompletedBundleIds -> true.B,
+        streamSourceIssuedAccessWriteback -> issuedAccessStreamDataValid,
+      ),
     )
 
     // stream bits are either the packed reservedSubPartitionsByCycle or the packed completedBundleIds
-    streamEnq.bits := Mux(
-      streamSource === streamSourceCompletedBundleIds,
-      completedBundleIdsPacked(streamBeatIdx(0)), // only 2 beats, so only need the least significant bit of streamBeatIdx to index
+    streamEnq.bits := MuxLookup(
+      streamSource,
       reservedStreamBits,
+      Seq(
+        streamSourceCompletedBundleIds -> completedBundleIdsPacked(streamBeatIdx(0)), // only 2 beats, so only need the least significant bit of streamBeatIdx to index
+        streamSourceIssuedAccessWriteback -> L2Access.pack(issuedAccessStreamEntryReg),
+      ),
     )
     val streamActive = streamSource =/= streamSourceIdle
     streamEnq.valid := streamActive && fire && streamPayloadValid
     val doStreamEnq = streamEnq.valid && streamEnq.ready
 
-    val streamLastBeat = Mux(
-      streamSource === streamSourceCompletedBundleIds,
-      streamBeatIdx === (completedBundleIdBeats - 1).U,
+    val streamLastBeat = MuxLookup(
+      streamSource,
       streamBeatIdx === (reservedSubPartitionBeats - 1).U,
+      Seq(
+        streamSourceCompletedBundleIds -> (streamBeatIdx === (completedBundleIdBeats - 1).U),
+        streamSourceIssuedAccessWriteback -> (streamBeatIdx === (issuedAccessWritebackCount - 1.U)),
+      ),
     )
 
     // when the SyncReadMem returns, latch it in a register
@@ -171,6 +272,25 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservedStreamEntryReg := reservedStreamEntryBits
       reservedStreamReadPending := false.B
       reservedStreamDataValid := true.B
+    }
+    when(issuedAccessStreamReadPending) {
+      issuedAccessStreamEntryReg := issuedAccessStreamEntryBits
+      issuedAccessStreamReadPending := false.B
+      issuedAccessStreamDataValid := true.B
+    }
+
+    // write the updated entry back to the reservedSubPartitionsByCycle table when we get a response from the SyncReadMem for a reservation update read, and then clear the pending flag to allow next updates
+    when(reservationUpdateReadPending) {
+      val updatedEntryBits = Mux(
+        reservationUpdateReqReg.setNotClear,
+        reservationUpdateReadBits | reservationUpdateReqReg.mask,
+        reservationUpdateReadBits & ~reservationUpdateReqReg.mask,
+      )
+      reservedSubPartitionsByCycle.write(
+        reservationUpdateReqReg.idx,
+        updatedEntryBits,
+      )
+      reservationUpdateReadPending := false.B
     }
 
     // state machine to stream reservedSubPartitionsByCycle or completedBundleIds when triggered by bridge driver, and to keep track of stream beat index
@@ -196,6 +316,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }.elsewhen(readCompletedBundleIds && completedBundleIdsValid && completedBundleCountValid && !streamActive) {
       streamSource := streamSourceCompletedBundleIds
       streamBeatIdx := 0.U
+    }.elsewhen(readIssuedAccessWriteback && issuedAccessWritebackCount =/= 0.U && !streamActive) {
+      streamSource := streamSourceIssuedAccessWriteback
+      streamBeatIdx := 0.U
+      issuedAccessStreamReadIdx := 0.U
+      issuedAccessStreamReadEn := true.B
+      issuedAccessStreamReadPending := true.B
+      issuedAccessStreamDataValid := false.B
     }.elsewhen(doStreamEnq) {
       when(streamSource === streamSourceCompletedBundleIds) {
         when(streamLastBeat) {
@@ -203,6 +330,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           streamBeatIdx := 0.U
         }.otherwise {
           streamBeatIdx := streamBeatIdx + 1.U
+        }
+      }.elsewhen(streamSource === streamSourceIssuedAccessWriteback) {
+        when(streamLastBeat) {
+          streamSource := streamSourceIdle
+          streamBeatIdx := 0.U
+          issuedAccessStreamDataValid := false.B
+        }.otherwise {
+          val nextBeatIdx = streamBeatIdx + 1.U
+          streamBeatIdx := nextBeatIdx
+          issuedAccessStreamReadIdx := nextBeatIdx
+          issuedAccessStreamReadEn := true.B
+          issuedAccessStreamReadPending := true.B
+          issuedAccessStreamDataValid := false.B
         }
       }.otherwise {
         // when we are not on the last beat, issue next read to SyncReadMem
@@ -225,7 +365,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
     
-    /// streamDeq for host->target streaming of L2Accesses and blocked warp bitmap from bridge driver to bridge module
+    /// STEP 3: streamDeq for host->target streaming of L2Accesses and blocked warp bitmap from bridge driver to bridge module
 
     //// store L2Access vector from bridge driver to a backing store in the bridge module
     val accessStore = SyncReadMem(key.maxL2AccessEntries, new L2Access)
@@ -260,22 +400,57 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       uploadRecvCount := 0.U
       uploadStoredCount := 0.U
       blockedWarpBeatCount := 0.U
+      issuedAccessWritebackIdx := 0.U
+      issuedAccessWritebackCount := 0.U
       uploadPhase := Mux(uploadCount === 0.U, uploadPhaseBlockedWarpBitmap, uploadPhaseL2Accesses)
       blockedWarpBitmap.foreach(_ := 0.U)
     }
 
     val uploadBits = L2Access.unpack(streamDeq.bits)
 
-    // while writing the L2 acceses into the backing store, also write them to reservedSubPartitionsByCycle
-    // one cycle after we set reservedUploadPending, we read the previous value and OR in the new reservation
-    val canAcceptL2Access = !reservedSubPartitionsInitActive && !reservedUploadPending
-    streamDeq.ready := uploadActive && Mux(uploadPhase === uploadPhaseL2Accesses, canAcceptL2Access, true.B)
-    when(reservedUploadPending) {
-      reservedSubPartitionsByCycle.write(
-        reservedUploadIdxReg,
-        reservedUploadEntryBits | reservedUploadMaskReg,
-      )
-      reservedUploadPending := false.B
+    // when uploading L2 accesses, also update the reserved sub-partition table based on the sub-partition of each access 
+    // compute the index and the mask (one-hot encoding) for the reservation update 
+    val (uploadReservationInWindow, uploadReservationIdx) = reservationWindowLookup(uploadBits.cycleCount)
+    val uploadReservationMask = reservationMaskForSubpartition(uploadBits.mSubpartition)
+
+    // we are only ready to accept next L2 access if we are in the L2 access upload phase, and if L2 reservation updater is not busy with previous upload
+    val reservationUpdaterBusy = reservedSubPartitionsInitActive || reservationUpdateReadPending
+    val canAcceptUploadReservation = !reservationUpdaterBusy
+    streamDeq.ready := uploadActive && Mux(uploadPhase === uploadPhaseL2Accesses, canAcceptUploadReservation, true.B)
+
+    // get the reservation clear arbiter output to update the reservation table 
+    val clearArbValid = reservationClearArb.io.out.valid
+    val clearArbInWindow = Wire(Bool())
+    val clearArbIdx = Wire(UInt(reservedSubPartitionIdxWidth.W))
+    val clearArbMask = Wire(UInt(reservedSubPartitionEntryWidth.W))
+    val (clearWindowOk, clearReservationIdx) = reservationWindowLookup(reservationClearArb.io.out.bits.cycle)
+    clearArbInWindow := clearWindowOk
+    clearArbIdx := clearReservationIdx
+    clearArbMask := reservationMaskForSubpartition(reservationClearArb.io.out.bits.subpartition)
+
+    // if we are updating reservation for upload, it is a set, otherwise it is a clear 
+    val issueUploadReservation = streamDeq.fire && uploadPhase === uploadPhaseL2Accesses
+    val issueClearReservation = !reservationUpdaterBusy && !issueUploadReservation && clearArbValid
+    reservationClearArb.io.out.ready := issueClearReservation
+
+    // if the upload reservation is in the window, we can latch the update to the reservation table 
+    when(issueUploadReservation && uploadReservationInWindow) {
+      reservationUpdateReadIdx := uploadReservationIdx
+      reservationUpdateReadEn := true.B
+      reservationUpdateReqReg.idx := uploadReservationIdx
+      reservationUpdateReqReg.mask := uploadReservationMask
+      reservationUpdateReqReg.setNotClear := true.B
+      reservationUpdateReadPending := true.B
+    }
+
+    // if we are not doing upload reservation update and there is a clear request in the window, we latch the update to the reservation table
+    when(issueClearReservation && clearArbInWindow) {
+      reservationUpdateReadIdx := clearArbIdx
+      reservationUpdateReadEn := true.B
+      reservationUpdateReqReg.idx := clearArbIdx
+      reservationUpdateReqReg.mask := clearArbMask
+      reservationUpdateReqReg.setNotClear := false.B
+      reservationUpdateReadPending := true.B
     }
     
     when(streamDeq.fire && !uploadStart) {
@@ -293,27 +468,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
             uploadOverflow := true.B
           }
 
-          // calculate which cycle and L2 subpartition in reservedSubPartitionsByCycle this L2 access corresponds to 
-          val accessCycle = uploadBits.cycleCount.pad(64)
-          val cycleDelta = accessCycle - reservedSubPartitionsBaseCycle
-          val cycleBeforeBase = accessCycle < reservedSubPartitionsBaseCycle
-          val cycleOutsideWindow = cycleBeforeBase || cycleDelta >= reservedSubPartitionEntries.U
-          val wrappedOffset = cycleDelta(reservedSubPartitionIdxWidth - 1, 0)
-          val reservationIdx =
-            (reservedSubPartitionsBaseIdx + wrappedOffset)(reservedSubPartitionIdxWidth - 1, 0)
-          val reservationMask = UIntToOH(
-            uploadBits.mSubpartition(log2Ceil(reservedSubPartitionEntryWidth) - 1, 0),
-            reservedSubPartitionEntryWidth,
-          ).asUInt
-
-          // read the current bitmask for the cycle and subpartition being reserved, so we can OR in the new reservation
-          reservedUploadReadIdx := reservationIdx
-          reservedUploadReadEn := true.B
-          reservedUploadIdxReg := reservationIdx
-          reservedUploadMaskReg := reservationMask
-          reservedUploadPending := true.B
-
-          when(cycleOutsideWindow) {
+          when(!uploadReservationInWindow) {
             uploadOverflow := true.B
           }
 
@@ -343,33 +498,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
 
-    target.accessStoredCount := uploadStoredCount
-
     target.blockedWarpBitmapReady := blockedWarpUploadDone
     target.uploadDone := uploadDone
-    target.uploadOverflow := uploadOverflow
 
     val minIssueCycle = RegInit(0.U(32.W))
     target.minIssueCycle := minIssueCycle
 
-    target.trafficComplete := trafficComplete
-    
-    
-    
-
-    // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
-    val blockedWarpQueryWordIdx =
-      target.blockedWarpQueryIdx(BlockedWarpBitmap.indexBits - 1, BlockedWarpBitmap.streamBeatOffsetBits)
-    val blockedWarpQueryBitIdx =
-      target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
-    val blockedWarpQueryRespReg = RegInit(false.B)
-
-    when(target.blockedWarpQueryEn) {
-      blockedWarpQueryRespReg := blockedWarpUploadDone &&
-        blockedWarpBitmap(blockedWarpQueryWordIdx)(blockedWarpQueryBitIdx)
-    }
-    target.blockedWarpQueryResp := blockedWarpQueryRespReg
-    target.blockedWarpQueryRespValid := RegNext(target.blockedWarpQueryEn, false.B)
+    //// STEP 4: TG is running issue schedule, respond to requests to reads for L2 accesses and blocked warps
 
     // target drives accessReadAddr and accessReadEn to request L2 access data from backing store
     val accessReadData = accessStore.read(target.accessReadAddr, target.accessReadEn)
@@ -377,6 +512,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // return L2 access data requested by the Traffic Generator from the backing store
     target.accessReadData := accessReadData
     target.accessReadDataValid := accessReadDataValid
+    
+
+    // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
+    val blockedWarpQueryWordIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.indexBits - 1, BlockedWarpBitmap.streamBeatOffsetBits)
+    val blockedWarpQueryBitIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
+    val blockedWarpQueryRespReg = RegInit(false.B)
+
+    when(target.blockedWarpQueryEn) {
+      blockedWarpQueryRespReg := blockedWarpUploadDone && blockedWarpBitmap(blockedWarpQueryWordIdx)(blockedWarpQueryBitIdx)
+    }
+    target.blockedWarpQueryResp := blockedWarpQueryRespReg
+    target.blockedWarpQueryRespValid := RegNext(target.blockedWarpQueryEn, false.B)
+
+
+    
 
     val targetReset = fire && hPort.hBits.reset
 
@@ -389,14 +539,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservedStreamReadPending := false.B
       reservedStreamDataValid := false.B
       reservedStreamStartPending := false.B
-      reservedUploadPending := false.B
+      issuedAccessStreamReadPending := false.B
+      issuedAccessStreamDataValid := false.B
+      reservationUpdateReadPending := false.B
+      issuedAccessWritebackIdx := 0.U
+      issuedAccessWritebackCount := 0.U
       completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
       completedBundleCountValid := true.B
     }
-
-    val trafficComplete = Wire(Bool())
 
     /////////// MMIO registers for bridge driver interaction ///////////
 
@@ -405,9 +557,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // for bridge driver to read to determine if target is still running the previous traffic pattern
     genROReg(uploadActive || target.targetBusy, "target_busy")
+    genROReg(target.hasPendingWork, "has_pending_work")
 
     // bridge driver toggles to pause/resume target while generating traffic patterns 
     Pulsify(genWORegInit(pauseTarget, "pause_target", false.B), pulseLength = 1)
+
+    // bridge driver pulses this when a freshly uploaded scheduling round is ready to issue
+    val startRound = Wire(Bool())
+    Pulsify(genWORegInit(startRound, "start_round", false.B), pulseLength = 1)
+    target.startRound := startRound
 
     // bridge driver triggers to read reservedSubpartitionsByCycle from stream
     Pulsify(genWORegInit(readReservedSubPartitions, "read_reserved_subpartitions", false.B), pulseLength = 1)
@@ -421,6 +579,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genWORegInit(uploadCount, "upload_count", 0.U)
     Pulsify(genWORegInit(uploadStart, "upload_start", false.B), pulseLength = 1)
 
+    genROReg(target.roundComplete, "round_complete")
     genROReg(uploadDone, "upload_done")
     genROReg(uploadOverflow, "upload_overflow")
     genROReg(blockedWarpUploadDone, "blocked_warp_upload_done")
@@ -432,13 +591,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(completedBundleIdsValid, "completed_bundle_ids_valid")
     genROReg(completedBundleCountValid, "completed_bundle_count_valid")
 
-    // generate register definitions for the bridge driver to interact with 
-    
-    
-    Pulsify(genWORegInit(trafficComplete, "traffic_complete", false.B), pulseLength = 1)
     Pulsify(genWORegInit(readCompletedBundleIds, "read_completed_bundle_ids", false.B), pulseLength = 1)
+    Pulsify(genWORegInit(readIssuedAccessWriteback, "read_issued_access_writeback", false.B), pulseLength = 1)
     
     genROReg(target.currentCycleAfterIssue, "current_cycle_after_issue")
+    genROReg(issuedAccessWritebackCount, "issued_access_writeback_count")
     
     
     

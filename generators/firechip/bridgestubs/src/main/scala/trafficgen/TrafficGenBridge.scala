@@ -34,14 +34,18 @@ object TrafficGenBridge {
     val ep = Module(new TrafficGenBridge())
 
     ep.io.trafficgen.targetBusy := trafficGenIO.targetBusy
+    ep.io.trafficgen.hasPendingWork := trafficGenIO.hasPendingWork
     ep.io.trafficgen.startTrafficGen := trafficGenIO.startTrafficGen
+    ep.io.trafficgen.roundComplete := trafficGenIO.roundComplete
     ep.io.trafficgen.currentCycleAfterIssue := trafficGenIO.currentCycleAfterIssue
+    ep.io.trafficgen.reservationClear <> trafficGenIO.reservationClear
+    ep.io.trafficgen.issuedAccessWriteback <> trafficGenIO.issuedAccessWriteback
     ep.io.trafficgen.completedBundleIdWriteEn := trafficGenIO.completedBundleIdWriteEn
     ep.io.trafficgen.completedBundleIdWriteIdx := trafficGenIO.completedBundleIdWriteIdx
     ep.io.trafficgen.completedBundleIdWriteData := trafficGenIO.completedBundleIdWriteData
     ep.io.trafficgen.completedBundleCountWriteEn := trafficGenIO.completedBundleCountWriteEn
     ep.io.trafficgen.completedBundleCountWriteData := trafficGenIO.completedBundleCountWriteData
-    trafficGenIO.trafficComplete := ep.io.trafficgen.trafficComplete
+    trafficGenIO.startRound := ep.io.trafficgen.startRound
     trafficGenIO.minIssueCycle := ep.io.trafficgen.minIssueCycle
     trafficGenIO.blockedWarpBitmapReady := ep.io.trafficgen.blockedWarpBitmapReady
     ep.io.trafficgen.blockedWarpQueryIdx := trafficGenIO.blockedWarpQueryIdx
@@ -52,9 +56,7 @@ object TrafficGenBridge {
     ep.io.trafficgen.accessReadEn := trafficGenIO.accessReadEn
     trafficGenIO.accessReadData := ep.io.trafficgen.accessReadData
     trafficGenIO.accessReadDataValid := ep.io.trafficgen.accessReadDataValid
-    trafficGenIO.accessStoredCount := ep.io.trafficgen.accessStoredCount
     trafficGenIO.uploadDone := ep.io.trafficgen.uploadDone
-    trafficGenIO.uploadOverflow := ep.io.trafficgen.uploadOverflow
     ep.io.clock := clock
     ep.io.reset := reset
     ep

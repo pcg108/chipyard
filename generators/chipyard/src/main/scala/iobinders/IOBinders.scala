@@ -635,8 +635,9 @@ class WithCTCPunchthrough extends OverrideIOBinder({
 class WithTrafficGenIOPunchthrough extends OverrideIOBinder({
   (system: CanHaveTrafficGen) => {
     val ports = system.trafficGenIO.map { n =>
-      val port = IO(new ClockedIO(new TrafficGenPortPeripheralIO)).suggestName("trafficgen")
-      port <> n
+      val wrapped = n.getWrappedValue
+      val port = IO(chiselTypeOf(wrapped)).suggestName("trafficgen")
+      port <> wrapped
       TrafficGenPort(() => port)
     }.toSeq
     (ports, Nil)
