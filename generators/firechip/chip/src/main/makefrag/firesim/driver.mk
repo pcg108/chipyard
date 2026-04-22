@@ -15,6 +15,7 @@ endif
 firechip_lib_dir = $(chipyard_dir)/generators/firechip/chip/src/main/cc
 firechip_bridgestubs_lib_dir = $(chipyard_dir)/generators/firechip/bridgestubs/src/main/cc
 testchipip_csrc_dir = $(chipyard_dir)/generators/testchipip/src/main/resources/testchipip/csrc
+chipyard_csrc_dir = $(chipyard_dir)/generators/chipyard/src/main/resources/csrc
 
 # DRIVER_H only used to update recipe pre-reqs (ok to track more files)
 
@@ -27,6 +28,7 @@ DRIVER_CC += \
 		$(testchipip_csrc_dir)/testchip_tsi.cc \
 		$(testchipip_csrc_dir)/testchip_dtm.cc \
 		$(testchipip_csrc_dir)/testchip_htif.cc \
+		$(chipyard_csrc_dir)/trafficgen_dpi.cc \
 		$(firechip_bridgestubs_lib_dir)/fesvr/firesim_tsi.cc \
 		$(firechip_bridgestubs_lib_dir)/fesvr/firesim_dtm.cc \
 		$(RISCV)/lib/libfesvr.a

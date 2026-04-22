@@ -137,6 +137,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     )
     val reservationUpdateReadPending = RegInit(false.B)
     val reservationUpdateReqReg = Reg(new ReservationUpdate)
+    val reservationWindowAdvanceCycle = target.reservationWindowAdvanceCycle
+    val reservationWindowAdvanceEn = target.reservationWindowAdvanceEn
 
     val clearQueueDepth = 4
     val reservationClearQueues = Seq.fill(key.nGenerators) {
@@ -369,6 +371,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     //// store L2Access vector from bridge driver to a backing store in the bridge module
     val accessStore = SyncReadMem(key.maxL2AccessEntries, new L2Access)
+    // accessStore is treated as a ring buffer with head and tail pointers, and a count of the number of entries stored
+    val accessStoreHead = RegInit(0.U(32.W))
+    val accessStoreTail = RegInit(0.U(32.W))
+    val accessStoreCount = RegInit(0.U(32.W))
 
     // store the warps that are currently blocked in the scheduler, for the traffic generator to return on if it unblocks the scheduler
     // stored as a vec of beats to make it easier to stream
@@ -393,7 +399,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(uploadStart) {
 
       uploadActive := true.B
-      uploadDone := false.B
+      uploadDone := uploadCount === 0.U
       uploadOverflow := false.B
 
       blockedWarpUploadDone := false.B
@@ -460,8 +466,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         is(uploadPhaseL2Accesses) {
 
           // 1 L2Access is transferred per 512-bit beat, so we can store 1 L2Access per beat
-          when(uploadStoredCount < key.maxL2AccessEntries.U) {
-            accessStore.write(uploadStoredCount, uploadBits)
+          when(accessStoreCount < key.maxL2AccessEntries.U) {
+            accessStore.write(accessStoreTail, uploadBits)
+            accessStoreTail := Mux(accessStoreTail === (key.maxL2AccessEntries - 1).U, 0.U, accessStoreTail + 1.U)
+            accessStoreCount := accessStoreCount + 1.U
             uploadStoredCount := uploadStoredCount + 1.U
           }.otherwise {
             // track to indicate when we overflow and can't store all L2 accesses
@@ -503,12 +511,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     val minIssueCycle = RegInit(0.U(32.W))
     target.minIssueCycle := minIssueCycle
+    target.accessStoreCount := accessStoreCount
 
     //// STEP 4: TG is running issue schedule, respond to requests to reads for L2 accesses and blocked warps
 
     // target drives accessReadAddr and accessReadEn to request L2 access data from backing store
-    val accessReadData = accessStore.read(target.accessReadAddr, target.accessReadEn)
-    val accessReadDataValid = RegNext(target.accessReadEn, false.B)
+    // compute the address in the ring buffer for access store
+    val accessReadLogicalAddrInRange = target.accessReadAddr < accessStoreCount
+    val accessReadPhysicalAddr =
+      Mux(
+        accessStoreHead + target.accessReadAddr >= key.maxL2AccessEntries.U,
+        accessStoreHead + target.accessReadAddr - key.maxL2AccessEntries.U,
+        accessStoreHead + target.accessReadAddr,
+      )
+    val accessReadData = accessStore.read(accessReadPhysicalAddr, target.accessReadEn && accessReadLogicalAddrInRange)
+    val accessReadDataValid = RegNext(target.accessReadEn && accessReadLogicalAddrInRange, false.B)
     // return L2 access data requested by the Traffic Generator from the backing store
     target.accessReadData := accessReadData
     target.accessReadDataValid := accessReadDataValid
@@ -524,6 +541,35 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     target.blockedWarpQueryResp := blockedWarpQueryRespReg
     target.blockedWarpQueryRespValid := RegNext(target.blockedWarpQueryEn, false.B)
+
+    // when the target consumes L2 accesses, move the head pointer and decrease the count of stored accesses accordingly
+    when(target.accessStoreConsumeEn && target.accessStoreConsumeCount =/= 0.U) {
+      val consumeCount = Mux(
+        target.accessStoreConsumeCount > accessStoreCount,
+        accessStoreCount,
+        target.accessStoreConsumeCount,
+      )
+      val wrappedHead = accessStoreHead + consumeCount
+      accessStoreHead := Mux(
+        wrappedHead >= key.maxL2AccessEntries.U,
+        wrappedHead - key.maxL2AccessEntries.U,
+        wrappedHead,
+      )
+      accessStoreCount := accessStoreCount - consumeCount
+    }
+
+    // when the target advances the reservation window, we need to advance the base cycle and index for the reservedSubPartitionsByCycle table accordingly
+    when(reservationWindowAdvanceEn && reservationWindowAdvanceCycle > reservedSubPartitionsBaseCycle) {
+      val cycleDelta = reservationWindowAdvanceCycle - reservedSubPartitionsBaseCycle
+      val clampedDelta = Mux(cycleDelta >= reservedSubPartitionEntries.U, reservedSubPartitionEntries.U, cycleDelta)
+      val nextBaseIdxWide = reservedSubPartitionsBaseIdx + clampedDelta(reservedSubPartitionIdxWidth - 1, 0)
+      reservedSubPartitionsBaseIdx := Mux(
+        nextBaseIdxWide >= reservedSubPartitionEntries.U,
+        nextBaseIdxWide - reservedSubPartitionEntries.U,
+        nextBaseIdxWide,
+      )
+      reservedSubPartitionsBaseCycle := reservationWindowAdvanceCycle
+    }
 
 
     
@@ -544,6 +590,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationUpdateReadPending := false.B
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
+      accessStoreHead := 0.U
+      accessStoreTail := 0.U
+      accessStoreCount := 0.U
       completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B

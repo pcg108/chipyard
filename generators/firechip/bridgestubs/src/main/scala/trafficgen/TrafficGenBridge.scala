@@ -56,6 +56,11 @@ object TrafficGenBridge {
     ep.io.trafficgen.accessReadEn := trafficGenIO.accessReadEn
     trafficGenIO.accessReadData := ep.io.trafficgen.accessReadData
     trafficGenIO.accessReadDataValid := ep.io.trafficgen.accessReadDataValid
+    trafficGenIO.accessStoreCount := ep.io.trafficgen.accessStoreCount
+    ep.io.trafficgen.accessStoreConsumeCount := trafficGenIO.accessStoreConsumeCount
+    ep.io.trafficgen.accessStoreConsumeEn := trafficGenIO.accessStoreConsumeEn
+    ep.io.trafficgen.reservationWindowAdvanceCycle := trafficGenIO.reservationWindowAdvanceCycle
+    ep.io.trafficgen.reservationWindowAdvanceEn := trafficGenIO.reservationWindowAdvanceEn
     trafficGenIO.uploadDone := ep.io.trafficgen.uploadDone
     ep.io.clock := clock
     ep.io.reset := reset

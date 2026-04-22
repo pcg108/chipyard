@@ -117,6 +117,11 @@ class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val accessReadEn = Output(Bool())
   val accessReadData = Input(new L2Access)
   val accessReadDataValid = Input(Bool())
+  val accessStoreCount = Input(UInt(32.W))
+  val accessStoreConsumeCount = Output(UInt(32.W))
+  val accessStoreConsumeEn = Output(Bool())
+  val reservationWindowAdvanceCycle = Output(UInt(64.W))
+  val reservationWindowAdvanceEn = Output(Bool())
   val uploadDone = Input(Bool())
 }
 

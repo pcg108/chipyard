@@ -2,6 +2,7 @@ package chipyard.example
 
 import chisel3._
 import chisel3.util._
+import chisel3.experimental.IntParam
 
 import freechips.rocketchip.prci._
 import freechips.rocketchip.subsystem._
@@ -80,10 +81,15 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
   // L2 access returned from access store in bridge module
   val accessReadData = Input(new L2Access)
   val accessReadDataValid = Input(Bool())
+  val accessStoreCount = Input(UInt(32.W))
+  val accessStoreConsumeCount = Output(UInt(32.W))
+  val accessStoreConsumeEn = Output(Bool())
 
   // response to blocked warp bitmap query
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
+  val reservationWindowAdvanceCycle = Output(UInt(64.W))
+  val reservationWindowAdvanceEn = Output(Bool())
   
 
   val memActive = Input(Bool())
@@ -92,6 +98,86 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
 
 trait HasTrafficGenTopIO {
   def io: TrafficGenTopIO
+}
+
+class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERATORS" -> IntParam(nGenerators)))
+    with HasBlackBoxResource {
+
+  // Chisel black box that mirrors TrafficGenTopIO, but flattened
+
+  val io = IO(new Bundle {
+    val clock = Input(Clock())
+    val reset = Input(Bool())
+    val start_round = Input(Bool())
+    val blocked_warp_bitmap_ready = Input(Bool())
+    val access_store_count = Input(UInt(32.W))
+    val min_issue_cycle = Input(UInt(32.W))
+
+    val access_read_data_valid = Input(Bool())
+    val access_read_id = Input(UInt(32.W))
+    val access_read_address = Input(UInt(32.W))
+    val access_read_cycle_count = Input(UInt(32.W))
+    val access_read_subpartition = Input(UInt(32.W))
+    val access_read_set_index = Input(UInt(32.W))
+    val access_read_tag = Input(UInt(32.W))
+    val access_read_mask = Input(UInt(32.W))
+    val access_read_sm_id = Input(UInt(32.W))
+    val access_read_scheduler_id = Input(UInt(32.W))
+    val access_read_warp_id = Input(UInt(32.W))
+    val access_read_bundle_id = Input(UInt(32.W))
+    val access_read_wake_relevant_bundle = Input(UInt(32.W))
+    val access_read_is_write = Input(Bool())
+
+    val blocked_warp_query_resp_valid = Input(Bool())
+    val blocked_warp_query_resp = Input(Bool())
+
+    val issued_access_writeback_ready = Input(Bool())
+    val reservation_clear_ready = Input(Bool())
+
+    val target_busy = Output(Bool())
+    val has_pending_work = Output(Bool())
+    val round_complete = Output(Bool())
+    val current_cycle_after_issue = Output(UInt(32.W))
+
+    val access_read_en = Output(Bool())
+    val access_read_addr = Output(UInt(32.W))
+    val blocked_warp_query_en = Output(Bool())
+    val blocked_warp_query_idx = Output(UInt(BlockedWarpBitmap.indexBits.W))
+
+    val issued_access_writeback_valid = Output(Bool())
+    val issued_access_writeback_id = Output(UInt(32.W))
+    val issued_access_writeback_address = Output(UInt(32.W))
+    val issued_access_writeback_cycle_count = Output(UInt(32.W))
+    val issued_access_writeback_subpartition = Output(UInt(32.W))
+    val issued_access_writeback_set_index = Output(UInt(32.W))
+    val issued_access_writeback_tag = Output(UInt(32.W))
+    val issued_access_writeback_mask = Output(UInt(32.W))
+    val issued_access_writeback_sm_id = Output(UInt(32.W))
+    val issued_access_writeback_scheduler_id = Output(UInt(32.W))
+    val issued_access_writeback_warp_id = Output(UInt(32.W))
+    val issued_access_writeback_bundle_id = Output(UInt(32.W))
+    val issued_access_writeback_wake_relevant_bundle = Output(UInt(32.W))
+    val issued_access_writeback_is_write = Output(Bool())
+
+    val reservation_clear_valid = Output(Bool())
+    val reservation_clear_cycle = Output(UInt(32.W))
+    val reservation_clear_subpartition = Output(UInt(32.W))
+
+    val completed_bundle_count_write_en = Output(Bool())
+    val completed_bundle_count_write_data = Output(UInt(6.W))
+    val completed_bundle_id_write_en = Output(Bool())
+    val completed_bundle_id_write_idx = Output(UInt(5.W))
+    val completed_bundle_id_write_data = Output(UInt(32.W))
+
+    val access_store_consume_en = Output(Bool())
+    val access_store_consume_count = Output(UInt(32.W))
+    val reservation_window_advance_en = Output(Bool())
+    val reservation_window_advance_cycle = Output(UInt(64.W))
+  })
+
+  // pulls in SV wrapper resource  
+
+  addResource("/vsrc/trafficgen_dpi.v")
 }
 
 class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Parameters)
@@ -120,84 +206,119 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.startTrafficGen := startTrafficGenPulse
 
       val currentCycleAfterIssue = RegInit(0.U(32.W))
-      val roundActive = RegInit(false.B)
       val roundComplete = Wire(Bool())
-      val memActivePrev = RegNext(io.memActive, false.B)
       val patternReady = RegInit(false.B)
-      val blockedWarpDebugQueryIdx = RegInit(0.U(BlockedWarpBitmap.indexBits.W))
-      val blockedWarpDebugQueryReq = WireInit(0.U(1.W))
-      val blockedWarpDebugResp = RegInit(false.B)
-      val blockedWarpDebugRespValid = RegInit(false.B)
-
       val completedBundleCountWriteEn = Wire(Bool())
       val completedBundleCountWriteData = Wire(UInt(6.W))
-      val completedBundleIdWriteEn = Wire(Vec(32, Bool()))
+      val completedBundleIdWriteEn = Wire(Vec(32, Bool())) // one-hot vector for enable signal
       val completedBundleIdWriteData = Wire(Vec(32, UInt(32.W)))
+      val dpi = Module(new TrafficGenDPIBlackBox(params.numGenerators))
+
+      dpi.io.clock := clock
+      dpi.io.reset := reset.asBool
+
+      // target state into DPI black box
+      dpi.io.start_round := io.startRound
+      dpi.io.blocked_warp_bitmap_ready := io.blockedWarpBitmapReady
+      dpi.io.access_store_count := io.accessStoreCount
+      dpi.io.min_issue_cycle := io.minIssueCycle
+
+      // access store read response into DPI
+      dpi.io.access_read_data_valid := io.accessReadDataValid
+      dpi.io.access_read_id := io.accessReadData.id
+      dpi.io.access_read_address := io.accessReadData.address
+      dpi.io.access_read_cycle_count := io.accessReadData.cycleCount
+      dpi.io.access_read_subpartition := io.accessReadData.mSubpartition
+      dpi.io.access_read_set_index := io.accessReadData.mSetIndex
+      dpi.io.access_read_tag := io.accessReadData.mTag
+      dpi.io.access_read_mask := io.accessReadData.mMask
+      dpi.io.access_read_sm_id := io.accessReadData.smId
+      dpi.io.access_read_scheduler_id := io.accessReadData.schedulerId
+      dpi.io.access_read_warp_id := io.accessReadData.warpId
+      dpi.io.access_read_bundle_id := io.accessReadData.mBundleId
+      dpi.io.access_read_wake_relevant_bundle := io.accessReadData.mWakeRelevantBundle
+      dpi.io.access_read_is_write := io.accessReadData.mIsWrite
+
+      // blocked warp query response into DPI
+      dpi.io.blocked_warp_query_resp_valid := io.blockedWarpQueryRespValid
+      dpi.io.blocked_warp_query_resp := io.blockedWarpQueryResp
+
+      // backpressure from hw queues into DPI
+      dpi.io.issued_access_writeback_ready := io.issuedAccessWriteback(0).ready
+      dpi.io.reservation_clear_ready := io.reservationClear(0).ready
 
       io.currentCycleAfterIssue := currentCycleAfterIssue
       io.roundComplete := roundComplete
-      io.hasPendingWork := roundActive || io.memActive
+
+      // DPI outputs connected to bridge-facing interface
+
+      // query requests
+      io.accessReadAddr := dpi.io.access_read_addr
+      io.accessReadEn := dpi.io.access_read_en
+      io.blockedWarpQueryIdx := dpi.io.blocked_warp_query_idx
+      io.blockedWarpQueryEn := dpi.io.blocked_warp_query_en
+      
+      // ring buffer/window advancement
+      io.accessStoreConsumeCount := dpi.io.access_store_consume_count
+      io.accessStoreConsumeEn := dpi.io.access_store_consume_en
+      io.reservationWindowAdvanceCycle := dpi.io.reservation_window_advance_cycle
+      io.reservationWindowAdvanceEn := dpi.io.reservation_window_advance_en
+      
+      // status
+      io.hasPendingWork := dpi.io.has_pending_work
+      roundComplete := dpi.io.round_complete
+      trafficGenIdle := !dpi.io.target_busy
+      currentCycleAfterIssue := dpi.io.current_cycle_after_issue
+      io.targetBusy := dpi.io.target_busy
+      
       io.completedBundleIdWriteEn := completedBundleIdWriteEn.asUInt.orR
-      io.completedBundleIdWriteIdx := PriorityEncoder(completedBundleIdWriteEn)
-      io.completedBundleIdWriteData := Mux1H(completedBundleIdWriteEn, completedBundleIdWriteData)
+      //recover index from one-hot
+      io.completedBundleIdWriteIdx := PriorityEncoder(completedBundleIdWriteEn) 
+      //select data based on one-hot
+      io.completedBundleIdWriteData := Mux1H(completedBundleIdWriteEn, completedBundleIdWriteData) 
       io.completedBundleCountWriteEn := completedBundleCountWriteEn
       io.completedBundleCountWriteData := completedBundleCountWriteData
-      io.blockedWarpQueryIdx := blockedWarpDebugQueryIdx
-      io.blockedWarpQueryEn := blockedWarpDebugQueryReq(0)
-      io.accessReadAddr := 0.U
-      io.accessReadEn := false.B
+      
+      // these need to be pulsed so give a default 
       completedBundleCountWriteEn := false.B
       completedBundleCountWriteData := 0.U
+      when(dpi.io.completed_bundle_count_write_en) {
+        completedBundleCountWriteEn := true.B
+        completedBundleCountWriteData := dpi.io.completed_bundle_count_write_data
+      }
+      
       completedBundleIdWriteEn.foreach(_ := false.B)
       completedBundleIdWriteData.foreach(_ := 0.U)
+      when(dpi.io.completed_bundle_id_write_en) {
+        completedBundleIdWriteEn(dpi.io.completed_bundle_id_write_idx) := true.B
+        completedBundleIdWriteData(dpi.io.completed_bundle_id_write_idx) := dpi.io.completed_bundle_id_write_data
+      }
 
-      trafficGenIdle := !io.memActive && !roundActive
-      roundComplete := roundActive && memActivePrev && !io.memActive
-      when(io.startRound) {
-        roundActive := true.B
-      }
-      when(roundComplete) {
-        roundActive := false.B
-      }
 
       for (i <- 0 until params.numGenerators) {
         io.issue(i).valid := false.B
         io.issue(i).bits := 0.U.asTypeOf(new L2Access)
-        io.reservationClear(i).valid := false.B
-        io.reservationClear(i).bits := 0.U.asTypeOf(new ReservationClearRequest)
-        io.issuedAccessWriteback(i).valid := false.B
-        io.issuedAccessWriteback(i).bits := 0.U.asTypeOf(new L2Access)
+        io.reservationClear(i).valid := (if (i == 0) dpi.io.reservation_clear_valid else false.B)
+        io.reservationClear(i).bits.cycle := dpi.io.reservation_clear_cycle
+        io.reservationClear(i).bits.subpartition := dpi.io.reservation_clear_subpartition
+        io.issuedAccessWriteback(i).valid := (if (i == 0) dpi.io.issued_access_writeback_valid else false.B)
+        io.issuedAccessWriteback(i).bits.id := dpi.io.issued_access_writeback_id
+        io.issuedAccessWriteback(i).bits.address := dpi.io.issued_access_writeback_address
+        io.issuedAccessWriteback(i).bits.cycleCount := dpi.io.issued_access_writeback_cycle_count
+        io.issuedAccessWriteback(i).bits.mSubpartition := dpi.io.issued_access_writeback_subpartition
+        io.issuedAccessWriteback(i).bits.mSetIndex := dpi.io.issued_access_writeback_set_index
+        io.issuedAccessWriteback(i).bits.mTag := dpi.io.issued_access_writeback_tag
+        io.issuedAccessWriteback(i).bits.mMask := dpi.io.issued_access_writeback_mask
+        io.issuedAccessWriteback(i).bits.smId := dpi.io.issued_access_writeback_sm_id
+        io.issuedAccessWriteback(i).bits.schedulerId := dpi.io.issued_access_writeback_scheduler_id
+        io.issuedAccessWriteback(i).bits.warpId := dpi.io.issued_access_writeback_warp_id
+        io.issuedAccessWriteback(i).bits.mBundleId := dpi.io.issued_access_writeback_bundle_id
+        io.issuedAccessWriteback(i).bits.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
+        io.issuedAccessWriteback(i).bits.mIsWrite := dpi.io.issued_access_writeback_is_write
       }
 
       when(io.uploadDone && io.blockedWarpBitmapReady) {
         patternReady := true.B
-      }
-
-      when(blockedWarpDebugQueryReq(0)) {
-        blockedWarpDebugRespValid := false.B
-      }
-
-      when(io.blockedWarpQueryRespValid) {
-        blockedWarpDebugResp := io.blockedWarpQueryResp
-        blockedWarpDebugRespValid := true.B
-      }
-
-      io.targetBusy := io.memActive
-
-      def writeCompletedBundleCount(valid: Bool, data: UInt): Bool = {
-        when(valid) {
-          completedBundleCountWriteEn := true.B
-          completedBundleCountWriteData := data
-        }
-        true.B
-      }
-
-      def writeCompletedBundleId(idx: Int)(valid: Bool, data: UInt): Bool = {
-        when(valid) {
-          completedBundleIdWriteEn(idx) := true.B
-          completedBundleIdWriteData(idx) := data
-        }
-        true.B
       }
 
       node.regmap(
@@ -208,13 +329,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x18 -> Seq(RegField.r(1, patternReady)),
         0x20 -> Seq(RegField.r(32, io.minIssueCycle)),
         0x24 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
-        0x28 -> Seq(RegField(BlockedWarpBitmap.indexBits, blockedWarpDebugQueryIdx)),
-        0x2C -> Seq(RegField.w(1, blockedWarpDebugQueryReq)),
-        0x30 -> Seq(RegField.r(1, blockedWarpDebugRespValid)),
-        0x34 -> Seq(RegField.r(1, blockedWarpDebugResp)),
-        0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue)),
-        0xC0 -> Seq(RegField.w(6, writeCompletedBundleCount(_, _))),
-        0xC4 -> (0 until 32).map(idx => RegField.w(32, writeCompletedBundleId(idx)(_, _)))
+        0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue))
       )
     }
   }
@@ -314,6 +429,11 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.accessReadEn <> trafficGenTL.module.io.accessReadEn
       outerIO.bits.accessReadData <> trafficGenTL.module.io.accessReadData
       outerIO.bits.accessReadDataValid <> trafficGenTL.module.io.accessReadDataValid
+      outerIO.bits.accessStoreCount <> trafficGenTL.module.io.accessStoreCount
+      outerIO.bits.accessStoreConsumeCount <> trafficGenTL.module.io.accessStoreConsumeCount
+      outerIO.bits.accessStoreConsumeEn <> trafficGenTL.module.io.accessStoreConsumeEn
+      outerIO.bits.reservationWindowAdvanceCycle <> trafficGenTL.module.io.reservationWindowAdvanceCycle
+      outerIO.bits.reservationWindowAdvanceEn <> trafficGenTL.module.io.reservationWindowAdvanceEn
       outerIO.bits.uploadDone <> trafficGenTL.module.io.uploadDone
 
       trafficGenTL.module.io.memActive := generators.map(_.module.io.active).foldLeft(false.B)(_ || _)
