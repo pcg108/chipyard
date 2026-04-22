@@ -109,6 +109,7 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val clock = Input(Clock())
     val reset = Input(Bool())
     val start_round = Input(Bool())
+    val upload_done = Input(Bool())
     val blocked_warp_bitmap_ready = Input(Bool())
     val access_store_count = Input(UInt(32.W))
     val min_issue_cycle = Input(UInt(32.W))
@@ -219,6 +220,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
 
       // target state into DPI black box
       dpi.io.start_round := io.startRound
+      dpi.io.upload_done := io.uploadDone
       dpi.io.blocked_warp_bitmap_ready := io.blockedWarpBitmapReady
       dpi.io.access_store_count := io.accessStoreCount
       dpi.io.min_issue_cycle := io.minIssueCycle

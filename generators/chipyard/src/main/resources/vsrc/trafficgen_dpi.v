@@ -4,6 +4,7 @@ module TrafficGenDPIBlackBox #(
   input  logic        clock,
   input  logic        reset,
   input  logic        start_round,
+  input  logic        upload_done,
   input  logic        blocked_warp_bitmap_ready,
   input  logic [31:0] access_store_count,
   input  logic [31:0] min_issue_cycle,
@@ -72,6 +73,7 @@ module TrafficGenDPIBlackBox #(
   import "DPI-C" function void trafficgen_dpi_step(
     input  bit                reset,
     input  bit                start_round,
+    input  bit                upload_done,
     input  bit                blocked_warp_bitmap_ready,
     input  int unsigned       access_store_count,
     input  int unsigned       min_issue_cycle,
@@ -133,6 +135,7 @@ module TrafficGenDPIBlackBox #(
     trafficgen_dpi_step(
       reset,
       start_round,
+      upload_done,
       blocked_warp_bitmap_ready,
       access_store_count,
       min_issue_cycle,

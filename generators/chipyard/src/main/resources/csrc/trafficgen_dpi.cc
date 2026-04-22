@@ -181,7 +181,6 @@ public:
     mCurrentCycle = 0;
     mInflight.clear();
     mOutstandingBundles.clear();
-    mDeferredCompletedBundleIds.clear();
     mLoadedAccesses.clear();
     mExpectedAccessCount = 0;
     mBlockedWarpQueryList.clear();
@@ -199,6 +198,7 @@ public:
 
   void step(
       svBit startRound,
+      svBit uploadDone,
       svBit blockedWarpBitmapReady,
       std::uint32_t accessStoreCount,
       std::uint32_t minIssueCycle,
@@ -253,7 +253,7 @@ public:
     *reservationWindowAdvanceCycle = 0;
 
     if (mState == State::Idle) {
-      if (startRound && blockedWarpBitmapReady) {
+      if (startRound && uploadDone && blockedWarpBitmapReady) {
         mLoadedAccesses.clear();
         mLoadedAccesses.reserve(accessStoreCount);
         mExpectedAccessCount = accessStoreCount;
@@ -415,10 +415,6 @@ private:
     mRoundCurrentCycle = mCurrentCycle;
 
     const auto finalizeResult = [this, &pendingByCycle]() {
-      mCompletedBundleQueue.insert(mCompletedBundleQueue.end(),
-                                   mDeferredCompletedBundleIds.begin(),
-                                   mDeferredCompletedBundleIds.end());
-      mDeferredCompletedBundleIds.clear();
       mRoundCurrentCycle = mCurrentCycle;
       mRoundHasPendingWork = !pendingByCycle.empty() || !mInflight.empty();
     };
@@ -434,7 +430,7 @@ private:
               --bundleIt->second.remainingRequestCount;
             }
             if (bundleIt->second.remainingRequestCount == 0) {
-              mDeferredCompletedBundleIds.push_back(bundleId);
+              mCompletedBundleQueue.push_back(bundleId);
               if (bundleIt->second.wakeRelevant &&
                   mBlockedWarpSet.find(bundleIt->second.warpKey) != mBlockedWarpSet.end()) {
                 completedBlockedWarpBundle = true;
@@ -477,8 +473,7 @@ private:
       const auto pendingIt = pendingByCycle.find(mCurrentCycle);
       if (pendingIt != pendingByCycle.end()) {
         for (const auto &access : pendingIt->second) {
-          const std::uint64_t elapsedCycle =
-              static_cast<std::uint64_t>(std::max(findAccessTime(access), 0));
+          const std::uint64_t elapsedCycle = static_cast<std::uint64_t>(std::max(findAccessTime(access), 0));
 
           Access issuedAccess = access;
           issuedAccess.cycleCount = static_cast<std::uint32_t>(mCurrentCycle);
@@ -521,7 +516,6 @@ private:
   std::uint64_t mCurrentCycle = 0;
   std::map<std::uint64_t, PendingAccessInfo> mInflight;
   std::unordered_map<std::uint64_t, OutstandingBundleInfo> mOutstandingBundles;
-  std::vector<std::uint64_t> mDeferredCompletedBundleIds;
 
   std::vector<Access> mLoadedAccesses;
   std::size_t mExpectedAccessCount = 0;
@@ -551,6 +545,7 @@ TrafficGenDPIModel &model() {
 extern "C" void trafficgen_dpi_step(
     svBit reset,
     svBit start_round,
+    svBit upload_done,
     svBit blocked_warp_bitmap_ready,
     std::uint32_t access_store_count,
     std::uint32_t min_issue_cycle,
@@ -631,6 +626,7 @@ extern "C" void trafficgen_dpi_step(
 
   model().step(
       start_round,
+      upload_done,
       blocked_warp_bitmap_ready,
       access_store_count,
       min_issue_cycle,
