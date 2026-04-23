@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -226,11 +227,11 @@ void write_all(int fd, const void *buffer, std::size_t size) {
         continue;
       }
       throw std::runtime_error(errno_message(
-          "[trafficgen] failed to send reservations to gpu_model_socket"));
+          "failed to send reservations to gpu_model_socket"));
     }
     if (written == 0) {
       throw std::runtime_error(
-          "[trafficgen] failed to send reservations to gpu_model_socket: "
+          "failed to send reservations to gpu_model_socket: "
           "peer disconnected");
     }
     cursor += written;
@@ -248,11 +249,11 @@ void read_all(int fd, void *buffer, std::size_t size) {
         continue;
       }
       throw std::runtime_error(errno_message(
-          "[trafficgen] failed to receive schedule from gpu_model_socket"));
+          "failed to receive schedule from gpu_model_socket"));
     }
     if (received == 0) {
       throw std::runtime_error(
-          "[trafficgen] failed to receive schedule from gpu_model_socket: "
+          "failed to receive schedule from gpu_model_socket: "
           "peer disconnected");
     }
     cursor += received;
@@ -280,11 +281,9 @@ T deserialize_message(const std::string &payload) {
 template <typename T>
 std::uint32_t checked_u32(T value, const char *field_name) {
   if (value > static_cast<T>(UINT32_MAX)) {
-    std::fprintf(stderr,
-                 "[trafficgen] %s out of range for target upload: %" PRIu64
-                 "\n",
-                 field_name,
-                 static_cast<std::uint64_t>(value));
+    std::cout << "[bridge driver] " << field_name
+              << " out of range for target upload: "
+              << static_cast<std::uint64_t>(value) << '\n';
     std::abort();
   }
   return static_cast<std::uint32_t>(value);
@@ -313,7 +312,7 @@ public:
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
       throw std::runtime_error(
-          errno_message("[trafficgen] failed to create gpu_model socket"));
+          errno_message("failed to create gpu_model socket"));
     }
 
     sockaddr_in address{};
@@ -324,7 +323,7 @@ public:
     if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) <
         0) {
       const std::string message = errno_message(
-          "[trafficgen] failed to connect to gpu_model_socket at "
+          "failed to connect to gpu_model_socket at "
           "127.0.0.1:50051");
       close(fd);
       fd = -1;
@@ -335,7 +334,7 @@ public:
   void send_frame(const std::string &payload) const {
     if (fd < 0) {
       throw std::runtime_error(
-          "[trafficgen] gpu_model socket is not connected");
+          "gpu_model socket is not connected");
     }
 
     const std::uint64_t payload_size =
@@ -350,7 +349,7 @@ public:
   T recv_message() const {
     if (fd < 0) {
       throw std::runtime_error(
-          "[trafficgen] gpu_model socket is not connected");
+          "gpu_model socket is not connected");
     }
 
     std::uint64_t payload_size_network = 0;
@@ -379,12 +378,9 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
 
   if (sm_id >= max_sm_id || scheduler_id >= max_scheduler_id ||
       warp_id >= max_warp_id) {
-    std::fprintf(stderr,
-                 "[trafficgen] blocked warp tuple out of range: sm=%u "
-                 "scheduler=%u warp=%u\n",
-                 sm_id,
-                 scheduler_id,
-                 warp_id);
+    std::cout << "[bridge driver] blocked warp tuple out of range: sm=" << sm_id
+              << " scheduler=" << scheduler_id << " warp=" << warp_id
+              << '\n';
     std::abort();
   }
 
@@ -484,30 +480,27 @@ void trafficgen_t::connect_gpu_model_socket() {
   }
 
   gpu_model_socket_client->connect_loopback(kGpuModelSocketPort);
-  std::fprintf(stderr,
-               "[trafficgen] connected to gpu_model_socket at 127.0.0.1:%u\n",
-               static_cast<unsigned>(kGpuModelSocketPort));
+  std::cout << "[bridge driver] connected to gpu_model_socket at 127.0.0.1:"
+            << static_cast<unsigned>(kGpuModelSocketPort) << '\n';
 }
 
 bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
-        "[trafficgen] gpu_model socket client is not initialized");
+        "gpu_model socket client is not initialized");
   }
 
   const SchedulingRoundStateMessage message =
       gpu_model_socket_client->recv_message<SchedulingRoundStateMessage>();
-  std::fprintf(stderr,
-               "[trafficgen] received scheduling round state from "
-               "gpu_model_socket: mainLoopComplete=%s\n",
-               message.mainLoopComplete ? "true" : "false");
+  std::cout << "[bridge driver] received scheduling round state from gpu_model_socket: mainLoopComplete="
+            << (message.mainLoopComplete ? "true" : "false") << '\n';
   return message.mainLoopComplete;
 }
 
 void trafficgen_t::send_reserved_subpartitions_snapshot() const {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
-        "[trafficgen] gpu_model socket client is not initialized");
+        "gpu_model socket client is not initialized");
   }
 
   ReservationsMessage message;
@@ -515,18 +508,14 @@ void trafficgen_t::send_reserved_subpartitions_snapshot() const {
   const std::string payload = serialize_message(message);
   gpu_model_socket_client->send_frame(payload);
 
-  std::fprintf(
-      stderr,
-      "[trafficgen] sent reservedSubPartitionsByCycle to gpu_model_socket: "
-      "cycles=%zu payload_bytes=%zu\n",
-      reserved_subpartitions_by_cycle.size(),
-      payload.size());
+  std::cout << "[bridge driver] sent reservedSubPartitionsByCycle to gpu_model_socket: cycles="
+            << reserved_subpartitions_by_cycle.size() << " payload_bytes=" << payload.size() << '\n';
 }
 
 void trafficgen_t::receive_schedule_from_gpu_model() {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
-        "[trafficgen] gpu_model socket client is not initialized");
+        "gpu_model socket client is not initialized");
   }
 
   const SchedulerRoundMessage message =
@@ -578,13 +567,10 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     blocked_warp_bitmap[index / 64] |= (1ULL << (index % 64));
   }
 
-  std::fprintf(stderr,
-               "[trafficgen] received schedule from gpu_model_socket: "
-               "l2_accesses=%zu blocked_warps=%zu min_issue_cycle=%" PRIu64
-               "\n",
-               l2_accesses.size(),
-               message.blockedWarpIds.size(),
-               min_issue_cycle);
+  std::cout << "[bridge driver] received schedule from gpu_model_socket: "
+            << "l2_accesses=" << l2_accesses.size()
+            << " blocked_warps=" << message.blockedWarpIds.size()
+            << " min_issue_cycle=" << min_issue_cycle << '\n';
 }
 
 
@@ -595,9 +581,8 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
     // read base index into ring buffer
     reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
     if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
-      std::fprintf(stderr,
-                   "[trafficgen] reservedSubPartitions baseIdx out of range: %u\n",
-                   reserved_subpartitions_base_idx);
+      std::cout << "[bridge driver] reservedSubPartitions baseIdx out of range: "
+                << reserved_subpartitions_base_idx << '\n';
       std::abort();
     }
 
@@ -627,11 +612,9 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
     return 0;
   }
   if (bytes_received > remaining_bytes) {
-    std::fprintf(stderr,
-                 "[trafficgen] reservedSubPartitionsByCycle overrun: "
-                 "remaining=%zu got=%zu\n",
-                 remaining_bytes,
-                 bytes_received);
+    std::cout << "[bridge driver] reservedSubPartitionsByCycle overrun: "
+              << "remaining=" << remaining_bytes
+              << " got=" << bytes_received << '\n';
     std::abort();
   }
   if (reserved_subpartition_bytes_received + bytes_received < STREAM_BATCH_BYTES) {
@@ -678,11 +661,10 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
     reserved_subpartitions_by_cycle.emplace(cycle, std::move(reserved_subpartitions));
   }
 
-  std::fprintf(stderr,
-               "[trafficgen] decoded reservedSubPartitionsByCycle: cycles=%zu baseIdx=%u baseCycle=%" PRIu64 "\n",
-               reserved_subpartitions_by_cycle.size(),
-               reserved_subpartitions_base_idx,
-               reserved_subpartitions_base_cycle);
+  std::cout << "[bridge driver] decoded reservedSubPartitionsByCycle: cycles="
+            << reserved_subpartitions_by_cycle.size()
+            << " baseIdx=" << reserved_subpartitions_base_idx
+            << " baseCycle=" << reserved_subpartitions_base_cycle << '\n';
 
   return bytes_received;
 }
@@ -703,10 +685,8 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
     return 0;
   }
   if (bytes_received > remaining_bytes) {
-    std::fprintf(stderr,
-                 "[trafficgen] completedBundleIds overrun: remaining=%zu got=%zu\n",
-                 remaining_bytes,
-                 bytes_received);
+    std::cout << "[bridge driver] completedBundleIds overrun: remaining="
+              << remaining_bytes << " got=" << bytes_received << '\n';
     std::abort();
   }
   completed_bundle_bytes_received += bytes_received;
@@ -722,14 +702,11 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
   completed_bundle_count =
       static_cast<uint32_t>(read(mmio_addrs.completed_bundle_count));
 
-  std::fprintf(stderr,
-               "[trafficgen] completedBundleIds count=%u\n",
-               completed_bundle_count);
+  std::cout << "[bridge driver] completedBundleIds count="
+            << completed_bundle_count << '\n';
   for (size_t i = 0; i < completed_bundle_count && i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
-    std::fprintf(stderr,
-                 "[trafficgen] completedBundleIds[%zu]=%u\n",
-                 i,
-                 completed_bundle_ids[i]);
+    std::cout << "[bridge driver] completedBundleIds[" << i
+              << "]=" << completed_bundle_ids[i] << '\n';
   }
 
   return bytes_received;
@@ -757,10 +734,8 @@ trafficgen_t::process_issued_access_writeback_stream() {
     return 0;
   }
   if (bytes_received > remaining_bytes) {
-    std::fprintf(stderr,
-                 "[trafficgen] issuedAccessWriteback overrun: remaining=%zu got=%zu\n",
-                 remaining_bytes,
-                 bytes_received);
+    std::cout << "[bridge driver] issuedAccessWriteback overrun: remaining="
+              << remaining_bytes << " got=" << bytes_received << '\n';
     std::abort();
   }
   issued_access_writeback_bytes_received += bytes_received;
@@ -777,9 +752,8 @@ trafficgen_t::process_issued_access_writeback_stream() {
     issued_access_writeback_entries.push_back(unpack_l2_access(beat_words));
   }
 
-  std::fprintf(stderr,
-               "[trafficgen] issuedAccessWriteback count=%u\n",
-               issued_access_writeback_count);
+  std::cout << "[bridge driver] issuedAccessWriteback count="
+            << issued_access_writeback_count << '\n';
   return bytes_received;
 }
 
@@ -867,7 +841,7 @@ void trafficgen_t::tick() {
     // Wait for the traffic generator to be kicked off.
 
     if (read(mmio_addrs.start_trafficgen)) {
-      std::fprintf(stderr, "[trafficgen] start signal received, starting traffic generation\n");
+      std::cout << "[bridge driver] start signal received, starting traffic generation\n";
       
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
@@ -905,7 +879,8 @@ void trafficgen_t::tick() {
     // read from stream until we have received the full reservedSubPartitionByCycle bitmap
     reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
     if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
-      std::fprintf(stderr, "[trafficgen] completed reading reservedSubPartitionsByCycle stream data, bytes received=%zu\n", reserved_subpartition_bytes_received);
+      std::cout << "[bridge driver] completed reading reservedSubPartitionsByCycle stream data, bytes received="
+                << reserved_subpartition_bytes_received << '\n';
       
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
       send_reserved_subpartitions_snapshot();
@@ -937,7 +912,8 @@ void trafficgen_t::tick() {
         (l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
         read(mmio_addrs.blocked_warp_upload_done)) {
 
-      std::fprintf(stderr, "[trafficgen] upload completed, entering traffic issuing stage\n");
+      std::cout << "[bridge driver] upload completed, entering traffic issuing "
+                << "stage\n";
 
       write(mmio_addrs.start_round, 1);
       // pause_target is a pulse-driven toggle in the bridge module.
@@ -949,9 +925,11 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::ISSUING_TRAFFIC:
     // Wait for the target to finish generating memory traffic for the current round.
 
-    // Pause the target before reading back round results.
     if (!read(mmio_addrs.target_busy) && read(mmio_addrs.round_complete)) {
+      // Pause the target before reading back round results.
       write(mmio_addrs.pause_target, 1);
+
+
       issued_access_writeback_entries.clear();
       issued_access_writeback_stream_bytes.clear();
       issued_access_writeback_count = 0;
@@ -1024,7 +1002,7 @@ void trafficgen_t::tick() {
 
       if (!gpu_model_socket_client) {
         throw std::runtime_error(
-            "[trafficgen] gpu_model socket client is not initialized");
+            "gpu_model socket client is not initialized");
       }
       gpu_model_socket_client->send_frame(serialize_message(message));
 

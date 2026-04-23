@@ -31,6 +31,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       targetPaused := ~targetPaused
     }
 
+    // Latch the target's start doorbell until the host acknowledges it by
+    // pausing the target clock. This keeps the MMIO-visible start bit high long
+    // enough for the bridge driver to observe it even though the target write is
+    // only a one-cycle pulse.
+    val startTrafficGenLatched = RegInit(false.B)
+    when(target.startTrafficGen) {
+      startTrafficGenLatched := true.B
+    }
+    when(pauseTarget.asBool) {
+      startTrafficGenLatched := false.B
+    }
+
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
       !targetPaused
@@ -253,7 +265,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       ),
     )
     val streamActive = streamSource =/= streamSourceIdle
-    streamEnq.valid := streamActive && fire && streamPayloadValid
+    streamEnq.valid := streamActive && streamPayloadValid
     val doStreamEnq = streamEnq.valid && streamEnq.ready
 
     val streamLastBeat = MuxLookup(
@@ -597,12 +609,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
       completedBundleCountValid := true.B
+      startTrafficGenLatched := false.B
     }
 
     /////////// MMIO registers for bridge driver interaction ///////////
 
     // for target program to trigger traffic generation
-    genROReg(target.startTrafficGen, "start_trafficgen")
+    genROReg(startTrafficGenLatched, "start_trafficgen")
 
     // for bridge driver to read to determine if target is still running the previous traffic pattern
     genROReg(uploadActive || target.targetBusy, "target_busy")
