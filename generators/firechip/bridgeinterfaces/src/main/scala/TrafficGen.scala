@@ -7,23 +7,23 @@ import chisel3.util._
 
 // hardware record type to represent an L2 access from host 
 class L2Access extends Bundle {
-  val id = UInt(32.W)
-  val address = UInt(32.W)
-  val cycleCount = UInt(32.W)
+  val id = UInt(64.W)
+  val address = UInt(64.W)
+  val cycleCount = UInt(64.W)
   val mSubpartition = UInt(32.W)
   val mSetIndex = UInt(32.W)
-  val mTag = UInt(32.W)
+  val mTag = UInt(64.W)
   val mMask = UInt(32.W)
   val smId = UInt(32.W)
-  val schedulerId = UInt(32.W)
+  val schedulerId = UInt(8.W)
   val warpId = UInt(32.W)
-  val mBundleId = UInt(32.W)
-  val mWakeRelevantBundle = UInt(32.W)
+  val mBundleId = UInt(64.W)
+  val mWakeRelevantBundle = Bool()
   val mIsWrite = Bool()
 }
 
 object L2Access {
-  val packedWidth = 32 * 12 + 1
+  val packedWidth = 490
   val streamWidthBits = 512
   private val paddingWidth = streamWidthBits - packedWidth
 
@@ -50,19 +50,19 @@ object L2Access {
   def unpack(bits: UInt): L2Access = {
     require(bits.getWidth == streamWidthBits, s"L2Access.unpack expects ${streamWidthBits}b input")
     val access = Wire(new L2Access)
-    access.id := bits(31, 0)
-    access.address := bits(63, 32)
-    access.cycleCount := bits(95, 64)
-    access.mSubpartition := bits(127, 96)
-    access.mSetIndex := bits(159, 128)
-    access.mTag := bits(191, 160)
-    access.mMask := bits(223, 192)
-    access.smId := bits(255, 224)
-    access.schedulerId := bits(287, 256)
-    access.warpId := bits(319, 288)
-    access.mBundleId := bits(351, 320)
-    access.mWakeRelevantBundle := bits(383, 352)
-    access.mIsWrite := bits(384)
+    access.id := bits(63, 0)
+    access.address := bits(127, 64)
+    access.cycleCount := bits(191, 128)
+    access.mSubpartition := bits(223, 192)
+    access.mSetIndex := bits(255, 224)
+    access.mTag := bits(319, 256)
+    access.mMask := bits(351, 320)
+    access.smId := bits(383, 352)
+    access.schedulerId := bits(391, 384)
+    access.warpId := bits(423, 392)
+    access.mBundleId := bits(487, 424)
+    access.mWakeRelevantBundle := bits(488)
+    access.mIsWrite := bits(489)
     access
   }
 }
@@ -89,7 +89,7 @@ object BlockedWarpBitmap {
 }
 
 class ReservationClearRequest extends Bundle {
-  val cycle = UInt(32.W)
+  val cycle = UInt(64.W)
   val subpartition = UInt(32.W)
 }
 
@@ -98,16 +98,16 @@ class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
   val roundComplete = Output(Bool())
-  val currentCycleAfterIssue = Output(UInt(32.W))
+  val currentCycleAfterIssue = Output(UInt(64.W))
   val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
   val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(5.W))
-  val completedBundleIdWriteData = Output(UInt(32.W))
+  val completedBundleIdWriteData = Output(UInt(64.W))
   val completedBundleCountWriteEn = Output(Bool())
   val completedBundleCountWriteData = Output(UInt(6.W))
   val startRound = Input(Bool())
-  val minIssueCycle = Input(UInt(32.W))
+  val minIssueCycle = Input(UInt(64.W))
   val blockedWarpBitmapReady = Input(Bool())
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())

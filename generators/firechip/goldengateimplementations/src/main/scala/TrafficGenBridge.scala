@@ -110,8 +110,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // trigger for bridge driver to read reservedSubPartitionsByCycle
     val readReservedSubPartitions = Wire(Bool())
 
-    // need 2 beats to stream 32 32-bit bundle IDs (32x32 = 1024 bits = 2x512)
-    val completedBundleIdBeats = 2
+    // need 4 beats to stream 32 64-bit bundle IDs (32x64 = 2048 bits = 4x512)
+    val completedBundleIdBeats = 4
 
     // Send one 256-bit entry per 512-bit beat and leave the upper half zeroed so
     // the snapshot path only needs a single SyncReadMem read port.
@@ -210,7 +210,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     //// STEP 5: get completed bundle IDs from TG
 
     // vector of integers to store completed bundle IDs completed by target, to be read by bridge driver 
-    val completedBundleIds = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
+    val completedBundleIds = RegInit(VecInit(Seq.fill(32)(0.U(64.W))))
     val completedBundleCount = RegInit(0.U(6.W))
     val completedBundleIdsValid = RegInit(true.B)
     val completedBundleCountValid = RegInit(true.B)
@@ -231,7 +231,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // completedBundleIdsPacked(0) contains completedBundleIds(15, 0) and completedBundleIdsPacked(1) contains completedBundleIds(31, 16)
     val completedBundleIdsPacked = Wire(Vec(completedBundleIdBeats, UInt(L2Access.streamWidthBits.W)))
     for (beat <- 0 until completedBundleIdBeats) {
-      completedBundleIdsPacked(beat) := Cat((0 until 16).reverse.map(idx => completedBundleIds(beat * 16 + idx)))
+      completedBundleIdsPacked(beat) := Cat((0 until 8).reverse.map(idx => completedBundleIds(beat * 8 + idx)))
     }
 
     //// streamEnq target->host for reservedSubPartitionsByCycle and completedBundleIds ////
@@ -260,7 +260,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       streamSource,
       reservedStreamBits,
       Seq(
-        streamSourceCompletedBundleIds -> completedBundleIdsPacked(streamBeatIdx(0)), // only 2 beats, so only need the least significant bit of streamBeatIdx to index
+        streamSourceCompletedBundleIds -> completedBundleIdsPacked(streamBeatIdx),
         streamSourceIssuedAccessWriteback -> L2Access.pack(issuedAccessStreamEntryReg),
       ),
     )
@@ -398,7 +398,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val uploadActive = RegInit(false.B)
 
     val uploadRecvCount = RegInit(0.U(32.W))
-    val uploadStoredCount = RegInit(0.U(32.W))
     val blockedWarpBeatCount = RegInit(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
 
     val uploadDone = RegInit(true.B)
@@ -416,7 +415,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
       blockedWarpUploadDone := false.B
       uploadRecvCount := 0.U
-      uploadStoredCount := 0.U
       blockedWarpBeatCount := 0.U
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
@@ -482,7 +480,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
             accessStore.write(accessStoreTail, uploadBits)
             accessStoreTail := Mux(accessStoreTail === (key.maxL2AccessEntries - 1).U, 0.U, accessStoreTail + 1.U)
             accessStoreCount := accessStoreCount + 1.U
-            uploadStoredCount := uploadStoredCount + 1.U
           }.otherwise {
             // track to indicate when we overflow and can't store all L2 accesses
             uploadOverflow := true.B
@@ -521,7 +518,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.blockedWarpBitmapReady := blockedWarpUploadDone
     target.uploadDone := uploadDone
 
-    val minIssueCycle = RegInit(0.U(32.W))
+    val minIssueCycleLow = RegInit(0.U(32.W))
+    val minIssueCycleHigh = RegInit(0.U(32.W))
+    val minIssueCycle = Cat(minIssueCycleHigh, minIssueCycleLow)
     target.minIssueCycle := minIssueCycle
     target.accessStoreCount := accessStoreCount
 
@@ -647,7 +646,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(blockedWarpUploadDone, "blocked_warp_upload_done")
 
     // bridge driver writes the min_issue_cycle for the traffic generator to stop at
-    genWORegInit(minIssueCycle, "min_issue_cycle", 0.U)
+    genWORegInit(minIssueCycleLow, "min_issue_cycle_low", 0.U)
+    genWORegInit(minIssueCycleHigh, "min_issue_cycle_high", 0.U)
 
     // when completed bundle IDs or count are available, bridge driver can read them
     genROReg(completedBundleIdsValid, "completed_bundle_ids_valid")
@@ -656,7 +656,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     Pulsify(genWORegInit(readCompletedBundleIds, "read_completed_bundle_ids", false.B), pulseLength = 1)
     Pulsify(genWORegInit(readIssuedAccessWriteback, "read_issued_access_writeback", false.B), pulseLength = 1)
     
-    genROReg(target.currentCycleAfterIssue, "current_cycle_after_issue")
+    genROReg(target.currentCycleAfterIssue(31, 0), "current_cycle_after_issue_low")
+    genROReg(target.currentCycleAfterIssue(63, 32), "current_cycle_after_issue_high")
     genROReg(issuedAccessWritebackCount, "issued_access_writeback_count")
     
     

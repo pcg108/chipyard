@@ -47,7 +47,7 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
   // blocked warp bitmap has been written to bridge module
   val blockedWarpBitmapReady = Input(Bool())
   // furthest the TG is allowed to issue
-  val minIssueCycle = Input(UInt(32.W))
+  val minIssueCycle = Input(UInt(64.W))
   // begin next round of issuing
   val startRound = Input(Bool())
 
@@ -69,12 +69,12 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
   // write completed bundle IDs and counts to the bridge module as accesses return, to be used by future scheduling
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(5.W))
-  val completedBundleIdWriteData = Output(UInt(32.W))
+  val completedBundleIdWriteData = Output(UInt(64.W))
   val completedBundleCountWriteEn = Output(Bool())
   val completedBundleCountWriteData = Output(UInt(6.W))
 
   // current cycle of TG, used for scheduling
-  val currentCycleAfterIssue = Output(UInt(32.W))
+  val currentCycleAfterIssue = Output(UInt(64.W))
 
   //// Host -> Target execution data
 
@@ -112,21 +112,21 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val upload_done = Input(Bool())
     val blocked_warp_bitmap_ready = Input(Bool())
     val access_store_count = Input(UInt(32.W))
-    val min_issue_cycle = Input(UInt(32.W))
+    val min_issue_cycle = Input(UInt(64.W))
 
     val access_read_data_valid = Input(Bool())
-    val access_read_id = Input(UInt(32.W))
-    val access_read_address = Input(UInt(32.W))
-    val access_read_cycle_count = Input(UInt(32.W))
+    val access_read_id = Input(UInt(64.W))
+    val access_read_address = Input(UInt(64.W))
+    val access_read_cycle_count = Input(UInt(64.W))
     val access_read_subpartition = Input(UInt(32.W))
     val access_read_set_index = Input(UInt(32.W))
-    val access_read_tag = Input(UInt(32.W))
+    val access_read_tag = Input(UInt(64.W))
     val access_read_mask = Input(UInt(32.W))
     val access_read_sm_id = Input(UInt(32.W))
-    val access_read_scheduler_id = Input(UInt(32.W))
+    val access_read_scheduler_id = Input(UInt(8.W))
     val access_read_warp_id = Input(UInt(32.W))
-    val access_read_bundle_id = Input(UInt(32.W))
-    val access_read_wake_relevant_bundle = Input(UInt(32.W))
+    val access_read_bundle_id = Input(UInt(64.W))
+    val access_read_wake_relevant_bundle = Input(Bool())
     val access_read_is_write = Input(Bool())
 
     val blocked_warp_query_resp_valid = Input(Bool())
@@ -138,7 +138,7 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val target_busy = Output(Bool())
     val has_pending_work = Output(Bool())
     val round_complete = Output(Bool())
-    val current_cycle_after_issue = Output(UInt(32.W))
+    val current_cycle_after_issue = Output(UInt(64.W))
 
     val access_read_en = Output(Bool())
     val access_read_addr = Output(UInt(32.W))
@@ -146,29 +146,29 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val blocked_warp_query_idx = Output(UInt(BlockedWarpBitmap.indexBits.W))
 
     val issued_access_writeback_valid = Output(Bool())
-    val issued_access_writeback_id = Output(UInt(32.W))
-    val issued_access_writeback_address = Output(UInt(32.W))
-    val issued_access_writeback_cycle_count = Output(UInt(32.W))
+    val issued_access_writeback_id = Output(UInt(64.W))
+    val issued_access_writeback_address = Output(UInt(64.W))
+    val issued_access_writeback_cycle_count = Output(UInt(64.W))
     val issued_access_writeback_subpartition = Output(UInt(32.W))
     val issued_access_writeback_set_index = Output(UInt(32.W))
-    val issued_access_writeback_tag = Output(UInt(32.W))
+    val issued_access_writeback_tag = Output(UInt(64.W))
     val issued_access_writeback_mask = Output(UInt(32.W))
     val issued_access_writeback_sm_id = Output(UInt(32.W))
-    val issued_access_writeback_scheduler_id = Output(UInt(32.W))
+    val issued_access_writeback_scheduler_id = Output(UInt(8.W))
     val issued_access_writeback_warp_id = Output(UInt(32.W))
-    val issued_access_writeback_bundle_id = Output(UInt(32.W))
-    val issued_access_writeback_wake_relevant_bundle = Output(UInt(32.W))
+    val issued_access_writeback_bundle_id = Output(UInt(64.W))
+    val issued_access_writeback_wake_relevant_bundle = Output(Bool())
     val issued_access_writeback_is_write = Output(Bool())
 
     val reservation_clear_valid = Output(Bool())
-    val reservation_clear_cycle = Output(UInt(32.W))
+    val reservation_clear_cycle = Output(UInt(64.W))
     val reservation_clear_subpartition = Output(UInt(32.W))
 
     val completed_bundle_count_write_en = Output(Bool())
     val completed_bundle_count_write_data = Output(UInt(6.W))
     val completed_bundle_id_write_en = Output(Bool())
     val completed_bundle_id_write_idx = Output(UInt(5.W))
-    val completed_bundle_id_write_data = Output(UInt(32.W))
+    val completed_bundle_id_write_data = Output(UInt(64.W))
 
     val access_store_consume_en = Output(Bool())
     val access_store_consume_count = Output(UInt(32.W))
@@ -206,13 +206,13 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       startTrafficGenPulse := false.B
       io.startTrafficGen := startTrafficGenPulse
 
-      val currentCycleAfterIssue = RegInit(0.U(32.W))
+      val currentCycleAfterIssue = RegInit(0.U(64.W))
       val roundComplete = Wire(Bool())
       val patternReady = RegInit(false.B)
       val completedBundleCountWriteEn = Wire(Bool())
       val completedBundleCountWriteData = Wire(UInt(6.W))
       val completedBundleIdWriteEn = Wire(Vec(32, Bool())) // one-hot vector for enable signal
-      val completedBundleIdWriteData = Wire(Vec(32, UInt(32.W)))
+      val completedBundleIdWriteData = Wire(Vec(32, UInt(64.W)))
       val dpi = Module(new TrafficGenDPIBlackBox(params.numGenerators))
 
       dpi.io.clock := clock
@@ -329,9 +329,11 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x08 -> Seq(RegField.r(1, io.targetBusy)),
         0x0C -> Seq(RegField.r(1, io.uploadDone)),
         0x18 -> Seq(RegField.r(1, patternReady)),
-        0x20 -> Seq(RegField.r(32, io.minIssueCycle)),
-        0x24 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
-        0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue))
+        0x20 -> Seq(RegField.r(32, io.minIssueCycle(31, 0))),
+        0x24 -> Seq(RegField.r(32, io.minIssueCycle(63, 32))),
+        0x28 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
+        0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue(31, 0))),
+        0x3C -> Seq(RegField.r(32, io.currentCycleAfterIssue(63, 32)))
       )
     }
   }

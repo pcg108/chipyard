@@ -37,25 +37,25 @@ struct WarpKey {
 };
 
 struct Access {
-  std::uint32_t id = 0;
-  std::uint32_t address = 0;
-  std::uint32_t cycleCount = 0;
+  std::uint64_t id = 0;
+  std::uint64_t address = 0;
+  std::uint64_t cycleCount = 0;
   std::uint32_t subpartition = 0;
   std::uint32_t setIndex = 0;
-  std::uint32_t tag = 0;
+  std::uint64_t tag = 0;
   std::uint32_t mask = 0;
   std::uint32_t smId = 0;
-  std::uint32_t schedulerId = 0;
+  std::uint8_t schedulerId = 0;
   std::uint32_t warpId = 0;
-  std::uint32_t bundleId = 0;
-  std::uint32_t wakeRelevantBundle = 0;
+  std::uint64_t bundleId = 0;
+  bool wakeRelevantBundle = false;
   bool isWrite = false;
 
   WarpKey warpKey() const { return WarpKey{smId, schedulerId, warpId}; }
 };
 
 struct ReservationClear {
-  std::uint32_t cycle = 0;
+  std::uint64_t cycle = 0;
   std::uint32_t subpartition = 0;
 };
 
@@ -201,7 +201,7 @@ public:
       svBit uploadDone,
       svBit blockedWarpBitmapReady,
       std::uint32_t accessStoreCount,
-      std::uint32_t minIssueCycle,
+      std::uint64_t minIssueCycle,
       svBit accessReadDataValid,
       const Access &accessReadData,
       svBit blockedWarpQueryRespValid,
@@ -211,7 +211,7 @@ public:
       svBit *targetBusy,
       svBit *hasPendingWork,
       svBit *roundComplete,
-      std::uint32_t *currentCycleAfterIssue,
+      std::uint64_t *currentCycleAfterIssue,
       svBit *accessReadEn,
       std::uint32_t *accessReadAddr,
       svBit *blockedWarpQueryEn,
@@ -224,7 +224,7 @@ public:
       std::uint32_t *completedBundleCountWriteData,
       svBit *completedBundleIdWriteEn,
       std::uint32_t *completedBundleIdWriteIdx,
-      std::uint32_t *completedBundleIdWriteData,
+      std::uint64_t *completedBundleIdWriteData,
       svBit *accessStoreConsumeEn,
       std::uint32_t *accessStoreConsumeCount,
       svBit *reservationWindowAdvanceEn,
@@ -233,7 +233,7 @@ public:
     *targetBusy = (mState != State::Idle) ? 1 : 0;
     *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
     *roundComplete = 0;
-    *currentCycleAfterIssue = static_cast<std::uint32_t>(mCurrentCycle);
+    *currentCycleAfterIssue = mCurrentCycle;
     *accessReadEn = 0;
     *accessReadAddr = 0;
     *blockedWarpQueryEn = 0;
@@ -342,8 +342,7 @@ public:
                  mPendingBundleIdIdx < 32) {
         *completedBundleIdWriteEn = 1;
         *completedBundleIdWriteIdx = static_cast<std::uint32_t>(mPendingBundleIdIdx);
-        *completedBundleIdWriteData =
-            static_cast<std::uint32_t>(mCompletedBundleQueue[mPendingBundleIdIdx]);
+        *completedBundleIdWriteData = mCompletedBundleQueue[mPendingBundleIdIdx];
         ++mPendingBundleIdIdx;
         anyOutstanding = true;
       }
@@ -353,7 +352,7 @@ public:
         *accessStoreConsumeCount = mConsumeCount;
         *reservationWindowAdvanceEn = 1;
         *reservationWindowAdvanceCycle = mRoundCurrentCycle;
-        *currentCycleAfterIssue = static_cast<std::uint32_t>(mRoundCurrentCycle);
+        *currentCycleAfterIssue = mRoundCurrentCycle;
         *hasPendingWork = mRoundHasPendingWork ? 1 : 0;
         *roundComplete = 1;
         mState = State::Idle;
@@ -368,11 +367,11 @@ public:
     if (roundFinishedThisStep) {
       *targetBusy = 0;
       *hasPendingWork = mRoundHasPendingWork ? 1 : 0;
-      *currentCycleAfterIssue = static_cast<std::uint32_t>(mRoundCurrentCycle);
+      *currentCycleAfterIssue = mRoundCurrentCycle;
     } else {
       *targetBusy = (mState != State::Idle) ? 1 : 0;
       *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
-      *currentCycleAfterIssue = static_cast<std::uint32_t>(mCurrentCycle);
+      *currentCycleAfterIssue = mCurrentCycle;
     }
   }
 
@@ -476,11 +475,10 @@ private:
           const std::uint64_t elapsedCycle = static_cast<std::uint64_t>(std::max(findAccessTime(access), 0));
 
           Access issuedAccess = access;
-          issuedAccess.cycleCount = static_cast<std::uint32_t>(mCurrentCycle);
+          issuedAccess.cycleCount = mCurrentCycle;
           mIssuedQueue.push_back(issuedAccess);
           mReservationClearQueue.push_back(
-              ReservationClear{static_cast<std::uint32_t>(mCurrentCycle),
-                               access.subpartition});
+              ReservationClear{mCurrentCycle, access.subpartition});
           ++mConsumeCount;
 
           mInflight[access.id] = PendingAccessInfo{
@@ -492,7 +490,7 @@ private:
           auto &bundleInfo = mOutstandingBundles[access.bundleId];
           ++bundleInfo.remainingRequestCount;
           bundleInfo.warpKey = access.warpKey();
-          bundleInfo.wakeRelevant = access.wakeRelevantBundle != 0;
+          bundleInfo.wakeRelevant = access.wakeRelevantBundle;
         }
         pendingByCycle.erase(pendingIt);
       }
@@ -531,7 +529,7 @@ private:
   std::size_t mPendingBundleIdIdx = 0;
   std::uint32_t mConsumeCount = 0;
   std::uint64_t mRoundCurrentCycle = 0;
-  std::uint32_t mRoundMinIssueCycle = 0;
+  std::uint64_t mRoundMinIssueCycle = 0;
   bool mRoundHasPendingWork = false;
 };
 
@@ -548,20 +546,20 @@ extern "C" void trafficgen_dpi_step(
     svBit upload_done,
     svBit blocked_warp_bitmap_ready,
     std::uint32_t access_store_count,
-    std::uint32_t min_issue_cycle,
+    std::uint64_t min_issue_cycle,
     svBit access_read_data_valid,
-    std::uint32_t access_read_id,
-    std::uint32_t access_read_address,
-    std::uint32_t access_read_cycle_count,
+    std::uint64_t access_read_id,
+    std::uint64_t access_read_address,
+    std::uint64_t access_read_cycle_count,
     std::uint32_t access_read_subpartition,
     std::uint32_t access_read_set_index,
-    std::uint32_t access_read_tag,
+    std::uint64_t access_read_tag,
     std::uint32_t access_read_mask,
     std::uint32_t access_read_sm_id,
-    std::uint32_t access_read_scheduler_id,
+    std::uint8_t access_read_scheduler_id,
     std::uint32_t access_read_warp_id,
-    std::uint32_t access_read_bundle_id,
-    std::uint32_t access_read_wake_relevant_bundle,
+    std::uint64_t access_read_bundle_id,
+    svBit access_read_wake_relevant_bundle,
     svBit access_read_is_write,
     svBit blocked_warp_query_resp_valid,
     svBit blocked_warp_query_resp,
@@ -570,33 +568,33 @@ extern "C" void trafficgen_dpi_step(
     svBit *target_busy,
     svBit *has_pending_work,
     svBit *round_complete,
-    std::uint32_t *current_cycle_after_issue,
+    std::uint64_t *current_cycle_after_issue,
     svBit *access_read_en,
     std::uint32_t *access_read_addr,
     svBit *blocked_warp_query_en,
     std::uint32_t *blocked_warp_query_idx,
     svBit *issued_access_writeback_valid,
-    std::uint32_t *issued_access_writeback_id,
-    std::uint32_t *issued_access_writeback_address,
-    std::uint32_t *issued_access_writeback_cycle_count,
+    std::uint64_t *issued_access_writeback_id,
+    std::uint64_t *issued_access_writeback_address,
+    std::uint64_t *issued_access_writeback_cycle_count,
     std::uint32_t *issued_access_writeback_subpartition,
     std::uint32_t *issued_access_writeback_set_index,
-    std::uint32_t *issued_access_writeback_tag,
+    std::uint64_t *issued_access_writeback_tag,
     std::uint32_t *issued_access_writeback_mask,
     std::uint32_t *issued_access_writeback_sm_id,
-    std::uint32_t *issued_access_writeback_scheduler_id,
+    std::uint8_t *issued_access_writeback_scheduler_id,
     std::uint32_t *issued_access_writeback_warp_id,
-    std::uint32_t *issued_access_writeback_bundle_id,
-    std::uint32_t *issued_access_writeback_wake_relevant_bundle,
+    std::uint64_t *issued_access_writeback_bundle_id,
+    svBit *issued_access_writeback_wake_relevant_bundle,
     svBit *issued_access_writeback_is_write,
     svBit *reservation_clear_valid,
-    std::uint32_t *reservation_clear_cycle,
+    std::uint64_t *reservation_clear_cycle,
     std::uint32_t *reservation_clear_subpartition,
     svBit *completed_bundle_count_write_en,
     std::uint32_t *completed_bundle_count_write_data,
     svBit *completed_bundle_id_write_en,
     std::uint32_t *completed_bundle_id_write_idx,
-    std::uint32_t *completed_bundle_id_write_data,
+    std::uint64_t *completed_bundle_id_write_data,
     svBit *access_store_consume_en,
     std::uint32_t *access_store_consume_count,
     svBit *reservation_window_advance_en,
@@ -617,7 +615,7 @@ extern "C" void trafficgen_dpi_step(
       access_read_scheduler_id,
       access_read_warp_id,
       access_read_bundle_id,
-      access_read_wake_relevant_bundle,
+      access_read_wake_relevant_bundle != 0,
       access_read_is_write != 0,
   };
 
@@ -669,7 +667,8 @@ extern "C" void trafficgen_dpi_step(
   *issued_access_writeback_scheduler_id = issuedAccess.schedulerId;
   *issued_access_writeback_warp_id = issuedAccess.warpId;
   *issued_access_writeback_bundle_id = issuedAccess.bundleId;
-  *issued_access_writeback_wake_relevant_bundle = issuedAccess.wakeRelevantBundle;
+  *issued_access_writeback_wake_relevant_bundle =
+      issuedAccess.wakeRelevantBundle ? 1 : 0;
   *issued_access_writeback_is_write = issuedAccess.isWrite ? 1 : 0;
 
   *reservation_clear_cycle = reservationClear.cycle;

@@ -30,12 +30,14 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t upload_done;
   uint64_t upload_overflow;
   uint64_t blocked_warp_upload_done;
-  uint64_t min_issue_cycle;
+  uint64_t min_issue_cycle_low;
+  uint64_t min_issue_cycle_high;
   uint64_t completed_bundle_ids_valid;
   uint64_t completed_bundle_count_valid;
   uint64_t read_completed_bundle_ids;
   uint64_t read_issued_access_writeback;
-  uint64_t current_cycle_after_issue;
+  uint64_t current_cycle_after_issue_low;
+  uint64_t current_cycle_after_issue_high;
   uint64_t issued_access_writeback_count;
   uint64_t completed_bundle_count;
 };
@@ -44,18 +46,18 @@ using L2SubpartitionReservationsByCycle =
     std::unordered_map<std::uint64_t, std::unordered_set<unsigned>>;
 
 struct trafficgen_l2_access_t {
-  uint32_t id;
-  uint32_t address;
-  uint32_t cycle_count;
+  uint64_t id;
+  uint64_t address;
+  uint64_t cycle_count;
   uint32_t m_subpartition;
   uint32_t m_set_index;
-  uint32_t m_tag;
+  uint64_t m_tag;
   uint32_t m_mask;
   uint32_t sm_id;
-  uint32_t scheduler_id;
+  uint8_t scheduler_id;
   uint32_t warp_id;
-  uint32_t m_bundle_id;
-  uint32_t m_wake_relevant_bundle;
+  uint64_t m_bundle_id;
+  bool m_wake_relevant_bundle;
   bool m_is_write;
 };
 
@@ -108,7 +110,7 @@ public:
   static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
   
   static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 32;
-  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 2;
+  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 4;
 
   trafficgen_t(simif_t &simif,
                StreamEngine &stream,
@@ -140,7 +142,7 @@ private:
   std::array<uint64_t, STREAM_BATCH_BEATS * STREAM_WORDS_PER_BEAT>
       reserved_subpartitions_words{};
   L2SubpartitionReservationsByCycle reserved_subpartitions_by_cycle;
-  std::array<uint32_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
+  std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
   std::array<uint8_t, COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES>
       completed_bundle_stream_bytes{};

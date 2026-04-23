@@ -283,10 +283,21 @@ std::uint32_t checked_u32(T value, const char *field_name) {
   if (value > static_cast<T>(UINT32_MAX)) {
     std::cout << "[bridge driver] " << field_name
               << " out of range for target upload: "
-              << static_cast<std::uint64_t>(value) << '\n';
+              << static_cast<std::uint64_t>(value) << std::endl;
     std::abort();
   }
   return static_cast<std::uint32_t>(value);
+}
+
+template <typename T>
+std::uint8_t checked_u8(T value, const char *field_name) {
+  if (value > static_cast<T>(UINT8_MAX)) {
+    std::cout << "[bridge driver] " << field_name
+              << " out of range for target upload: "
+              << static_cast<std::uint64_t>(value) << std::endl;
+    std::abort();
+  }
+  return static_cast<std::uint8_t>(value);
 }
 
 } // namespace
@@ -380,7 +391,7 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
       warp_id >= max_warp_id) {
     std::cout << "[bridge driver] blocked warp tuple out of range: sm=" << sm_id
               << " scheduler=" << scheduler_id << " warp=" << warp_id
-              << '\n';
+              << std::endl;
     std::abort();
   }
 
@@ -391,36 +402,37 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
 
 static void pack_l2_access(const trafficgen_l2_access_t &access,
                            uint64_t *words) {
-
-  // serialize one L2 access struct into 8 64-bit ints
-  words[0] = (static_cast<uint64_t>(access.address) << 32) | access.id;
-  words[1] = (static_cast<uint64_t>(access.m_subpartition) << 32) |
-             access.cycle_count;
-  words[2] = (static_cast<uint64_t>(access.m_tag) << 32) | access.m_set_index;
-  words[3] = (static_cast<uint64_t>(access.sm_id) << 32) | access.m_mask;
-  words[4] =
-      (static_cast<uint64_t>(access.warp_id) << 32) | access.scheduler_id;
-  words[5] = (static_cast<uint64_t>(access.m_wake_relevant_bundle) << 32) |
-             access.m_bundle_id;
-  words[6] = access.m_is_write ? 1ULL : 0ULL;
-  words[7] = 0ULL;
+  words[0] = access.id;
+  words[1] = access.address;
+  words[2] = access.cycle_count;
+  words[3] = (static_cast<uint64_t>(access.m_set_index) << 32) |
+             access.m_subpartition;
+  words[4] = access.m_tag;
+  words[5] = (static_cast<uint64_t>(access.sm_id) << 32) | access.m_mask;
+  words[6] = (access.m_bundle_id & 0xffffffULL) << 40 |
+             (static_cast<uint64_t>(access.warp_id) << 8) |
+             static_cast<uint64_t>(access.scheduler_id);
+  words[7] = (access.m_is_write ? 1ULL : 0ULL) << 41 |
+             (access.m_wake_relevant_bundle ? 1ULL : 0ULL) << 40 |
+             (access.m_bundle_id >> 24);
 }
 
 static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
   trafficgen_l2_access_t access{};
-  access.id = static_cast<uint32_t>(words[0] & 0xffffffffULL);
-  access.address = static_cast<uint32_t>(words[0] >> 32);
-  access.cycle_count = static_cast<uint32_t>(words[1] & 0xffffffffULL);
-  access.m_subpartition = static_cast<uint32_t>(words[1] >> 32);
-  access.m_set_index = static_cast<uint32_t>(words[2] & 0xffffffffULL);
-  access.m_tag = static_cast<uint32_t>(words[2] >> 32);
-  access.m_mask = static_cast<uint32_t>(words[3] & 0xffffffffULL);
-  access.sm_id = static_cast<uint32_t>(words[3] >> 32);
-  access.scheduler_id = static_cast<uint32_t>(words[4] & 0xffffffffULL);
-  access.warp_id = static_cast<uint32_t>(words[4] >> 32);
-  access.m_bundle_id = static_cast<uint32_t>(words[5] & 0xffffffffULL);
-  access.m_wake_relevant_bundle = static_cast<uint32_t>(words[5] >> 32);
-  access.m_is_write = (words[6] & 0x1ULL) != 0;
+  access.id = words[0];
+  access.address = words[1];
+  access.cycle_count = words[2];
+  access.m_subpartition = static_cast<uint32_t>(words[3] & 0xffffffffULL);
+  access.m_set_index = static_cast<uint32_t>(words[3] >> 32);
+  access.m_tag = words[4];
+  access.m_mask = static_cast<uint32_t>(words[5] & 0xffffffffULL);
+  access.sm_id = static_cast<uint32_t>(words[5] >> 32);
+  access.scheduler_id = static_cast<uint8_t>(words[6] & 0xffULL);
+  access.warp_id = static_cast<uint32_t>((words[6] >> 8) & 0xffffffffULL);
+  access.m_bundle_id =
+      ((words[7] & 0xffffffffffULL) << 24) | ((words[6] >> 40) & 0xffffffULL);
+  access.m_wake_relevant_bundle = ((words[7] >> 40) & 0x1ULL) != 0;
+  access.m_is_write = ((words[7] >> 41) & 0x1ULL) != 0;
   return access;
 }
 
@@ -481,7 +493,7 @@ void trafficgen_t::connect_gpu_model_socket() {
 
   gpu_model_socket_client->connect_loopback(kGpuModelSocketPort);
   std::cout << "[bridge driver] connected to gpu_model_socket at 127.0.0.1:"
-            << static_cast<unsigned>(kGpuModelSocketPort) << '\n';
+            << static_cast<unsigned>(kGpuModelSocketPort) << std::endl;
 }
 
 bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
@@ -493,7 +505,7 @@ bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
   const SchedulingRoundStateMessage message =
       gpu_model_socket_client->recv_message<SchedulingRoundStateMessage>();
   std::cout << "[bridge driver] received scheduling round state from gpu_model_socket: mainLoopComplete="
-            << (message.mainLoopComplete ? "true" : "false") << '\n';
+            << (message.mainLoopComplete ? "true" : "false") << std::endl;
   return message.mainLoopComplete;
 }
 
@@ -509,7 +521,7 @@ void trafficgen_t::send_reserved_subpartitions_snapshot() const {
   gpu_model_socket_client->send_frame(payload);
 
   std::cout << "[bridge driver] sent reservedSubPartitionsByCycle to gpu_model_socket: cycles="
-            << reserved_subpartitions_by_cycle.size() << " payload_bytes=" << payload.size() << '\n';
+            << reserved_subpartitions_by_cycle.size() << " payload_bytes=" << payload.size() << std::endl;
 }
 
 void trafficgen_t::receive_schedule_from_gpu_model() {
@@ -526,29 +538,27 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   l2_accesses.reserve(message.allL2TraceSteps.size());
   for (const auto &wire_access : message.allL2TraceSteps) {
     trafficgen_l2_access_t access{};
-    access.id = checked_u32(wire_access.mUniqueId, "l2 access unique id");
-    access.address = checked_u32(wire_access.mAddress, "l2 access address");
-    access.cycle_count =
-        checked_u32(wire_access.mCycleCount, "l2 access cycle count");
+    access.id = wire_access.mUniqueId;
+    access.address = wire_access.mAddress;
+    access.cycle_count = wire_access.mCycleCount;
     access.m_subpartition = checked_u32(
         static_cast<std::uint64_t>(wire_access.mSubpartition),
         "l2 access subpartition");
     access.m_set_index = checked_u32(
         static_cast<std::uint64_t>(wire_access.mSetIndex),
         "l2 access set index");
-    access.m_tag = checked_u32(wire_access.mTag, "l2 access tag");
+    access.m_tag = wire_access.mTag;
     access.m_mask = checked_u32(
         static_cast<std::uint64_t>(wire_access.mMask), "l2 access mask");
     access.sm_id = checked_u32(
         static_cast<std::uint64_t>(wire_access.smId), "l2 access sm id");
-    access.scheduler_id = checked_u32(
+    access.scheduler_id = checked_u8(
         static_cast<std::uint64_t>(wire_access.schedulerId),
         "l2 access scheduler id");
     access.warp_id = checked_u32(
         static_cast<std::uint64_t>(wire_access.warpId), "l2 access warp id");
-    access.m_bundle_id =
-        checked_u32(wire_access.mBundleId, "l2 access bundle id");
-    access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle ? 1u : 0u;
+    access.m_bundle_id = wire_access.mBundleId;
+    access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle;
     access.m_is_write = wire_access.mIsWrite;
     l2_accesses.push_back(access);
   }
@@ -570,7 +580,7 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "l2_accesses=" << l2_accesses.size()
             << " blocked_warps=" << message.blockedWarpIds.size()
-            << " min_issue_cycle=" << min_issue_cycle << '\n';
+            << " min_issue_cycle=" << min_issue_cycle << std::endl;
 }
 
 
@@ -582,7 +592,7 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
     reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
     if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
       std::cout << "[bridge driver] reservedSubPartitions baseIdx out of range: "
-                << reserved_subpartitions_base_idx << '\n';
+                << reserved_subpartitions_base_idx << std::endl;
       std::abort();
     }
 
@@ -614,7 +624,7 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
   if (bytes_received > remaining_bytes) {
     std::cout << "[bridge driver] reservedSubPartitionsByCycle overrun: "
               << "remaining=" << remaining_bytes
-              << " got=" << bytes_received << '\n';
+              << " got=" << bytes_received << std::endl;
     std::abort();
   }
   if (reserved_subpartition_bytes_received + bytes_received < STREAM_BATCH_BYTES) {
@@ -664,7 +674,7 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
   std::cout << "[bridge driver] decoded reservedSubPartitionsByCycle: cycles="
             << reserved_subpartitions_by_cycle.size()
             << " baseIdx=" << reserved_subpartitions_base_idx
-            << " baseCycle=" << reserved_subpartitions_base_cycle << '\n';
+            << " baseCycle=" << reserved_subpartitions_base_cycle << std::endl;
 
   return bytes_received;
 }
@@ -686,7 +696,7 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
   }
   if (bytes_received > remaining_bytes) {
     std::cout << "[bridge driver] completedBundleIds overrun: remaining="
-              << remaining_bytes << " got=" << bytes_received << '\n';
+              << remaining_bytes << " got=" << bytes_received << std::endl;
     std::abort();
   }
   completed_bundle_bytes_received += bytes_received;
@@ -694,19 +704,17 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
     return bytes_received;
   }
 
-  auto *bundle_ids =
-      reinterpret_cast<const uint32_t *>(completed_bundle_stream_bytes.data());
-  for (size_t i = 0; i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
-    completed_bundle_ids[i] = bundle_ids[i];
-  }
+  std::memcpy(completed_bundle_ids.data(),
+              completed_bundle_stream_bytes.data(),
+              sizeof(completed_bundle_ids));
   completed_bundle_count =
       static_cast<uint32_t>(read(mmio_addrs.completed_bundle_count));
 
   std::cout << "[bridge driver] completedBundleIds count="
-            << completed_bundle_count << '\n';
+            << completed_bundle_count << std::endl;
   for (size_t i = 0; i < completed_bundle_count && i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
     std::cout << "[bridge driver] completedBundleIds[" << i
-              << "]=" << completed_bundle_ids[i] << '\n';
+              << "]=" << completed_bundle_ids[i] << std::endl;
   }
 
   return bytes_received;
@@ -735,7 +743,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
   }
   if (bytes_received > remaining_bytes) {
     std::cout << "[bridge driver] issuedAccessWriteback overrun: remaining="
-              << remaining_bytes << " got=" << bytes_received << '\n';
+              << remaining_bytes << " got=" << bytes_received << std::endl;
     std::abort();
   }
   issued_access_writeback_bytes_received += bytes_received;
@@ -753,7 +761,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
   }
 
   std::cout << "[bridge driver] issuedAccessWriteback count="
-            << issued_access_writeback_count << '\n';
+            << issued_access_writeback_count << std::endl;
   return bytes_received;
 }
 
@@ -841,7 +849,7 @@ void trafficgen_t::tick() {
     // Wait for the traffic generator to be kicked off.
 
     if (read(mmio_addrs.start_trafficgen)) {
-      std::cout << "[bridge driver] start signal received, starting traffic generation\n";
+      std::cout << "[bridge driver] start signal received, starting traffic generation" << std::endl;
       
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
@@ -880,7 +888,7 @@ void trafficgen_t::tick() {
     reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
     if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
       std::cout << "[bridge driver] completed reading reservedSubPartitionsByCycle stream data, bytes received="
-                << reserved_subpartition_bytes_received << '\n';
+                << reserved_subpartition_bytes_received << std::endl;
       
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
       send_reserved_subpartitions_snapshot();
@@ -895,8 +903,10 @@ void trafficgen_t::tick() {
                                          : trafficgen_upload_phase_t::l2_accesses;
       write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
       write(mmio_addrs.upload_start, 1);
-      write(mmio_addrs.min_issue_cycle,
-            checked_u32(min_issue_cycle, "min issue cycle"));
+      write(mmio_addrs.min_issue_cycle_low,
+            static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+      write(mmio_addrs.min_issue_cycle_high,
+            static_cast<uint32_t>(min_issue_cycle >> 32));
       reserved_subpartitions_read_issued = false;
       
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
@@ -912,8 +922,7 @@ void trafficgen_t::tick() {
         (l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
         read(mmio_addrs.blocked_warp_upload_done)) {
 
-      std::cout << "[bridge driver] upload completed, entering traffic issuing "
-                << "stage\n";
+      std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
 
       write(mmio_addrs.start_round, 1);
       // pause_target is a pulse-driven toggle in the bridge module.
@@ -997,7 +1006,11 @@ void trafficgen_t::tick() {
         message.trafficGenResult.completedBundleIds.push_back(completed_bundle_ids[i]);
       }
       message.trafficGenResult.currentCycleAfterIssue =
-          static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue));
+          (static_cast<std::uint64_t>(
+               read(mmio_addrs.current_cycle_after_issue_high))
+           << 32) |
+          static_cast<std::uint64_t>(
+              read(mmio_addrs.current_cycle_after_issue_low));
       message.hasPendingWork = read(mmio_addrs.has_pending_work) != 0;
 
       if (!gpu_model_socket_client) {
