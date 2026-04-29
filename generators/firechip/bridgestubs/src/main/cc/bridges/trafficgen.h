@@ -38,6 +38,7 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t read_issued_access_writeback;
   uint64_t current_cycle_after_issue_low;
   uint64_t current_cycle_after_issue_high;
+  uint64_t dpi_state;
   uint64_t issued_access_writeback_count;
   uint64_t completed_bundle_count;
 };
@@ -163,6 +164,7 @@ private:
   size_t blocked_warp_bitmap_upload_cursor = 0;
   trafficgen_upload_phase_t upload_phase = trafficgen_upload_phase_t::l2_accesses;
   bool target_busy = false;
+  bool round_completion_pause_issued = false;
   bool reserved_subpartitions_read_issued = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
   std::unique_ptr<socket_client_t> gpu_model_socket_client;

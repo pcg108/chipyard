@@ -26,7 +26,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 char trafficgen_t::KIND;
@@ -137,6 +139,30 @@ private:
   }
 };
 
+struct SocketAllL2TraceStepsSnapshot {
+  std::vector<socket_l2_access_t> steps;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & steps;
+  }
+};
+
+struct SocketBlockedWarpIdsSnapshot {
+  std::set<socket_warp_key_t> blockedWarpIds;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & blockedWarpIds;
+  }
+};
+
 struct IssuedAccessPoint {
   std::uint64_t requestUid = 0;
   std::uint64_t address = 0;
@@ -199,6 +225,61 @@ std::string errno_message(const std::string &prefix) {
   std::ostringstream oss;
   oss << prefix << ": " << std::strerror(errno);
   return oss.str();
+}
+
+void create_directory_if_needed(const std::string &path) {
+  if (mkdir(path.c_str(), 0755) == 0 || errno == EEXIST) {
+    return;
+  }
+  throw std::runtime_error(errno_message("failed to create " + path));
+}
+
+std::string format_round_log_dir(std::uint64_t round_number) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "round_%06" PRIu64, round_number);
+  return std::string(buffer);
+}
+
+template <typename Snapshot>
+void write_socket_snapshot(const std::string &path, const Snapshot &snapshot) {
+  std::ofstream output(path, std::ios::binary);
+  if (!output.is_open()) {
+    throw std::runtime_error("failed to open socket round log for writing: " +
+                             path);
+  }
+
+  boost::archive::binary_oarchive archive(output);
+  archive << snapshot;
+}
+
+void log_socket_round_inputs_for_compare(
+    const std::vector<socket_l2_access_t> &all_l2_trace_steps,
+    const std::set<socket_warp_key_t> &blocked_warp_ids) {
+  static std::uint64_t round_number = 0;
+  ++round_number;
+
+  const std::string root_dir =
+      "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0/bridge_socket_round_logs";
+  const std::string round_dir =
+      root_dir + "/" + format_round_log_dir(round_number);
+  const std::string l2_trace_steps_path = round_dir + "/all_l2_trace_steps.bin";
+  const std::string blocked_warp_ids_path = round_dir + "/blocked_warp_ids.bin";
+
+  create_directory_if_needed(root_dir);
+  create_directory_if_needed(round_dir);
+
+  SocketAllL2TraceStepsSnapshot l2_trace_steps_snapshot;
+  l2_trace_steps_snapshot.steps = all_l2_trace_steps;
+  SocketBlockedWarpIdsSnapshot blocked_warp_ids_snapshot;
+  blocked_warp_ids_snapshot.blockedWarpIds = blocked_warp_ids;
+
+  write_socket_snapshot(l2_trace_steps_path, l2_trace_steps_snapshot);
+  write_socket_snapshot(blocked_warp_ids_path, blocked_warp_ids_snapshot);
+
+  std::cout << "[bridge driver] logged socket round input snapshots: "
+            << "round_dir=" << round_dir
+            << " l2_accesses=" << all_l2_trace_steps.size()
+            << " blocked_warps=" << blocked_warp_ids.size() << std::endl;
 }
 
 std::uint64_t host_to_network_64(std::uint64_t value) {
@@ -478,6 +559,7 @@ void trafficgen_t::init() {
   upload_cursor = 0;
   blocked_warp_bitmap_upload_cursor = 0;
   upload_phase = trafficgen_upload_phase_t::done;
+  round_completion_pause_issued = false;
   reserved_subpartitions_read_issued = false;
   reserved_subpartitions_base_idx = 0;
   reserved_subpartitions_base_cycle = 0;
@@ -532,6 +614,9 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
 
   const SchedulerRoundMessage message =
       gpu_model_socket_client->recv_message<SchedulerRoundMessage>();
+
+  log_socket_round_inputs_for_compare(message.allL2TraceSteps,
+                                      message.blockedWarpIds);
 
   min_issue_cycle = message.min_issue_cycle;
   l2_accesses.clear();
@@ -855,6 +940,7 @@ void trafficgen_t::tick() {
       write(mmio_addrs.pause_target, 1);
 
       if (receive_main_loop_complete_from_gpu_model()) {
+        write(mmio_addrs.pause_target, 1);
         state = trafficgen_state_t::IDLE;
         break;
       }
@@ -927,6 +1013,7 @@ void trafficgen_t::tick() {
       write(mmio_addrs.start_round, 1);
       // pause_target is a pulse-driven toggle in the bridge module.
       write(mmio_addrs.pause_target, 1);
+      round_completion_pause_issued = false;
       state = trafficgen_state_t::ISSUING_TRAFFIC;
     }
 
@@ -934,11 +1021,15 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::ISSUING_TRAFFIC:
     // Wait for the target to finish generating memory traffic for the current round.
 
-    if (!read(mmio_addrs.target_busy) && read(mmio_addrs.round_complete)) {
-      // Pause the target before reading back round results.
+    if (read(mmio_addrs.round_complete) && !round_completion_pause_issued) {
+      // Hold target fire low while bridge-side retire and reservation clear sweeps drain.
       write(mmio_addrs.pause_target, 1);
+      round_completion_pause_issued = true;
+    }
 
-
+    if (round_completion_pause_issued &&
+        !read(mmio_addrs.target_busy) &&
+        read(mmio_addrs.round_complete)) {
       issued_access_writeback_entries.clear();
       issued_access_writeback_stream_bytes.clear();
       issued_access_writeback_count = 0;
@@ -1020,6 +1111,9 @@ void trafficgen_t::tick() {
       gpu_model_socket_client->send_frame(serialize_message(message));
 
       if (receive_main_loop_complete_from_gpu_model()) {
+        // Resume the target CPU so the target-side trafficgen test can observe
+        // idle and finish after the final scheduling round has been reported.
+        write(mmio_addrs.pause_target, 1);
         state = trafficgen_state_t::IDLE;
       } else {
         issued_access_writeback_entries.clear();

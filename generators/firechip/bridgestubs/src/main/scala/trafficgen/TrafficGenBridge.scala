@@ -36,8 +36,10 @@ object TrafficGenBridge {
     ep.io.trafficgen.targetBusy := trafficGenIO.targetBusy
     ep.io.trafficgen.hasPendingWork := trafficGenIO.hasPendingWork
     ep.io.trafficgen.startTrafficGen := trafficGenIO.startTrafficGen
+    ep.io.trafficgen.roundStarted := trafficGenIO.roundStarted
     ep.io.trafficgen.roundComplete := trafficGenIO.roundComplete
     ep.io.trafficgen.currentCycleAfterIssue := trafficGenIO.currentCycleAfterIssue
+    ep.io.trafficgen.dpiState := trafficGenIO.dpiState
     ep.io.trafficgen.reservationClear <> trafficGenIO.reservationClear
     ep.io.trafficgen.issuedAccessWriteback <> trafficGenIO.issuedAccessWriteback
     ep.io.trafficgen.completedBundleIdWriteEn := trafficGenIO.completedBundleIdWriteEn
@@ -50,15 +52,21 @@ object TrafficGenBridge {
     trafficGenIO.blockedWarpBitmapReady := ep.io.trafficgen.blockedWarpBitmapReady
     ep.io.trafficgen.blockedWarpQueryIdx := trafficGenIO.blockedWarpQueryIdx
     ep.io.trafficgen.blockedWarpQueryEn := trafficGenIO.blockedWarpQueryEn
+    ep.io.trafficgen.blockedWarpQueryRespStored := trafficGenIO.blockedWarpQueryRespStored
     trafficGenIO.blockedWarpQueryResp := ep.io.trafficgen.blockedWarpQueryResp
     trafficGenIO.blockedWarpQueryRespValid := ep.io.trafficgen.blockedWarpQueryRespValid
-    ep.io.trafficgen.accessReadAddr := trafficGenIO.accessReadAddr
+    trafficGenIO.blockedWarpQueryReady := ep.io.trafficgen.blockedWarpQueryReady
+    ep.io.trafficgen.accessReadCycle := trafficGenIO.accessReadCycle
     ep.io.trafficgen.accessReadEn := trafficGenIO.accessReadEn
+    ep.io.trafficgen.accessReadDataReady := trafficGenIO.accessReadDataReady
+    ep.io.trafficgen.accessReadBucketDoneReady := trafficGenIO.accessReadBucketDoneReady
     trafficGenIO.accessReadData := ep.io.trafficgen.accessReadData
     trafficGenIO.accessReadDataValid := ep.io.trafficgen.accessReadDataValid
+    trafficGenIO.accessReadBucketDone := ep.io.trafficgen.accessReadBucketDone
+    trafficGenIO.accessReadReady := ep.io.trafficgen.accessReadReady
     trafficGenIO.accessStoreCount := ep.io.trafficgen.accessStoreCount
-    ep.io.trafficgen.accessStoreConsumeCount := trafficGenIO.accessStoreConsumeCount
-    ep.io.trafficgen.accessStoreConsumeEn := trafficGenIO.accessStoreConsumeEn
+    trafficGenIO.accessStoreMaxCycle := ep.io.trafficgen.accessStoreMaxCycle
+    trafficGenIO.accessStoreHasEntries := ep.io.trafficgen.accessStoreHasEntries
     ep.io.trafficgen.reservationWindowAdvanceCycle := trafficGenIO.reservationWindowAdvanceCycle
     ep.io.trafficgen.reservationWindowAdvanceEn := trafficGenIO.reservationWindowAdvanceEn
     trafficGenIO.uploadDone := ep.io.trafficgen.uploadDone
