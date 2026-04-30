@@ -70,7 +70,7 @@ object L2Access {
 object BlockedWarpBitmap {
   val smBits = 8
   val schedulerBits = 2
-  val warpBits = 4
+  val warpBits = 9
   val indexBits = smBits + schedulerBits + warpBits
   val totalBits = 1 << indexBits
   val streamBeatBits = L2Access.streamWidthBits

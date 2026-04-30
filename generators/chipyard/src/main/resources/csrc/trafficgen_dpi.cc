@@ -38,7 +38,7 @@ constexpr const char *kDpiLogPath = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0
 constexpr const char *kDefaultRoundLogDir = "rodinia_1_bridge";
 constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0";
 constexpr std::uint32_t kBlockedWarpSchedulerBits = 2;
-constexpr std::uint32_t kBlockedWarpWarpBits = 4;
+constexpr std::uint32_t kBlockedWarpWarpBits = 9;
 constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
 
 struct WarpKey {
@@ -896,15 +896,7 @@ public:
       break;
     case State::AcknowledgeBlockedQuery:
       *blockedWarpQueryRespStored = 1;
-      if (blockedWarpQueryReady) {
-        ++mBlockedWarpQueryIdx;
-        if (mBlockedWarpQueryIdx >= mBlockedWarpQueryList.size()) {
-          logBlockedWarpQueryResult();
-          mState = State::RunRound;
-        } else {
-          mState = State::RequestBlockedQuery;
-        }
-      }
+      advanceBlockedWarpQuery();
       break;
     case State::RunRound:
       runRound();
@@ -1030,6 +1022,16 @@ private:
     }
     mBlockedWarpQueryList.assign(uniqueWarps.begin(), uniqueWarps.end());
     logBlockedWarpQueryList();
+  }
+
+  void advanceBlockedWarpQuery() {
+    ++mBlockedWarpQueryIdx;
+    if (mBlockedWarpQueryIdx >= mBlockedWarpQueryList.size()) {
+      logBlockedWarpQueryResult();
+      mState = State::RunRound;
+    } else {
+      mState = State::RequestBlockedQuery;
+    }
   }
 
   void logBlockedWarpQueryList() {

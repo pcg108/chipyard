@@ -42,7 +42,7 @@ module TrafficGenDPIBlackBox #(
   output logic        access_read_data_ready,
   output logic        access_read_bucket_done_ready,
   output logic        blocked_warp_query_en,
-  output logic [13:0] blocked_warp_query_idx,
+  output logic [18:0] blocked_warp_query_idx,
   output logic        blocked_warp_query_resp_stored,
   output logic        issued_access_writeback_valid,
   output logic [63:0] issued_access_writeback_id,
@@ -219,7 +219,7 @@ module TrafficGenDPIBlackBox #(
   end
 
   always_comb begin
-    blocked_warp_query_idx = blocked_warp_query_idx_dpi[13:0];
+    blocked_warp_query_idx = blocked_warp_query_idx_dpi[18:0];
     completed_bundle_count_write_data = completed_bundle_count_write_data_dpi[5:0];
     completed_bundle_id_write_idx = completed_bundle_id_write_idx_dpi[4:0];
   end
