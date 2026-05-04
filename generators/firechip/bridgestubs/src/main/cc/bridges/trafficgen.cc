@@ -940,6 +940,7 @@ void trafficgen_t::tick() {
       write(mmio_addrs.pause_target, 1);
 
       if (receive_main_loop_complete_from_gpu_model()) {
+        write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
         state = trafficgen_state_t::IDLE;
         break;
@@ -1111,8 +1112,9 @@ void trafficgen_t::tick() {
       gpu_model_socket_client->send_frame(serialize_message(message));
 
       if (receive_main_loop_complete_from_gpu_model()) {
-        // Resume the target CPU so the target-side trafficgen test can observe
-        // idle and finish after the final scheduling round has been reported.
+        // Resume the target CPU only after exposing global completion to the
+        // target-side trafficgen test.
+        write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
         state = trafficgen_state_t::IDLE;
       } else {

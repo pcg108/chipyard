@@ -62,9 +62,9 @@ module TrafficGenDPIBlackBox #(
   output logic [63:0] reservation_clear_cycle,
   output logic [31:0] reservation_clear_subpartition,
   output logic        completed_bundle_count_write_en,
-  output logic [5:0]  completed_bundle_count_write_data,
+  output logic [7:0]  completed_bundle_count_write_data,
   output logic        completed_bundle_id_write_en,
-  output logic [4:0]  completed_bundle_id_write_idx,
+  output logic [6:0]  completed_bundle_id_write_idx,
   output logic [63:0] completed_bundle_id_write_data,
   output logic        reservation_window_advance_en,
   output logic [63:0] reservation_window_advance_cycle
@@ -220,8 +220,8 @@ module TrafficGenDPIBlackBox #(
 
   always_comb begin
     blocked_warp_query_idx = blocked_warp_query_idx_dpi[18:0];
-    completed_bundle_count_write_data = completed_bundle_count_write_data_dpi[5:0];
-    completed_bundle_id_write_idx = completed_bundle_id_write_idx_dpi[4:0];
+    completed_bundle_count_write_data = completed_bundle_count_write_data_dpi[7:0];
+    completed_bundle_id_write_idx = completed_bundle_id_write_idx_dpi[6:0];
   end
 
 endmodule

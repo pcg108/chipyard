@@ -40,6 +40,7 @@ constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot
 constexpr std::uint32_t kBlockedWarpSchedulerBits = 2;
 constexpr std::uint32_t kBlockedWarpWarpBits = 9;
 constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
+constexpr std::size_t kMaxCompletedBundleIds = 128;
 
 struct WarpKey {
   std::uint32_t smId = 0;
@@ -923,11 +924,12 @@ public:
       if (!mCompletedCountSent) {
         *completedBundleCountWriteEn = 1;
         *completedBundleCountWriteData =
-            static_cast<std::uint32_t>(std::min<std::size_t>(mCompletedBundleQueue.size(), 32));
+            static_cast<std::uint32_t>(
+                std::min(mCompletedBundleQueue.size(), kMaxCompletedBundleIds));
         mCompletedCountSent = true;
         anyOutstanding = true;
       } else if (mPendingBundleIdIdx < mCompletedBundleQueue.size() &&
-                 mPendingBundleIdIdx < 32) {
+                 mPendingBundleIdIdx < kMaxCompletedBundleIds) {
         *completedBundleIdWriteEn = 1;
         *completedBundleIdWriteIdx = static_cast<std::uint32_t>(mPendingBundleIdIdx);
         *completedBundleIdWriteData = mCompletedBundleQueue[mPendingBundleIdIdx];

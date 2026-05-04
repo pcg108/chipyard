@@ -29,6 +29,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
      */
     val pauseTarget = RegInit(false.B)
     val targetPaused = RegInit(false.B)
+    val trafficGenDone = RegInit(false.B)
+    val trafficGenDonePulse = Wire(Bool())
+    trafficGenDonePulse := false.B
     when(pauseTarget.asBool) {
       targetPaused := ~targetPaused
     }
@@ -40,10 +43,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val startTrafficGenLatched = RegInit(false.B)
     when(target.startTrafficGen) {
       startTrafficGenLatched := true.B
+      trafficGenDone := false.B
     }
     when(pauseTarget.asBool) {
       startTrafficGenLatched := false.B
     }
+    when(trafficGenDonePulse) {
+      trafficGenDone := true.B
+    }
+    target.trafficGenDone := trafficGenDone
 
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
@@ -57,8 +65,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
      * driven by uploaded accesses (to populate) and the traffic generator (to depopulate).
      */
 
-    // assuming we have a 4096 cycle window, and up to 256 L2 subpartitions
-    val reservedSubPartitionEntries = 4096
+    // assuming we have an 8192 cycle window, and up to 256 L2 subpartitions
+    val reservedSubPartitionEntries = 8192
     val reservedSubPartitionEntryWidth = 256
 
     // Table that maps cycle to an occupancy mask. Use SyncReadMem so the larger
@@ -114,9 +122,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // trigger for bridge driver to read reservedSubPartitionsByCycle
     val readReservedSubPartitions = Wire(Bool())
 
-    // completedBundleIds will be streamed back from traffic generator to bridge driver
-    // need 4 beats to stream 32 64-bit bundle IDs (32x64 = 2048 bits = 4x512)
-    val completedBundleIdBeats = 4
+    // completedBundleIds will be streamed back from traffic generator to bridge driver.
+    // 128 64-bit bundle IDs require 16 512-bit beats.
+    val completedBundleIdBeats = 16
 
     // Send one 256-bit entry per 512-bit beat and leave the upper half zeroed so
     // the snapshot path only needs a single SyncReadMem read port.
@@ -234,8 +242,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     
     
     // vector of integers to store completed bundle IDs completed by target, to be read by bridge driver 
-    val completedBundleIds = RegInit(VecInit(Seq.fill(32)(0.U(64.W))))
-    val completedBundleCount = RegInit(0.U(6.W))
+    val completedBundleIds = RegInit(VecInit(Seq.fill(128)(0.U(64.W))))
+    val completedBundleCount = RegInit(0.U(8.W))
     val completedBundleIdsValid = RegInit(true.B)
     val completedBundleCountValid = RegInit(true.B)
 
@@ -252,7 +260,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // trigger for bridge driver to read completedBundleIds 
     val readCompletedBundleIds = Wire(Bool())
 
-    // completedBundleIdsPacked(0) contains completedBundleIds(15, 0) and completedBundleIdsPacked(1) contains completedBundleIds(31, 16)
+    // Each beat packs eight 64-bit completed bundle IDs into one 512-bit stream beat.
     val completedBundleIdsPacked = Wire(Vec(completedBundleIdBeats, UInt(L2Access.streamWidthBits.W)))
     for (beat <- 0 until completedBundleIdBeats) {
       completedBundleIdsPacked(beat) := Cat((0 until 8).reverse.map(idx => completedBundleIds(beat * 8 + idx)))
@@ -901,9 +909,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Hold the round start request high until the target DPI acknowledges it.
     val startRoundPulse = Wire(Bool())
     val startRoundPending = RegInit(false.B)
+    val currentRound = RegInit(0.U(64.W))
+    dontTouch(currentRound)
+    val startRoundPulsePrev = RegNext(startRoundPulse, false.B)
+    val startRoundRisingEdge = startRoundPulse && !startRoundPulsePrev
     startRoundPulse := false.B
-    when(startRoundPulse) {
+    when(startRoundRisingEdge) {
       startRoundPending := true.B
+      currentRound := currentRound + 1.U
     }
     when(target.roundStarted) {
       startRoundPending := false.B
@@ -912,12 +925,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // Hold round completion for the bridge driver. The DPI can assert
     // roundComplete for only one target-visible cycle, while the C++ bridge
-    // driver polls this MMIO register from the host side.
+    // driver polls this MMIO register from the host side. Clear it only after
+    // the target/DPI has actually accepted the next round; the bridge-driver
+    // start pulse can happen while the target is still paused.
     val roundCompleteLatched = RegInit(false.B)
-    when(startRoundPulse) {
+    when(target.roundStarted) {
       roundCompleteLatched := false.B
-    }
-    when(target.roundComplete) {
+    }.elsewhen(target.roundComplete) {
       roundCompleteLatched := true.B
     }
 
@@ -967,6 +981,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       startRoundPending := false.B
       startTrafficGenLatched := false.B
       roundCompleteLatched := false.B
+      trafficGenDone := false.B
+      currentRound := 0.U
     }
 
     /////////// MMIO registers for bridge driver interaction ///////////
@@ -977,12 +993,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // for bridge driver to read to determine if target is still running the previous traffic pattern
     genROReg(uploadActive || target.targetBusy || accessRetireActive || baseAdvancePending, "target_busy")
     genROReg(target.hasPendingWork, "has_pending_work")
+    Pulsify(genWORegInit(trafficGenDonePulse, "trafficgen_done", false.B), pulseLength = 1)
 
     // bridge driver toggles to pause/resume target while generating traffic patterns 
     Pulsify(genWORegInit(pauseTarget, "pause_target", false.B), pulseLength = 1)
 
     // bridge driver pulses this when a freshly uploaded scheduling round is ready to issue
     Pulsify(genWORegInit(startRoundPulse, "start_round", false.B), pulseLength = 1)
+    genROReg(currentRound(31, 0), "current_round_low")
+    genROReg(currentRound(63, 32), "current_round_high")
 
     // bridge driver triggers to read reservedSubpartitionsByCycle from stream
     Pulsify(genWORegInit(readReservedSubPartitions, "read_reserved_subpartitions", false.B), pulseLength = 1)

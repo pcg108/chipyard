@@ -18,8 +18,11 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t start_trafficgen;
   uint64_t target_busy;
   uint64_t has_pending_work;
+  uint64_t trafficgen_done;
   uint64_t pause_target;
   uint64_t start_round;
+  uint64_t current_round_low;
+  uint64_t current_round_high;
   uint64_t read_reserved_subpartitions;
   uint64_t reserved_subpartitions_base_idx;
   uint64_t reserved_subpartitions_base_cycle_low;
@@ -86,7 +89,7 @@ class trafficgen_t final : public streaming_bridge_driver_t {
 public:
   static char KIND;
   static constexpr size_t STREAM_WORD_BITS = 256;
-  static constexpr size_t STREAM_WORD_COUNT = 4096;
+  static constexpr size_t STREAM_WORD_COUNT = 8192;
   static constexpr size_t STREAM_WORDS_PER_ENTRY = STREAM_WORD_BITS / 64;
   static constexpr size_t STREAM_WORDS_PER_BEAT = STREAM_WIDTH_BYTES / sizeof(uint64_t);
   static constexpr size_t STREAM_BATCH_BEATS = STREAM_WORD_COUNT;
@@ -111,8 +114,8 @@ public:
   static constexpr size_t BLOCKED_WARP_BITMAP_BEATS = BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
   static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
   
-  static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 32;
-  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 4;
+  static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 128;
+  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 16;
 
   trafficgen_t(simif_t &simif,
                StreamEngine &stream,

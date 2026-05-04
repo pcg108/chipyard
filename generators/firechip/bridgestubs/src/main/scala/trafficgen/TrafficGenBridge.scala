@@ -48,6 +48,7 @@ object TrafficGenBridge {
     ep.io.trafficgen.completedBundleCountWriteEn := trafficGenIO.completedBundleCountWriteEn
     ep.io.trafficgen.completedBundleCountWriteData := trafficGenIO.completedBundleCountWriteData
     trafficGenIO.startRound := ep.io.trafficgen.startRound
+    trafficGenIO.trafficGenDone := ep.io.trafficgen.trafficGenDone
     trafficGenIO.minIssueCycle := ep.io.trafficgen.minIssueCycle
     trafficGenIO.blockedWarpBitmapReady := ep.io.trafficgen.blockedWarpBitmapReady
     ep.io.trafficgen.blockedWarpQueryIdx := trafficGenIO.blockedWarpQueryIdx

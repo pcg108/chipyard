@@ -54,6 +54,8 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
   val minIssueCycle = Input(UInt(64.W))
   // begin next round of issuing
   val startRound = Input(Bool())
+  // GPU model main loop has completed; this is global completion, not per-round idle
+  val trafficGenDone = Input(Bool())
 
   //// Target -> Host execution data
 
@@ -75,10 +77,10 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
 
   // write completed bundle IDs and counts to the bridge module as accesses return, to be used by future scheduling
   val completedBundleIdWriteEn = Output(Bool())
-  val completedBundleIdWriteIdx = Output(UInt(5.W))
+  val completedBundleIdWriteIdx = Output(UInt(7.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
   val completedBundleCountWriteEn = Output(Bool())
-  val completedBundleCountWriteData = Output(UInt(6.W))
+  val completedBundleCountWriteData = Output(UInt(8.W))
 
   // current cycle of TG, used for scheduling
   val currentCycleAfterIssue = Output(UInt(64.W))
@@ -185,9 +187,9 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val reservation_clear_subpartition = Output(UInt(32.W))
 
     val completed_bundle_count_write_en = Output(Bool())
-    val completed_bundle_count_write_data = Output(UInt(6.W))
+    val completed_bundle_count_write_data = Output(UInt(8.W))
     val completed_bundle_id_write_en = Output(Bool())
-    val completed_bundle_id_write_idx = Output(UInt(5.W))
+    val completed_bundle_id_write_idx = Output(UInt(7.W))
     val completed_bundle_id_write_data = Output(UInt(64.W))
 
     val reservation_window_advance_en = Output(Bool())
@@ -229,9 +231,9 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       val roundComplete = Wire(Bool())
       val patternReady = RegInit(false.B)
       val completedBundleCountWriteEn = Wire(Bool())
-      val completedBundleCountWriteData = Wire(UInt(6.W))
-      val completedBundleIdWriteEn = Wire(Vec(32, Bool())) // one-hot vector for enable signal
-      val completedBundleIdWriteData = Wire(Vec(32, UInt(64.W)))
+      val completedBundleCountWriteData = Wire(UInt(8.W))
+      val completedBundleIdWriteEn = Wire(Vec(128, Bool())) // one-hot vector for enable signal
+      val completedBundleIdWriteData = Wire(Vec(128, UInt(64.W)))
       val dpi = Module(new TrafficGenDPIBlackBox(params.numGenerators))
 
       dpi.io.clock := clock
@@ -356,6 +358,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x04 -> Seq(RegField.w(1, startTrafficGenPulse)),
         0x08 -> Seq(RegField.r(1, io.targetBusy)),
         0x0C -> Seq(RegField.r(1, io.uploadDone)),
+        0x10 -> Seq(RegField.r(1, io.trafficGenDone)),
         0x18 -> Seq(RegField.r(1, patternReady)),
         0x20 -> Seq(RegField.r(32, io.minIssueCycle(31, 0))),
         0x24 -> Seq(RegField.r(32, io.minIssueCycle(63, 32))),
@@ -454,6 +457,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.completedBundleCountWriteEn <> trafficGenTL.module.io.completedBundleCountWriteEn
       outerIO.bits.completedBundleCountWriteData <> trafficGenTL.module.io.completedBundleCountWriteData
       outerIO.bits.startRound <> trafficGenTL.module.io.startRound
+      outerIO.bits.trafficGenDone <> trafficGenTL.module.io.trafficGenDone
       outerIO.bits.minIssueCycle <> trafficGenTL.module.io.minIssueCycle
       outerIO.bits.blockedWarpBitmapReady <> trafficGenTL.module.io.blockedWarpBitmapReady
       outerIO.bits.blockedWarpQueryIdx <> trafficGenTL.module.io.blockedWarpQueryIdx
