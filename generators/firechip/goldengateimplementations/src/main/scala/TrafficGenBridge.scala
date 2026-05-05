@@ -682,8 +682,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationUpdateReqReg.setNotClear := false.B
       reservationUpdateReadPending := true.B
     }
+
+    /*
+      * Upload L2 access path:
+        * 1. if we can reuse a previously freed accessStore entry from free list, latch the bits and cycle index for this access
+        *    and issue a read to free list to get the accessStore index we can use for this access
+        * 2. if we can't reuse from free list, use nextUnusedAccessIdx as the accessStore index for this access, and increment nextUnusedAccessIdx
+        * 3. if this is the first access for this cycle bucket, write directly to cycle head and tail; 
+              otherwise, append to the existing linked list for this cycle bucket by reading the current tail from cycleTail SyncReadMem, 
+              writing the new access to accessStore, writing the next pointer of current tail to point to the new access, 
+              and updating the tail pointer to the new access
+    */
     
-    when(streamDeq.fire && !uploadStart) {
+    when(streamDeq.fire && !uploadStart) { // !uploadStart to begin on the cycle after initialization cycle so we have everything else latched
       switch(uploadPhase) {
 
         // first, stream L2 access data into backing store
@@ -693,18 +704,24 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           // are appended into the linked list for their cycle bucket.
           when(uploadReservationInWindow && canAllocateAccessIdx) {
             when(freeListHasEntry) {
-              uploadAllocateBitsReg := uploadBits
-              uploadAllocateCycleIdxReg := uploadReservationIdx
-              freeListReadIdx := freeListCount - 1.U
+              // this path is to reuse a previously freed accessStore entry from free list 
+              uploadAllocateBitsReg := uploadBits // latch the stream L2 access bits while waiting for free list read
+              uploadAllocateCycleIdxReg := uploadReservationIdx // latch the cycle bucket index for this access while waiting for free list read
+              // get the top entry from free list
+              freeListReadIdx := freeListCount - 1.U 
               freeListReadEn := true.B
+              // complete through uploadAllocatePending
               uploadAllocatePending := true.B
             }.otherwise {
+              // use a never-before used slot (free list is empty but store has capacity, so allocate next fresh index from nextUnusedAccessIdx)
+              // no free list memory read required
               val newIdx = nextUnusedAccessIdx
               accessStore.write(newIdx, uploadBits)
               nextPtr.write(newIdx, invalidAccessIdx)
               nextUnusedAccessIdx := nextUnusedAccessIdx + 1.U
 
               when(!cycleValid(uploadReservationIdx)) {
+                // if this is the first access for this cycle bucket, write directly to cycle head and tail
                 cycleHead.write(uploadReservationIdx, newIdx)
                 cycleTail.write(uploadReservationIdx, newIdx)
                 cycleValid(uploadReservationIdx) := true.B
@@ -712,6 +729,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
                 markAccessStored(uploadBits.cycleCount)
                 uploadAccessComplete := true.B
               }.otherwise {
+                // otherwise, append to the existing linked list for this cycle bucket 
                 uploadAppendCycleIdxReg := uploadReservationIdx
                 uploadAppendNewIdxReg := newIdx
                 uploadAppendCycleCountReg := uploadBits.cycleCount
@@ -748,13 +766,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
 
+    // path for reusing a previously freed accessStore entry from free list after reading the free list entry
     when(uploadAllocatePending) {
+      // get the new accessStore index from free list read
       val newIdx = freeListReadBits
+      // write the uploaded access into the access store at the allocated index
       accessStore.write(newIdx, uploadAllocateBitsReg)
+      // set next pointer for this new entry to invalid to indicate end of list
       nextPtr.write(newIdx, invalidAccessIdx)
+      // decrement free list count to indicate we have used one entry from free list
       freeListCount := freeListCount - 1.U
 
       when(!cycleValid(uploadAllocateCycleIdxReg)) {
+        // if this is the first access for this cycle bucket, write directly to cycle head and tail
         cycleHead.write(uploadAllocateCycleIdxReg, newIdx)
         cycleTail.write(uploadAllocateCycleIdxReg, newIdx)
         cycleValid(uploadAllocateCycleIdxReg) := true.B
@@ -762,6 +786,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         markAccessStored(uploadAllocateBitsReg.cycleCount)
         uploadAccessComplete := true.B
       }.otherwise {
+        // otherwise, append to the existing linked list for this cycle bucket 
         uploadAppendCycleIdxReg := uploadAllocateCycleIdxReg
         uploadAppendNewIdxReg := newIdx
         uploadAppendCycleCountReg := uploadAllocateBitsReg.cycleCount
@@ -773,6 +798,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       uploadAllocatePending := false.B
     }
 
+    // once we get the current tail index, we can update the current tail's next pointer to point to the new entry, 
+    // and then update the tail pointer for this cycle bucket to the new entry
     when(uploadAppendTailReadPending) {
       nextPtr.write(uploadAppendTailReadBits, uploadAppendNewIdxReg)
       cycleTail.write(uploadAppendCycleIdxReg, uploadAppendNewIdxReg)
@@ -782,6 +809,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       uploadAccessComplete := true.B
     }
 
+    // track the count of uploaded accesses and transition to blocked warp bitmap phase when done
     when(uploadAccessComplete) {
       uploadRecvCount := uploadRecvCount + 1.U
       when(uploadRecvCount + 1.U === uploadCount) {
@@ -793,6 +821,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.blockedWarpBitmapReady := blockedWarpUploadDone
     target.uploadDone := uploadDone
 
+    // MMIO min_issue_cycle registers and report to target 
     val minIssueCycleLow = RegInit(0.U(32.W))
     val minIssueCycleHigh = RegInit(0.U(32.W))
     val minIssueCycle = Cat(minIssueCycleHigh, minIssueCycleLow)
@@ -802,8 +831,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.accessStoreHasEntries := accessStoreHasEntries
 
     /*
-     * Stage 4: respond to traffic-generator queries for accesses and blocked
-     * warps, then retire completed cycle buckets.
+     * Respond to traffic-generator queries for accesses and blocked warps, then retire completed cycle buckets.
      */
 
     // target requests one logical cycle bucket at a time. The bridge walks the
@@ -827,6 +855,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessReadDataFire = fire && accessReadDataValidReg && target.accessReadDataReady
     val accessReadBucketDoneFire = fire && accessReadBucketDoneReg && target.accessReadBucketDoneReady
 
+    // upon receiving a read request, first check if requested cycle is in the window, and if so, get the head of the linked list for that cycle
     when(accessReadReq) {
       accessReadReadyReg := false.B
       accessReadDataValidReg := false.B
@@ -839,6 +868,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         accessReadBucketDoneReg := true.B
       }
     }
+    // get the head access entry for this cycle bucket, and indicate we have a pending read of an access entry
+    // the next pointer read is done in parallel
     when(accessReadHeadPending) {
       accessReadEntryIdx := accessReadHeadBits
       accessReadEntryEn := true.B
@@ -846,12 +877,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadHeadPending := false.B
       accessReadEntryPending := true.B
     }
+    // latch the access entry data for the head and the pointer to the next entry in the bucket linked list 
+    // and indicate valid to the target 
     when(accessReadEntryPending) {
       accessReadDataReg := accessReadData
       accessReadNextIdxReg := accessReadNextPtr
       accessReadDataValidReg := true.B
       accessReadEntryPending := false.B
     }
+    // when the target accepts the data, issue the next read for the next entry, or indicate the bucket is done 
     when(accessReadDataFire) {
       accessReadDataValidReg := false.B
       when(accessReadNextIdxReg === invalidAccessIdx) {
@@ -862,10 +896,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         accessReadEntryPending := true.B
       }
     }
+    // when the bucket is done and the target accepts the bucket-done signal, we can mark ready for the next read request
     when(accessReadBucketDoneFire) {
       accessReadBucketDoneReg := false.B
       accessReadReadyReg := true.B
     }
+    // reset signals 
     when(accessReadReset) {
       accessReadReadyReg := true.B
       accessReadHeadPending := false.B
@@ -896,12 +932,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val blockedWarpQueryReq = fire && target.blockedWarpQueryEn && blockedWarpQueryReadyReg
     val blockedWarpQueryRespReturn = RegNext(blockedWarpQueryReq, false.B)
 
+    // respond to blocked warp query by looking up the corresponding bit in the blocked warp bitmap, 
+    // but only after the upload is done and the bitmap is valid; hold the response until the target acknowledges it
     when(blockedWarpQueryReq) {
       blockedWarpQueryReadyReg := false.B
       blockedWarpQueryPending := true.B
       blockedWarpQueryRespValidReg := false.B
       blockedWarpQueryRespReg := blockedWarpUploadDone && blockedWarpBitmap(blockedWarpQueryWordIdx)(blockedWarpQueryBitIdx)
     }
+    // hold the response until the target acknowledges it, and then mark ready for the next query
     when(blockedWarpQueryRespReturn) {
       blockedWarpQueryPending := false.B
       blockedWarpQueryRespValidReg := true.B
@@ -929,9 +968,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       !accessRetireActive &&
       !reservationClearSweepActive
     ) {
+      // calculate the new base cycle and base index after advancing the window
       val nextReservationBaseCycle = reservationWindowAdvanceCycle + 1.U
       val cycleDelta = nextReservationBaseCycle - reservedSubPartitionsBaseCycle
       val clampedDelta = Mux(cycleDelta >= reservedSubPartitionEntries.U, reservedSubPartitionEntries.U, cycleDelta)
+      // compute next physical ring buffer index for reservation/access window base
       val nextBaseIdxWide = reservedSubPartitionsBaseIdx +& clampedDelta(reservedSubPartitionIdxWidth - 1, 0)
       pendingBaseIdx := Mux(
         nextBaseIdxWide >= reservedSubPartitionEntries.U,
@@ -940,6 +981,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       )(reservedSubPartitionIdxWidth - 1, 0)
       pendingBaseCycle := nextReservationBaseCycle
       baseAdvancePending := true.B
+      // track how many cycles need to be retired based on how much we are advancing the window, and start retiring from the current base index
+      // for both accesses and reservation entries
       accessRetireCycleIdx := reservedSubPartitionsBaseIdx
       accessRetireRemaining := clampedDelta(reservedSubPartitionIdxWidth, 0)
       accessRetireState := accessRetireReadHead
@@ -950,6 +993,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         accessStoreMaxCycle := 0.U
       }
     }.elsewhen(reservationClearSweepActive && !reservationUpdateReadPending) {
+      // sweep the reservation table for this cycle index to clear all reservations for the new window base cycle, 
+      // then advance the sweep index and repeat until we have cleared for all cycles that are advancing out of the window
       reservationTableWriteIdx := reservationClearSweepIdx
       reservationTableWriteBits := 0.U
       reservationTableWriteEn := true.B
@@ -957,14 +1002,20 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationClearSweepRemaining := reservationClearSweepRemaining - 1.U
     }
 
+    // retire old access buckets when reservation/access cycle window advances
+    // walk each expired cycle bucket's linked list, return accessStore entries to free list
+    // clear bucket head/tail metadata, and move to next bucket
+
     switch(accessRetireState) {
       is(accessRetireReadHead) {
         when(accessRetireRemaining =/= 0.U) {
+          // issue a read of the head of linked list for this cycle bucket to get first access index 
           when(cycleValid(accessRetireCycleIdx)) {
             accessRetireHeadReadIdx := accessRetireCycleIdx
             accessRetireHeadReadEn := true.B
             accessRetireState := accessRetireReadNext
           }.otherwise {
+            // if bucket is empty, move to clearing bucket state directly
             accessRetireState := accessRetireClearBucket
           }
         }.otherwise {
@@ -972,22 +1023,27 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         }
       }
       is(accessRetireReadNext) {
+        // capture head entry index and issue read of nextPtr(head)
         accessRetireEntryIdx := accessRetireHeadReadBits
         accessRetireNextReadIdx := accessRetireHeadReadBits
         accessRetireNextReadEn := true.B
         accessRetireState := accessRetireFreeEntry
       }
       is(accessRetireFreeEntry) {
+        // free current entry by writing index into free list and increment free list count
         when(freeListCount < key.maxL2AccessEntries.U) {
           freeList.write(freeListCount, accessRetireEntryIdx)
           freeListCount := freeListCount + 1.U
         }
+        // decrement access store count
         when(accessStoreCount =/= 0.U) {
           accessStoreCount := accessStoreCount - 1.U
         }
         when(accessRetireNextReadBits === invalidAccessIdx) {
+          // if bucket is done, move to clearing bucket state
           accessRetireState := accessRetireClearBucket
         }.otherwise {
+          // move to next entry in linked list to free, and issue read for next entry index
           accessRetireEntryIdx := accessRetireNextReadBits
           accessRetireNextReadIdx := accessRetireNextReadBits
           accessRetireNextReadEn := true.B
@@ -995,21 +1051,27 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         }
       }
       is(accessRetireClearBucket) {
+        // clear bucket metadata (cycle head/tail and valid bit)
         cycleHead.write(accessRetireCycleIdx, invalidAccessIdx)
         cycleTail.write(accessRetireCycleIdx, invalidAccessIdx)
         cycleValid(accessRetireCycleIdx) := false.B
+        // advance to next bucket and decrement remaining count, or go idle if done
         accessRetireCycleIdx := wrapCycleIdx(accessRetireCycleIdx)
         accessRetireRemaining := accessRetireRemaining - 1.U
         accessRetireState := Mux(accessRetireRemaining === 1.U, accessRetireIdle, accessRetireReadHead)
       }
     }
 
+    // once we have completed retiring accesses and clearing reservations for new base cycle, 
+    // we can update the base index and cycle to advance the window
     when(baseAdvancePending && !accessRetireActive && !reservationClearSweepActive) {
       reservedSubPartitionsBaseIdx := pendingBaseIdx
       reservedSubPartitionsBaseCycle := pendingBaseCycle
       baseAdvancePending := false.B
     }
 
+    // perform the update to the reservation table for either upload reservations or clear requests from the arbiter, 
+    // based on the reservationUpdateReqReg that we set in the when statements above
     when(reservationTableWriteEn) {
       reservedSubPartitionsByCycle.write(
         reservationTableWriteIdx,
