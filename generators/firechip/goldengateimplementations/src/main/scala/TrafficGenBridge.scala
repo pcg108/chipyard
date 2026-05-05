@@ -449,7 +449,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       * 1. accessStore[idx]: SyncReadMem that holds the L2 accesses indexed by an opaque access ID. 
       * 2. cycleHead[cycleIdx]: first accessStore index for a given cycle (i.e. head of the linked list for that cycle's bucket)
       * 3. cycleTail[cycleIdx]: last accessStore index for a given cycle (i.e. tail of the linked list for that cycle's bucket)
-      * 4. nextPtr[idx]: SyncReadMem that holds the next access in the same cycle bucket as the current idx 
+      * 4. nextPtr[idx]: SyncReadMem that holds the index of the next access in the same cycle bucket as the current idx 
       * 5. freeList: reusable accessStore indices 
     *
      * Reading:
@@ -497,6 +497,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val cycleValid = RegInit(VecInit(Seq.fill(reservedSubPartitionEntries)(false.B)))
     
 
+    // helper function to mark that we have stored an access for a given cycle, and update max cycle if needed
     def markAccessStored(cycle: UInt): Unit = {
       when(!accessStoreHasEntries || cycle > accessStoreMaxCycle) {
         accessStoreMaxCycle := cycle
@@ -504,9 +505,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreHasEntries := true.B
     }
 
+    // helper function to wrap cycle index based on the ring buffer size
     def wrapCycleIdx(idx: UInt): UInt =
       Mux(idx === (reservedSubPartitionEntries - 1).U, 0.U, idx + 1.U)
 
+    // state machine to retire completed cycle buckets and free their access store entries
+    // state machine runs when reservation/access window advances and old cycle buckets need to be cleared
     val (
       accessRetireIdle ::
       accessRetireReadHead ::
@@ -515,17 +519,26 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessRetireClearBucket ::
       Nil
     ) = Enum(5)
+
+    // current state of retire FSM
     val accessRetireState = RegInit(accessRetireIdle)
+    // physical ring buffer address being retired 
     val accessRetireCycleIdx = RegInit(0.U(reservedSubPartitionIdxWidth.W))
+    // how many cycle buckets still need to retire 
     val accessRetireRemaining = RegInit(0.U((reservedSubPartitionIdxWidth + 1).W))
+    // current access index being retired, used to read access enty and free it 
     val accessRetireEntryIdx = Reg(UInt(accessIdxWidth.W))
+    // indicate retirement is ongoing 
     val accessRetireActive = accessRetireState =/= accessRetireIdle || accessRetireRemaining =/= 0.U
+    // for current cycle bucket, find first access-store entry in bucket linked list 
     val accessRetireHeadReadIdx = WireDefault(0.U(reservedSubPartitionIdxWidth.W))
     val accessRetireHeadReadEn = WireDefault(false.B)
     val accessRetireHeadReadBits = cycleHead.read(accessRetireHeadReadIdx, accessRetireHeadReadEn)
+    // use nextPtr to walk the linked list of access-store entries for this cycle bucket, and get next entry
     val accessRetireNextReadIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessRetireNextReadEn = WireDefault(false.B)
     val accessRetireNextReadBits = nextPtr.read(accessRetireNextReadIdx, accessRetireNextReadEn)
+    // new logical base cycle and base index after advance
     val pendingBaseCycle = RegInit(0.U(64.W))
     val pendingBaseIdx = RegInit(0.U(reservedSubPartitionIdxWidth.W))
     val baseAdvancePending = RegInit(false.B)
@@ -538,31 +551,40 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // stored as a vec of beats to make it easier to stream
     val blockedWarpBitmap = RegInit(VecInit(Seq.fill(BlockedWarpBitmap.streamBeatCount)(0.U(L2Access.streamWidthBits.W))))
     
-    // state machine to receive streamed L2Access and blocked warp bitmap
+    // signal to start upload process from bridge driver, which includes both L2 accesses and blocked warp bitmap
     val uploadStart = Wire(Bool())
+    // written by bridge driver to indicate how many L2 accesses we are uploading
     val uploadCount = RegInit(0.U(32.W))
+    // count of L2 accesses uploaded so far
+    val uploadRecvCount = RegInit(0.U(32.W))
+    // indicate currently uploading L2 accesses and blocked warps
     val uploadActive = RegInit(false.B)
 
-    val uploadRecvCount = RegInit(0.U(32.W))
+    // count beats completed for blocked warp bitmap
     val blockedWarpBeatCount = RegInit(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
 
+    // upload completion and overflow signals 
     val uploadDone = RegInit(true.B)
     val blockedWarpUploadDone = RegInit(false.B)
     val uploadOverflow = RegInit(false.B)
 
+    // state machine states for upload process (IDLE, L2 accesses, Blocked warp bitmap)
     val uploadPhaseIdle :: uploadPhaseL2Accesses :: uploadPhaseBlockedWarpBitmap :: Nil = Enum(3)
     val uploadPhase = RegInit(uploadPhaseIdle)
+
+    // reset the target-side query/read response state when a fresh upload begins
     val accessReadReset = WireDefault(false.B)
 
+    // initial state for uploading
     when(uploadStart) {
-
       uploadActive := true.B
       uploadDone := uploadCount === 0.U
+      uploadRecvCount := 0.U
       uploadOverflow := false.B
 
       blockedWarpUploadDone := false.B
-      uploadRecvCount := 0.U
       blockedWarpBeatCount := 0.U
+
       accessReadReset := true.B
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
@@ -570,30 +592,53 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       blockedWarpBitmap.foreach(_ := 0.U)
     }
 
+    // unpack the incoming stream beat into L2 access information
     val uploadBits = L2Access.unpack(streamDeq.bits)
 
     // when uploading L2 accesses, also update the reserved sub-partition table based on the sub-partition of each access 
-    // compute the index and the mask (one-hot encoding) for the reservation update 
+
+    // determine if the uploaded access cycle is in our current window, and get the index for it in reservedSubPartitionsByCycle
     val (uploadReservationInWindow, uploadReservationIdx) = reservationWindowLookup(uploadBits.cycleCount)
+    // get the one-hot mask for the sub-partition of this access to update the reservation table
     val uploadReservationMask = reservationMaskForSubpartition(uploadBits.mSubpartition)
+
+    // cycle bucket index used to read cycleTail SyncReadMem
     val uploadAppendTailReadIdx = WireDefault(0.U(reservedSubPartitionIdxWidth.W))
     val uploadAppendTailReadEn = WireDefault(false.B)
+
+    // returned current tail access index for this cycle bucket 
     val uploadAppendTailReadBits = cycleTail.read(uploadAppendTailReadIdx, uploadAppendTailReadEn)
+    // track that a cycleTail read has been issued and append operation is waiting for SyncReadMem result
     val uploadAppendTailReadPending = RegInit(false.B)
+
+    // latch cycle bucket index while waiting for cycleTail read to return 
     val uploadAppendCycleIdxReg = Reg(UInt(reservedSubPartitionIdxWidth.W))
+
+    // latch newly allocated accessStore index while waiting for cycleTail read to return (new linked-list node)
     val uploadAppendNewIdxReg = Reg(UInt(accessIdxWidth.W))
+
+    // latch logical cycle count of uploaded access 
     val uploadAppendCycleCountReg = Reg(UInt(64.W))
+
+    // indicate current uploaded L2 access has completed
     val uploadAccessComplete = WireDefault(false.B)
+    // free list has space for new access
     val freeListHasEntry = freeListCount =/= 0.U
+    // whether bridge can allocate storage for this uploaded access 
     val canAllocateAccessIdx = freeListHasEntry || nextUnusedAccessIdx < key.maxL2AccessEntries.U
+
+    // free list read index and enable for allocating an accessStore entry for uploaded access
     val freeListReadIdx = WireDefault(0.U(accessIdxWidth.W))
     val freeListReadEn = WireDefault(false.B)
     val freeListReadBits = freeList.read(freeListReadIdx, freeListReadEn)
+    // track that we have issued free list read and waiting for result 
     val uploadAllocatePending = RegInit(false.B)
+    // latch the uploaded L2 access while waiting for free list read to return
     val uploadAllocateBitsReg = Reg(new L2Access)
+    // latch cycle bucket index for uploaded access while waiting for free-list read 
     val uploadAllocateCycleIdxReg = Reg(UInt(reservedSubPartitionIdxWidth.W))
 
-    // we are only ready to accept next L2 access if we are in the L2 access upload phase, and if L2 reservation updater is not busy with previous upload
+    // check if we are busy updating reservation table (doing RMW read, reservation clear sweep, retiring accesses, or advancing base index/cycle)
     val reservationUpdaterBusy = reservationUpdateReadPending || reservationClearSweepActive || accessRetireActive || baseAdvancePending
     val canAcceptUploadReservation = !reservationUpdaterBusy
     streamDeq.ready := uploadActive && Mux(
@@ -618,6 +663,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val issueClearReservation = !reservationUpdaterBusy && !issueUploadReservation && clearArbValid
     reservationClearArb.io.out.ready := issueClearReservation
 
+    //// do reservation table updates for uploads and clears (used up where we get reservationUpdateReadBits)
     // if the upload reservation is in the window, we can latch the update to the reservation table 
     when(issueUploadReservation && uploadReservationInWindow) {
       reservationUpdateReadIdx := uploadReservationIdx
@@ -627,7 +673,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationUpdateReqReg.setNotClear := true.B
       reservationUpdateReadPending := true.B
     }
-
     // if we are not doing upload reservation update and there is a clear request in the window, we latch the update to the reservation table
     when(issueClearReservation && clearArbInWindow) {
       reservationUpdateReadIdx := clearArbIdx
