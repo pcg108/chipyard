@@ -670,9 +670,15 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
 
 
 size_t trafficgen_t::process_reserved_subpartitions_stream() {
-  if (!reserved_subpartitions_metadata_latched) {
-    // Snapshot metadata must stay fixed while we accumulate a paused target snapshot.
+  /*
+    reservedSubPartitionsByCycle is stored in bridge module as a ring buffer, with 8192 rows of 256 bits
+    each row corresponds to a cycle and has a bitmap of which subpartitions are reserved for that cycle 
+    the base index and base cycle of the ring buffer are read from MMIO
+  */
 
+  // read the base index and base cycle for ring buffer from MMIO
+  if (!reserved_subpartitions_metadata_latched) {
+    
     // read base index into ring buffer
     reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
     if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
@@ -695,14 +701,14 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
   }
 
   // Try to pull between 0 to remaining bytes into reserved_subpartitions_words
-  auto *snapshot_bytes = reinterpret_cast<uint8_t *>(reserved_subpartitions_words.data());
+  auto *snapshot_bytes = reinterpret_cast<uint8_t *>(reserved_subpartitions_words.data());  // pointer to byte array of reserved_subpartitions_words
   const size_t remaining_bytes = STREAM_BATCH_BYTES - reserved_subpartition_bytes_received;
   const auto bytes_received = pull(this->stream_to_host_idx,
                                     snapshot_bytes + reserved_subpartition_bytes_received,
                                     remaining_bytes,
                                     0);
 
-  // return if we have not pulled everything, if stream is empty, or we overflowed buffer                                    
+  // return if stream was empty, we overflowed the buffer, or we haven't received the full buffer yet                                 
   if (bytes_received == 0) {
     return 0;
   }
@@ -765,6 +771,8 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
 }
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
+
+  // 64 bits per ID, so 8 IDs per 512-bit beat; for 128 IDs we need 16 beats = 8192 bits = 1024 bytes
   const size_t total_bytes = COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES;
   if (completed_bundle_bytes_received >= total_bytes) {
     return 0;
@@ -807,6 +815,12 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
 
 size_t
 trafficgen_t::process_issued_access_writeback_stream() {
+
+  /*
+    read issued access from bridge module 
+    same as sending L2 accesses, we read 1 access per beat
+  */
+
   if (issued_access_writeback_count == 0) {
     return 0;
   }
@@ -851,12 +865,21 @@ trafficgen_t::process_issued_access_writeback_stream() {
 }
 
 void trafficgen_t::push_upload_data() {
+
+  /*
+    L2 accesses: a vector of L2 access structs
+    blocked warps: bitmap with 1 bit per warp tuple (SM, scheduler, warp id), stored as an array of 64-bit integers, with each bit representing whether the corresponding warp tuple is blocked
+  */
+
+
   if (upload_phase == trafficgen_upload_phase_t::done) {
     return;
   }
 
   // first upload the L2 access pattern
   if (upload_phase == trafficgen_upload_phase_t::l2_accesses) {
+
+    // we are sending 1 l2 access per 512-bit stream beat 
     const size_t total_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
 
     // move on when all access uploaded
@@ -900,6 +923,8 @@ void trafficgen_t::push_upload_data() {
 
   // next upload the blocked warp bitmap
   if (upload_phase == trafficgen_upload_phase_t::blocked_warp_bitmap) {
+
+    // blocked warp bitmap is just a simple byte stream of the bitmap array, since each index corresponds to a specific warp 
     const size_t total_bytes = BLOCKED_WARP_BITMAP_BEATS * STREAM_WIDTH_BYTES;
 
     // complete when all accesses uploaded
@@ -960,13 +985,9 @@ void trafficgen_t::tick() {
 
     break;
   case trafficgen_state_t::READ_RESERVED_PARTITIONS:
+
+    // trigger bridge module to send reservedSubPartitionsByCycle by stream
     if (!reserved_subpartitions_read_issued) {
-      reserved_subpartition_bytes_received = 0;
-      reserved_subpartitions_metadata_latched = false;
-      reserved_subpartitions_base_idx = 0;
-      reserved_subpartitions_base_cycle = 0;
-      reserved_subpartitions_words.fill(0);
-      reserved_subpartitions_by_cycle.clear();
       write(mmio_addrs.read_reserved_subpartitions, 1);
       reserved_subpartitions_read_issued = true;
     }
@@ -1002,7 +1023,7 @@ void trafficgen_t::tick() {
     break;
   case trafficgen_state_t::UPLOAD_SCHEDULE:
 
-    // write schedule to bridge module via stream
+    // write schedule and blocked warp bitmap to bridge module via stream
     push_upload_data();
 
     if (upload_phase == trafficgen_upload_phase_t::done &&
@@ -1012,7 +1033,6 @@ void trafficgen_t::tick() {
       std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
 
       write(mmio_addrs.start_round, 1);
-      // pause_target is a pulse-driven toggle in the bridge module.
       write(mmio_addrs.pause_target, 1);
       round_completion_pause_issued = false;
       state = trafficgen_state_t::ISSUING_TRAFFIC;
@@ -1028,6 +1048,7 @@ void trafficgen_t::tick() {
       round_completion_pause_issued = true;
     }
 
+    // once target is paused after round completion
     if (round_completion_pause_issued &&
         !read(mmio_addrs.target_busy) &&
         read(mmio_addrs.round_complete)) {
@@ -1045,7 +1066,7 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::READING_TRAFFICGEN_OUTPUT:
     {
 
-      // read issued accesses with writeback info, completed bundle IDs, and other round results from the target via MMIO and stream, then send them to gpu_model via socket
+      // read issued accesses from bridge module 
       if (!issued_access_writeback_read_issued) {
         issued_access_writeback_count = static_cast<uint32_t>(read(mmio_addrs.issued_access_writeback_count));
         issued_access_writeback_stream_bytes.assign(static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES, 0);
@@ -1063,6 +1084,7 @@ void trafficgen_t::tick() {
         break;
       }
 
+      // read completed bundle IDs from bridge module
       if (!completed_bundle_read_issued) {
         completed_bundle_stream_bytes.fill(0);
         completed_bundle_bytes_received = 0;
@@ -1076,6 +1098,7 @@ void trafficgen_t::tick() {
         break;
       }
 
+      // decode issued accesses 
       TrafficGenResultMessage message;
       message.trafficGenResult.issuedAccesses.reserve(issued_access_writeback_entries.size());
       for (const auto &access : issued_access_writeback_entries) {
@@ -1092,11 +1115,14 @@ void trafficgen_t::tick() {
         message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
       }
 
+      // decode completed bundle IDs
       message.trafficGenResult.completedBundleIds.clear();
       message.trafficGenResult.completedBundleIds.reserve(completed_bundle_count);
       for (size_t i = 0; i < completed_bundle_count && i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
         message.trafficGenResult.completedBundleIds.push_back(completed_bundle_ids[i]);
       }
+
+      // read current cycle after issue from MMIO
       message.trafficGenResult.currentCycleAfterIssue =
           (static_cast<std::uint64_t>(
                read(mmio_addrs.current_cycle_after_issue_high))
