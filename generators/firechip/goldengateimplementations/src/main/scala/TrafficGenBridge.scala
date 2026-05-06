@@ -945,6 +945,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       blockedWarpQueryPending := false.B
       blockedWarpQueryRespValidReg := true.B
     }
+    // once the target stores the blocked warp query, we can clear the valid and mark ready for the next query
     when(target.blockedWarpQueryRespStored && blockedWarpQueryRespValidReg) {
       blockedWarpQueryRespValidReg := false.B
       blockedWarpQueryReadyReg := true.B
