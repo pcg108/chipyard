@@ -136,7 +136,7 @@ class TrafficGenPortIO extends Bundle {
 
 case class TrafficGenBridgeKey(maxL2AccessEntries: Int)
 
-class TrafficGenBridgeTargetIO(key: TrafficGenBridgeKey) extends Bundle {
+class TrafficGenBridgeTargetIO extends Bundle {
   val clock = Input(Clock())
   val trafficgen = Flipped(new TrafficGenPortIO)
   val reset = Input(Bool())

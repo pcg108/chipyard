@@ -17,7 +17,7 @@ class TrafficGenBridge()(implicit p: Parameters) extends BlackBox
     p(chipyard.example.TrafficGenKey).get.maxL2AccessEntries,
   )
 
-  val io = IO(new TrafficGenBridgeTargetIO(bridgeKey))
+  val io = IO(new TrafficGenBridgeTargetIO)
   val bridgeIO = HostPort(io)
   val constructorArg = Some(bridgeKey)
 

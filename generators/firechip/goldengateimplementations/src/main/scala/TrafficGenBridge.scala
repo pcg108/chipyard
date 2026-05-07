@@ -21,7 +21,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
   lazy val module = new BridgeModuleImp(this) {
     val io = IO(new WidgetIO())
-    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key)))
+    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO))
     val target = hPort.hBits.trafficgen
 
     /*
