@@ -93,7 +93,7 @@ class ReservationClearRequest extends Bundle {
   val subpartition = UInt(32.W)
 }
 
-class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
+class TrafficGenPortIO extends Bundle {
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -101,8 +101,8 @@ class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val roundComplete = Output(Bool())
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
-  val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
+  val reservationClear = Decoupled(new ReservationClearRequest)
+  val issuedAccessWriteback = Decoupled(new L2Access)
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(7.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
@@ -134,10 +134,10 @@ class TrafficGenPortIO(val nGenerators: Int) extends Bundle {
   val uploadDone = Input(Bool())
 }
 
-case class TrafficGenBridgeKey(maxL2AccessEntries: Int, nGenerators: Int)
+case class TrafficGenBridgeKey(maxL2AccessEntries: Int)
 
 class TrafficGenBridgeTargetIO(key: TrafficGenBridgeKey) extends Bundle {
   val clock = Input(Clock())
-  val trafficgen = Flipped(new TrafficGenPortIO(key.nGenerators))
+  val trafficgen = Flipped(new TrafficGenPortIO)
   val reset = Input(Bool())
 }

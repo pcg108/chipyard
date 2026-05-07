@@ -173,26 +173,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val reservationClearSweepActive = reservationClearSweepRemaining =/= 0.U
 
 
-    // target drives reservation clear requests, which are enqueued and arbitrated before being applied to the reservation table
-    val clearQueueDepth = 4
-    // we have 1 queue per traffic generator to hold incoming reservation clear requests 
-    val reservationClearQueues = Seq.fill(key.nGenerators) {
-      Module(new Queue(new ReservationLookup, clearQueueDepth))
-    }
-    // drive the handshake ports of reservation clear queues with clear requests from target 
-    for ((queue, lane) <- reservationClearQueues.zipWithIndex) {
-      queue.io.enq.valid := target.reservationClear(lane).valid && fire
-      queue.io.enq.bits.cycle := target.reservationClear(lane).bits.cycle
-      queue.io.enq.bits.subpartition := target.reservationClear(lane).bits.subpartition
-      target.reservationClear(lane).ready := queue.io.enq.ready && fire
-    }
-
-    // we pick one clear request in this cycle to apply to reservation table 
-    val reservationClearArb = Module(new RRArbiter(new ReservationLookup, key.nGenerators))
-    for ((queue, lane) <- reservationClearQueues.zipWithIndex) {
-      reservationClearArb.io.in(lane) <> queue.io.deq
-    }
-
     /*
       * target issued accesses are buffered into issuedAccssWritebackStore for logging in the GPU model
     */
@@ -202,25 +182,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val issuedAccessWritebackCount = RegInit(0.U(32.W))
     val issuedAccessWritebackIdx = RegInit(0.U(32.W))
 
-    // as we did for reservation clears, we enqueue issued access writebacks in per-lane queues and arbitrate before writing into the SyncReadMem
-    val issuedAccessWritebackQueueDepth = 4
-    val issuedAccessWritebackQueues = Seq.fill(key.nGenerators) {
-      Module(new Queue(new L2Access, issuedAccessWritebackQueueDepth))
-    }
-    for ((queue, lane) <- issuedAccessWritebackQueues.zipWithIndex) {
-      queue.io.enq.valid := target.issuedAccessWriteback(lane).valid && fire
-      queue.io.enq.bits := target.issuedAccessWriteback(lane).bits
-      target.issuedAccessWriteback(lane).ready := queue.io.enq.ready && fire
-    }
-    val issuedAccessWritebackArb = Module(new RRArbiter(new L2Access, key.nGenerators))
-    for ((queue, lane) <- issuedAccessWritebackQueues.zipWithIndex) {
-      issuedAccessWritebackArb.io.in(lane) <> queue.io.deq
-    }
-    val doIssuedAccessWriteback = issuedAccessWritebackArb.io.out.valid &&
+    val doIssuedAccessWriteback = target.issuedAccessWriteback.valid && fire &&
       issuedAccessWritebackIdx < key.maxL2AccessEntries.U
-    issuedAccessWritebackArb.io.out.ready := doIssuedAccessWriteback
+    target.issuedAccessWriteback.ready := doIssuedAccessWriteback
     when(doIssuedAccessWriteback) {
-      issuedAccessWritebackStore.write(issuedAccessWritebackIdx, issuedAccessWritebackArb.io.out.bits)
+      issuedAccessWritebackStore.write(issuedAccessWritebackIdx, target.issuedAccessWriteback.bits)
       issuedAccessWritebackIdx := issuedAccessWritebackIdx + 1.U
       issuedAccessWritebackCount := issuedAccessWritebackCount + 1.U
     }
@@ -647,21 +613,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       true.B,
     )
 
-    // get the reservation clear arbiter output to update the reservation table 
-    val clearArbValid = reservationClearArb.io.out.valid
-    val clearArbInWindow = Wire(Bool())
-    val clearArbIdx = Wire(UInt(reservedSubPartitionIdxWidth.W))
-    val clearArbMask = Wire(UInt(reservedSubPartitionEntryWidth.W))
-    val (clearWindowOk, clearReservationIdx) = reservationWindowLookup(reservationClearArb.io.out.bits.cycle)
-    clearArbInWindow := clearWindowOk
-    clearArbIdx := clearReservationIdx
-    clearArbMask := reservationMaskForSubpartition(reservationClearArb.io.out.bits.subpartition)
+    // get the scalar reservation clear stream to update the reservation table
+    val clearStreamValid = target.reservationClear.valid && fire
+    val clearStreamInWindow = Wire(Bool())
+    val clearStreamIdx = Wire(UInt(reservedSubPartitionIdxWidth.W))
+    val clearStreamMask = Wire(UInt(reservedSubPartitionEntryWidth.W))
+    val (clearWindowOk, clearReservationIdx) = reservationWindowLookup(target.reservationClear.bits.cycle)
+    clearStreamInWindow := clearWindowOk
+    clearStreamIdx := clearReservationIdx
+    clearStreamMask := reservationMaskForSubpartition(target.reservationClear.bits.subpartition)
 
     // if we are updating reservation for upload, it is a set, otherwise it is a clear 
     val issueUploadReservation = streamDeq.fire && uploadPhase === uploadPhaseL2Accesses &&
       uploadReservationInWindow && canAllocateAccessIdx
-    val issueClearReservation = !reservationUpdaterBusy && !issueUploadReservation && clearArbValid
-    reservationClearArb.io.out.ready := issueClearReservation
+    val issueClearReservation = !reservationUpdaterBusy && !issueUploadReservation && clearStreamValid
+    target.reservationClear.ready := issueClearReservation
 
     //// do reservation table updates for uploads and clears (used up where we get reservationUpdateReadBits)
     // if the upload reservation is in the window, we can latch the update to the reservation table 
@@ -674,11 +640,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationUpdateReadPending := true.B
     }
     // if we are not doing upload reservation update and there is a clear request in the window, we latch the update to the reservation table
-    when(issueClearReservation && clearArbInWindow) {
-      reservationUpdateReadIdx := clearArbIdx
+    when(issueClearReservation && clearStreamInWindow) {
+      reservationUpdateReadIdx := clearStreamIdx
       reservationUpdateReadEn := true.B
-      reservationUpdateReqReg.idx := clearArbIdx
-      reservationUpdateReqReg.mask := clearArbMask
+      reservationUpdateReqReg.idx := clearStreamIdx
+      reservationUpdateReqReg.mask := clearStreamMask
       reservationUpdateReqReg.setNotClear := false.B
       reservationUpdateReadPending := true.B
     }
@@ -1071,7 +1037,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       baseAdvancePending := false.B
     }
 
-    // perform the update to the reservation table for either upload reservations or clear requests from the arbiter, 
+    // perform the update to the reservation table for either upload reservations or clear requests, 
     // based on the reservationUpdateReqReg that we set in the when statements above
     when(reservationTableWriteEn) {
       reservedSubPartitionsByCycle.write(

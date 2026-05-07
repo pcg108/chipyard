@@ -60,9 +60,9 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
   //// Target -> Host execution data
 
   // TG issue logic will enqueue clear requests here to remove the issued subpartition from reservedSubPartitionsByCycle without stalling on bridge RMW latency.
-  val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
+  val reservationClear = Decoupled(new ReservationClearRequest)
   // TG issue logic will enqueue the actual issued L2 accesses here with cycleCount updated to the real issue cycle.
-  val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
+  val issuedAccessWriteback = Decoupled(new L2Access)
 
   // query the L2 access store for an L2 access
   val accessReadCycle = Output(UInt(64.W))
@@ -271,9 +271,40 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       dpi.io.blocked_warp_query_resp := io.blockedWarpQueryResp
       dpi.io.blocked_warp_query_ready := io.blockedWarpQueryReady
 
-      // backpressure from hw queues into DPI
-      dpi.io.issued_access_writeback_ready := io.issuedAccessWriteback(0).ready
-      dpi.io.reservation_clear_ready := io.reservationClear(0).ready
+      val reservationClearLanes = Wire(Vec(params.numGenerators, Decoupled(new ReservationClearRequest)))
+      val issuedAccessWritebackLanes = Wire(Vec(params.numGenerators, Decoupled(new L2Access)))
+
+      val reservationClearQueues = Seq.fill(params.numGenerators) {
+        Module(new Queue(new ReservationClearRequest, 4))
+      }
+      val issuedAccessWritebackQueues = Seq.fill(params.numGenerators) {
+        Module(new Queue(new L2Access, 4))
+      }
+      val reservationClearArb = Module(new RRArbiter(new ReservationClearRequest, params.numGenerators))
+      val issuedAccessWritebackArb = Module(new RRArbiter(new L2Access, params.numGenerators))
+
+      for (i <- 0 until params.numGenerators) {
+        reservationClearQueues(i).io.enq.valid := reservationClearLanes(i).valid
+        reservationClearQueues(i).io.enq.bits := reservationClearLanes(i).bits
+        reservationClearLanes(i).ready := reservationClearQueues(i).io.enq.ready
+        reservationClearArb.io.in(i) <> reservationClearQueues(i).io.deq
+
+        issuedAccessWritebackQueues(i).io.enq.valid := issuedAccessWritebackLanes(i).valid
+        issuedAccessWritebackQueues(i).io.enq.bits := issuedAccessWritebackLanes(i).bits
+        issuedAccessWritebackLanes(i).ready := issuedAccessWritebackQueues(i).io.enq.ready
+        issuedAccessWritebackArb.io.in(i) <> issuedAccessWritebackQueues(i).io.deq
+      }
+
+      io.reservationClear.valid := reservationClearArb.io.out.valid
+      io.reservationClear.bits := reservationClearArb.io.out.bits
+      reservationClearArb.io.out.ready := io.reservationClear.ready
+      io.issuedAccessWriteback.valid := issuedAccessWritebackArb.io.out.valid
+      io.issuedAccessWriteback.bits := issuedAccessWritebackArb.io.out.bits
+      issuedAccessWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
+
+      // backpressure from local lane queues into DPI
+      dpi.io.issued_access_writeback_ready := issuedAccessWritebackLanes(0).ready
+      dpi.io.reservation_clear_ready := reservationClearLanes(0).ready
 
       io.currentCycleAfterIssue := currentCycleAfterIssue
       io.roundStarted := roundStarted
@@ -330,23 +361,23 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       for (i <- 0 until params.numGenerators) {
         io.issue(i).valid := false.B
         io.issue(i).bits := 0.U.asTypeOf(new L2Access)
-        io.reservationClear(i).valid := (if (i == 0) dpi.io.reservation_clear_valid else false.B)
-        io.reservationClear(i).bits.cycle := dpi.io.reservation_clear_cycle
-        io.reservationClear(i).bits.subpartition := dpi.io.reservation_clear_subpartition
-        io.issuedAccessWriteback(i).valid := (if (i == 0) dpi.io.issued_access_writeback_valid else false.B)
-        io.issuedAccessWriteback(i).bits.id := dpi.io.issued_access_writeback_id
-        io.issuedAccessWriteback(i).bits.address := dpi.io.issued_access_writeback_address
-        io.issuedAccessWriteback(i).bits.cycleCount := dpi.io.issued_access_writeback_cycle_count
-        io.issuedAccessWriteback(i).bits.mSubpartition := dpi.io.issued_access_writeback_subpartition
-        io.issuedAccessWriteback(i).bits.mSetIndex := dpi.io.issued_access_writeback_set_index
-        io.issuedAccessWriteback(i).bits.mTag := dpi.io.issued_access_writeback_tag
-        io.issuedAccessWriteback(i).bits.mMask := dpi.io.issued_access_writeback_mask
-        io.issuedAccessWriteback(i).bits.smId := dpi.io.issued_access_writeback_sm_id
-        io.issuedAccessWriteback(i).bits.schedulerId := dpi.io.issued_access_writeback_scheduler_id
-        io.issuedAccessWriteback(i).bits.warpId := dpi.io.issued_access_writeback_warp_id
-        io.issuedAccessWriteback(i).bits.mBundleId := dpi.io.issued_access_writeback_bundle_id
-        io.issuedAccessWriteback(i).bits.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
-        io.issuedAccessWriteback(i).bits.mIsWrite := dpi.io.issued_access_writeback_is_write
+        reservationClearLanes(i).valid := (if (i == 0) dpi.io.reservation_clear_valid else false.B)
+        reservationClearLanes(i).bits.cycle := dpi.io.reservation_clear_cycle
+        reservationClearLanes(i).bits.subpartition := dpi.io.reservation_clear_subpartition
+        issuedAccessWritebackLanes(i).valid := (if (i == 0) dpi.io.issued_access_writeback_valid else false.B)
+        issuedAccessWritebackLanes(i).bits.id := dpi.io.issued_access_writeback_id
+        issuedAccessWritebackLanes(i).bits.address := dpi.io.issued_access_writeback_address
+        issuedAccessWritebackLanes(i).bits.cycleCount := dpi.io.issued_access_writeback_cycle_count
+        issuedAccessWritebackLanes(i).bits.mSubpartition := dpi.io.issued_access_writeback_subpartition
+        issuedAccessWritebackLanes(i).bits.mSetIndex := dpi.io.issued_access_writeback_set_index
+        issuedAccessWritebackLanes(i).bits.mTag := dpi.io.issued_access_writeback_tag
+        issuedAccessWritebackLanes(i).bits.mMask := dpi.io.issued_access_writeback_mask
+        issuedAccessWritebackLanes(i).bits.smId := dpi.io.issued_access_writeback_sm_id
+        issuedAccessWritebackLanes(i).bits.schedulerId := dpi.io.issued_access_writeback_scheduler_id
+        issuedAccessWritebackLanes(i).bits.warpId := dpi.io.issued_access_writeback_warp_id
+        issuedAccessWritebackLanes(i).bits.mBundleId := dpi.io.issued_access_writeback_bundle_id
+        issuedAccessWritebackLanes(i).bits.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
+        issuedAccessWritebackLanes(i).bits.mIsWrite := dpi.io.issued_access_writeback_is_write
       }
 
       when(io.uploadDone && io.blockedWarpBitmapReady) {
@@ -438,7 +469,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
     }
 
     InModuleBody {
-      val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO(params.numGenerators))).suggestName("trafficgen")
+      val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO)).suggestName("trafficgen")
       dontTouch(outerIO)
 
       outerIO.clock := trafficGenTL.module.clock

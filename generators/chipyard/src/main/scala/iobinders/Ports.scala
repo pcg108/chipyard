@@ -121,7 +121,7 @@ case class OffchipSelPort  (val getIO: () => UInt)
 case class CTCPort (val getIO: () => Data, val portId: Int) 
     extends Port[Data]
 
-class TrafficGenPortPeripheralIO(val nGenerators: Int) extends Bundle {
+class TrafficGenPortPeripheralIO extends Bundle {
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -129,8 +129,8 @@ class TrafficGenPortPeripheralIO(val nGenerators: Int) extends Bundle {
   val roundComplete = Output(Bool())
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val reservationClear = Vec(nGenerators, Decoupled(new ReservationClearRequest))
-  val issuedAccessWriteback = Vec(nGenerators, Decoupled(new L2Access))
+  val reservationClear = Decoupled(new ReservationClearRequest)
+  val issuedAccessWriteback = Decoupled(new L2Access)
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(7.W))
   val completedBundleIdWriteData = Output(UInt(64.W))

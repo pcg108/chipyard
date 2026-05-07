@@ -15,7 +15,6 @@ class TrafficGenBridge()(implicit p: Parameters) extends BlackBox
   val moduleName = "firechip.goldengateimplementations.TrafficGenBridgeModule"
   private val bridgeKey = TrafficGenBridgeKey(
     p(chipyard.example.TrafficGenKey).get.maxL2AccessEntries,
-    p(chipyard.example.TrafficGenKey).get.numGenerators,
   )
 
   val io = IO(new TrafficGenBridgeTargetIO(bridgeKey))
