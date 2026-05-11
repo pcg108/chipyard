@@ -24,7 +24,7 @@ case class TrafficGenParams(
   width: Int = 32,
   base: BigInt = 0x88000000L,
   size: BigInt = 500000000L,
-  numGenerators: Int = 4,
+  numGenerators: Int = 1,
   regionStride: BigInt = 0x400000L,
   maxL2AccessEntries: Int = 262144, // 2^18
   backend: TrafficGenBackend = TrafficGenDPIBackend
@@ -111,6 +111,7 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int) extends Bundle {
 
   val memActive = Input(Bool())
   val issue = Vec(nGenerators, Decoupled(new L2Access))
+  val completion = Vec(nGenerators, Flipped(Decoupled(new L2Access)))
 }
 
 trait HasTrafficGenTopIO {
@@ -332,6 +333,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   for (i <- 0 until params.numGenerators) {
     io.issue(i).valid := false.B
     io.issue(i).bits := 0.U.asTypeOf(new L2Access)
+    io.completion(i).ready := true.B
     reservationClearLanes(i).valid := (if (i == 0) dpi.io.reservation_clear_valid else false.B)
     reservationClearLanes(i).bits.cycle := dpi.io.reservation_clear_cycle
     reservationClearLanes(i).bits.subpartition := dpi.io.reservation_clear_subpartition
@@ -357,30 +359,110 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   val io = IO(new TrafficGenTopIO(params.width, params.numGenerators))
 
-  val sIdle :: sRead :: sIssue :: sComplete :: Nil = Enum(4)
+  val sIdle :: sRead :: sIssue :: sCompletion :: Nil = Enum(4)
+  val cDequeue :: cRequestBlockedWarp :: cWaitBlockedWarp :: Nil = Enum(3)
   val state = RegInit(sIdle)
-  val currentCycle = RegInit(0.U(64.W))
-  val pendingAccess = Reg(new L2Access)
-  val laneIdxWidth = math.max(1, log2Ceil(params.numGenerators))
-  val laneIdx = RegInit(0.U(laneIdxWidth.W))
+  val completionState = RegInit(cDequeue)
+  val modelCycle = RegInit(0.U(64.W))
+  val bucketDoneSeen = RegInit(false.B)
+  val readReqPending = RegInit(false.B)
+  val pendingIssue = Reg(new L2Access)
+  val pendingIssueValid = RegInit(false.B)
+  val roundStopPending = RegInit(false.B)
+  val inflightAccessCount = RegInit(0.U(32.W))
+  val completedBundleCount = RegInit(0.U(8.W))
+
+  val bundleTableDepth = 128
+  val bundleIdxWidth = log2Ceil(bundleTableDepth)
+  val bundleTableValid = RegInit(VecInit(Seq.fill(bundleTableDepth)(false.B)))
+  val bundleTableId = Reg(Vec(bundleTableDepth, UInt(64.W)))
+  val bundleTableCount = RegInit(VecInit(Seq.fill(bundleTableDepth)(0.U(32.W))))
+  val bundleTableWakeRelevant = RegInit(VecInit(Seq.fill(bundleTableDepth)(false.B)))
+  val bundleTableSmId = Reg(Vec(bundleTableDepth, UInt(32.W)))
+  val bundleTableSchedulerId = Reg(Vec(bundleTableDepth, UInt(8.W)))
+  val bundleTableWarpId = Reg(Vec(bundleTableDepth, UInt(32.W)))
+  val completionQuerySmId = Reg(UInt(32.W))
+  val completionQuerySchedulerId = Reg(UInt(8.W))
+  val completionQueryWarpId = Reg(UInt(32.W))
+
+  val issuedAccessWritebackQueue = Module(new Queue(new L2Access, 4))
+  val reservationClearQueue = Module(new Queue(new ReservationClearRequest, 4))
+  val completionArb = Module(new RRArbiter(new L2Access, params.numGenerators))
+  val completionQueue = Module(new Queue(new L2Access, 8))
+
+  for (i <- 0 until params.numGenerators) {
+    completionArb.io.in(i) <> io.completion(i)
+  }
+  completionQueue.io.enq <> completionArb.io.out
+
+  val issuedAccess = Wire(new L2Access)
+  issuedAccess := pendingIssue
+  issuedAccess.cycleCount := modelCycle
+
+  val reservationClear = Wire(new ReservationClearRequest)
+  reservationClear.cycle := pendingIssue.cycleCount
+  reservationClear.subpartition := pendingIssue.mSubpartition
+
+  val issueReadyVec = VecInit((0 until params.numGenerators).map(i => io.issue(i).ready))
+  val issueLaneReady = issueReadyVec.asUInt.orR
+  val issueLaneOH = PriorityEncoderOH(issueReadyVec.asUInt)
+  val issueCanFire = state === sIssue &&
+    pendingIssueValid &&
+    issueLaneReady &&
+    issuedAccessWritebackQueue.io.enq.ready &&
+    reservationClearQueue.io.enq.ready
+
+  val issueBundleMatchVec = VecInit((0 until bundleTableDepth).map { i =>
+    bundleTableValid(i) && bundleTableId(i) === pendingIssue.mBundleId
+  })
+  val issueBundleFreeVec = VecInit((0 until bundleTableDepth).map { i =>
+    !bundleTableValid(i)
+  })
+  val issueBundleMatch = issueBundleMatchVec.asUInt.orR
+  val issueBundleHasFree = issueBundleFreeVec.asUInt.orR
+  val issueBundleMatchIdx = PriorityEncoder(issueBundleMatchVec)
+  val issueBundleFreeIdx = PriorityEncoder(issueBundleFreeVec)
+
+  val completionBundleMatchVec = VecInit((0 until bundleTableDepth).map { i =>
+    bundleTableValid(i) && bundleTableId(i) === completionQueue.io.deq.bits.mBundleId
+  })
+  val completionBundleMatch = completionBundleMatchVec.asUInt.orR
+  val completionBundleIdx = PriorityEncoder(completionBundleMatchVec)
+
+  val sideEffectQueuesEmpty =
+    !issuedAccessWritebackQueue.io.deq.valid && !reservationClearQueue.io.deq.valid
+  val bucketDrained = bucketDoneSeen && !pendingIssueValid && sideEffectQueuesEmpty
+  val accessStoreEndReached = !io.accessStoreHasEntries || modelCycle >= io.accessStoreMaxCycle
+  val stopCondition = roundStopPending || modelCycle >= io.minIssueCycle || accessStoreEndReached
+  val roundCompletePulse = WireDefault(false.B)
 
   io.startTrafficGen := false.B
-  io.targetBusy := state =/= sIdle
-  io.hasPendingWork := state =/= sIdle || io.memActive
+  io.targetBusy := (state =/= sIdle) && !roundCompletePulse
+  io.hasPendingWork := state =/= sIdle ||
+    inflightAccessCount =/= 0.U ||
+    io.memActive ||
+    io.accessStoreHasEntries
   io.roundStarted := false.B
-  io.roundComplete := false.B
-  io.dpiState := state
-  io.currentCycleAfterIssue := currentCycle
+  io.roundComplete := roundCompletePulse
+  io.dpiState := state.asUInt
+  io.currentCycleAfterIssue := modelCycle
 
-  io.reservationClear.valid := false.B
-  io.reservationClear.bits := 0.U.asTypeOf(new ReservationClearRequest)
-  io.issuedAccessWriteback.valid := false.B
-  io.issuedAccessWriteback.bits := pendingAccess
+  io.reservationClear.valid := reservationClearQueue.io.deq.valid
+  io.reservationClear.bits := reservationClearQueue.io.deq.bits
+  reservationClearQueue.io.deq.ready := io.reservationClear.ready
+  io.issuedAccessWriteback.valid := issuedAccessWritebackQueue.io.deq.valid
+  io.issuedAccessWriteback.bits := issuedAccessWritebackQueue.io.deq.bits
+  issuedAccessWritebackQueue.io.deq.ready := io.issuedAccessWriteback.ready
+  issuedAccessWritebackQueue.io.enq.valid := false.B
+  issuedAccessWritebackQueue.io.enq.bits := issuedAccess
+  reservationClearQueue.io.enq.valid := false.B
+  reservationClearQueue.io.enq.bits := reservationClear
+  completionQueue.io.deq.ready := false.B
 
-  io.accessReadCycle := currentCycle
-  io.accessReadEn := state === sRead
-  io.accessReadDataReady := state === sRead
-  io.accessReadBucketDoneReady := state === sRead
+  io.accessReadCycle := modelCycle
+  io.accessReadEn := false.B
+  io.accessReadDataReady := false.B
+  io.accessReadBucketDoneReady := false.B
 
   io.blockedWarpQueryIdx := 0.U
   io.blockedWarpQueryEn := false.B
@@ -392,66 +474,173 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.completedBundleCountWriteEn := false.B
   io.completedBundleCountWriteData := 0.U
 
-  io.reservationWindowAdvanceCycle := currentCycle
+  io.reservationWindowAdvanceCycle := 0.U
   io.reservationWindowAdvanceEn := false.B
 
   for (i <- 0 until params.numGenerators) {
-    io.issue(i).valid := false.B
-    io.issue(i).bits := pendingAccess
+    io.issue(i).valid := issueCanFire && issueLaneOH(i)
+    io.issue(i).bits := issuedAccess
   }
-
-  val selectedIssueReady = Mux1H((0 until params.numGenerators).map { i =>
-    (laneIdx === i.U) -> io.issue(i).ready
-  })
-  val issueAccepted =
-    selectedIssueReady &&
-    io.issuedAccessWriteback.ready &&
-    io.reservationClear.ready
 
   switch(state) {
     is(sIdle) {
-      when(io.startRound && io.uploadDone && io.blockedWarpBitmapReady) {
-        state := sRead
-        currentCycle := 0.U
-        laneIdx := 0.U
+      when(io.startRound && io.uploadDone && io.blockedWarpBitmapReady && io.accessReadReady) {
+        bucketDoneSeen := false.B
+        readReqPending := false.B
+        pendingIssueValid := false.B
+        roundStopPending := false.B
+        completedBundleCount := 0.U
+        completionState := cDequeue
+        io.accessReadEn := true.B
         io.roundStarted := true.B
-      }
-    }
-    is(sRead) {
-      when(!io.accessStoreHasEntries || currentCycle > io.accessStoreMaxCycle || currentCycle >= io.minIssueCycle) {
-        state := sComplete
-      }.elsewhen(io.accessReadDataValid) {
-        pendingAccess := io.accessReadData
-        state := sIssue
-      }.elsewhen(io.accessReadBucketDone) {
-        currentCycle := currentCycle + 1.U
-      }
-    }
-    is(sIssue) {
-      for (i <- 0 until params.numGenerators) {
-        io.issue(i).valid := laneIdx === i.U
-      }
-      io.issuedAccessWriteback.valid := true.B
-      io.issuedAccessWriteback.bits := pendingAccess
-      io.reservationClear.valid := true.B
-      io.reservationClear.bits.cycle := pendingAccess.cycleCount
-      io.reservationClear.bits.subpartition := pendingAccess.mSubpartition
-
-      when(issueAccepted) {
-        when(laneIdx === (params.numGenerators - 1).U) {
-          laneIdx := 0.U
-        }.otherwise {
-          laneIdx := laneIdx + 1.U
-        }
-        currentCycle := Mux(pendingAccess.cycleCount > currentCycle, pendingAccess.cycleCount, currentCycle)
         state := sRead
       }
     }
-    is(sComplete) {
-      io.roundComplete := true.B
-      io.reservationWindowAdvanceEn := true.B
-      when(!io.memActive) {
-        state := sIdle
+
+    is(sRead) {
+      when(readReqPending) {
+        when(io.accessReadReady) {
+          io.accessReadEn := true.B
+          readReqPending := false.B
+        }
+      }.elsewhen(!bucketDoneSeen) {
+        when(io.accessReadDataValid) {
+          io.accessReadDataReady := true.B
+          pendingIssue := io.accessReadData
+          pendingIssueValid := true.B
+          state := sIssue
+        }.elsewhen(io.accessReadBucketDone) {
+          io.accessReadBucketDoneReady := true.B
+          bucketDoneSeen := true.B
+          io.reservationWindowAdvanceCycle := modelCycle
+          io.reservationWindowAdvanceEn := true.B
+        }
+      }.elsewhen(bucketDrained) {
+        when(completionQueue.io.deq.valid) {
+          completionState := cDequeue
+          state := sCompletion
+        }.elsewhen(stopCondition) {
+          io.completedBundleCountWriteEn := true.B
+          io.completedBundleCountWriteData := completedBundleCount
+          roundCompletePulse := true.B
+          state := sIdle
+        }.otherwise {
+          modelCycle := modelCycle + 1.U
+          bucketDoneSeen := false.B
+          readReqPending := true.B
+        }
+      }
+    }
+
+    is(sIssue) {
+      issuedAccessWritebackQueue.io.enq.valid := issueCanFire
+      reservationClearQueue.io.enq.valid := issueCanFire
+
+      when(issueCanFire) {
+        val bundleIdx = Mux(issueBundleMatch, issueBundleMatchIdx, issueBundleFreeIdx)
+
+        when(issueBundleMatch) {
+          assert(bundleTableWakeRelevant(bundleIdx) === pendingIssue.mWakeRelevantBundle,
+            "TrafficGenRTLEngine saw inconsistent wake-relevant metadata for a bundle")
+          assert(bundleTableSmId(bundleIdx) === pendingIssue.smId &&
+            bundleTableSchedulerId(bundleIdx) === pendingIssue.schedulerId &&
+            bundleTableWarpId(bundleIdx) === pendingIssue.warpId,
+            "TrafficGenRTLEngine saw inconsistent warp metadata for a bundle")
+          bundleTableCount(bundleIdx) := bundleTableCount(bundleIdx) + 1.U
+        }.otherwise {
+          assert(issueBundleHasFree, "TrafficGenRTLEngine bundle table capacity exceeded")
+          when(issueBundleHasFree) {
+            bundleTableValid(bundleIdx) := true.B
+            bundleTableId(bundleIdx) := pendingIssue.mBundleId
+            bundleTableCount(bundleIdx) := 1.U
+            bundleTableWakeRelevant(bundleIdx) := pendingIssue.mWakeRelevantBundle
+            bundleTableSmId(bundleIdx) := pendingIssue.smId
+            bundleTableSchedulerId(bundleIdx) := pendingIssue.schedulerId
+            bundleTableWarpId(bundleIdx) := pendingIssue.warpId
+          }
+        }
+
+        inflightAccessCount := inflightAccessCount + 1.U
+        pendingIssueValid := false.B
+        state := sRead
+      }
+    }
+
+    is(sCompletion) {
+      switch(completionState) {
+        is(cDequeue) {
+          completionQueue.io.deq.ready := true.B
+
+          when(completionQueue.io.deq.fire) {
+            assert(completionBundleMatch, "TrafficGenRTLEngine completed an unknown bundle")
+            assert(inflightAccessCount =/= 0.U, "TrafficGenRTLEngine completed with no inflight accesses")
+
+            when(completionBundleMatch) {
+              val bundleCompleted = bundleTableCount(completionBundleIdx) === 1.U
+
+              when(inflightAccessCount =/= 0.U) {
+                inflightAccessCount := inflightAccessCount - 1.U
+              }
+
+              when(bundleCompleted) {
+                assert(completedBundleCount < bundleTableDepth.U,
+                  "TrafficGenRTLEngine completed bundle queue capacity exceeded")
+                when(completedBundleCount < bundleTableDepth.U) {
+                  io.completedBundleIdWriteEn := true.B
+                  io.completedBundleIdWriteIdx := completedBundleCount(6, 0)
+                  io.completedBundleIdWriteData := completionQueue.io.deq.bits.mBundleId
+                  completedBundleCount := completedBundleCount + 1.U
+                }
+
+                completionQuerySmId := bundleTableSmId(completionBundleIdx)
+                completionQuerySchedulerId := bundleTableSchedulerId(completionBundleIdx)
+                completionQueryWarpId := bundleTableWarpId(completionBundleIdx)
+                bundleTableValid(completionBundleIdx) := false.B
+                bundleTableCount(completionBundleIdx) := 0.U
+
+                when(bundleTableWakeRelevant(completionBundleIdx)) {
+                  completionState := cRequestBlockedWarp
+                }.otherwise {
+                  completionState := cDequeue
+                  state := sRead
+                }
+              }.otherwise {
+                bundleTableCount(completionBundleIdx) := bundleTableCount(completionBundleIdx) - 1.U
+                completionState := cDequeue
+                state := sRead
+              }
+            }.otherwise {
+              completionState := cDequeue
+              state := sRead
+            }
+          }
+        }
+
+        is(cRequestBlockedWarp) {
+          io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
+            completionQuerySmId,
+            completionQuerySchedulerId,
+            completionQueryWarpId)
+          when(io.blockedWarpQueryReady) {
+            io.blockedWarpQueryEn := true.B
+            completionState := cWaitBlockedWarp
+          }
+        }
+
+        is(cWaitBlockedWarp) {
+          io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
+            completionQuerySmId,
+            completionQuerySchedulerId,
+            completionQueryWarpId)
+          when(io.blockedWarpQueryRespValid) {
+            io.blockedWarpQueryRespStored := true.B
+            when(io.blockedWarpQueryResp) {
+              roundStopPending := true.B
+            }
+            completionState := cDequeue
+            state := sRead
+          }
+        }
       }
     }
   }
@@ -504,6 +693,11 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       engine.io.blockedWarpQueryRespValid := io.blockedWarpQueryRespValid
       engine.io.blockedWarpQueryReady := io.blockedWarpQueryReady
       engine.io.memActive := io.memActive
+      for (i <- 0 until params.numGenerators) {
+        engine.io.completion(i).valid := io.completion(i).valid
+        engine.io.completion(i).bits := io.completion(i).bits
+        io.completion(i).ready := engine.io.completion(i).ready
+      }
 
       io.targetBusy := engine.io.targetBusy
       io.hasPendingWork := engine.io.hasPendingWork
@@ -567,7 +761,6 @@ class TrafficGenMem(id: Int, beatBytes: Int)(implicit p: Parameters)
     clients = Seq(TLClientParameters(
       name = s"trafficgenmem$id",
       sourceId = IdRange(0, 4),
-      supportsProbe = TransferSizes(64, 64),
       supportsGet = TransferSizes(64, 64),
       supportsPutFull = TransferSizes(64, 64)
     ))
@@ -587,6 +780,7 @@ class TrafficGenMem(id: Int, beatBytes: Int)(implicit p: Parameters)
       val active = Output(Bool())
       val coreOffset = Input(UInt(32.W))
       val req = Flipped(Decoupled(new L2Access))
+      val completion = Decoupled(new L2Access)
     })
 
     withClockAndReset(clock, reset) {
@@ -595,27 +789,43 @@ class TrafficGenMem(id: Int, beatBytes: Int)(implicit p: Parameters)
 
       val sIdle :: sWaitD :: Nil = Enum(2)
       val state = RegInit(sIdle)
-      val addr = Cat((io.req.bits.address + io.coreOffset)(63, 6), 0.U(6.W))
+      val issueQueue = Module(new Queue(new L2Access, 4))
+      val completionQueue = Module(new Queue(new L2Access, 4))
+      val outstandingAccess = Reg(new L2Access)
+      val issueAccess = issueQueue.io.deq.bits
+      val addr = Cat((issueAccess.address + io.coreOffset)(63, 6), 0.U(6.W))
       val size = log2Ceil(64).U
-      val (_, get) = edge.Get(0.U, addr, size)
-      val (_, put) = edge.Put(0.U, addr, size, 0.U((beatBytes * 8).W))
 
-      mem.a.valid := state === sIdle && io.req.valid
-      mem.a.bits := Mux(io.req.bits.mIsWrite, put, get)
-      mem.b.ready := true.B
+      issueQueue.io.enq <> io.req
+
+      /*
+        Currently serial implementation- should make a parallel implementation that can have multiple outstanding accesses per node
+      */
+
+      mem.a.valid := state === sIdle && issueQueue.io.deq.valid
+      mem.a.bits := Mux(issueAccess.mIsWrite,
+                        edge.Put(0.U, addr, size, 0.U((beatBytes * 8).W))._2,
+                        edge.Get(0.U, addr, size)._2)
+      val dLast = edge.last(mem.d.bits, mem.d.fire)
+
+      mem.b.ready := false.B
       mem.c.valid := false.B
       mem.c.bits := DontCare
-      mem.d.ready := true.B
+      mem.d.ready := state === sWaitD && (!dLast || completionQueue.io.enq.ready)
       mem.e.valid := false.B
       mem.e.bits := DontCare
 
-      io.req.ready := state === sIdle && mem.a.ready
-      io.active := state =/= sIdle
+      issueQueue.io.deq.ready := state === sIdle && mem.a.ready
+      completionQueue.io.enq.valid := state === sWaitD && mem.d.valid && dLast
+      completionQueue.io.enq.bits := outstandingAccess
+      io.completion <> completionQueue.io.deq
+      io.active := state =/= sIdle || issueQueue.io.deq.valid || completionQueue.io.deq.valid
 
-      when(io.req.fire) {
+      when(issueQueue.io.deq.fire) {
+        outstandingAccess := issueAccess
         state := sWaitD
       }
-      when(mem.d.fire) {
+      when(mem.d.fire && dLast) {
         state := sIdle
       }
     }
@@ -689,6 +899,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       generators.zipWithIndex.foreach { case (generator, i) =>
         generator.module.io.coreOffset := (BigInt(i) * params.regionStride).U
         generator.module.io.req <> trafficGenTL.module.io.issue(i)
+        trafficGenTL.module.io.completion(i) <> generator.module.io.completion
       }
 
       outerIO
