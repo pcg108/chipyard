@@ -88,6 +88,16 @@ object BlockedWarpBitmap {
     )
 }
 
+object CompletedBundleIds {
+  val capacity = 4096
+  val idsPerBeat = 8
+  val beats = capacity / idsPerBeat
+  val idxWidth = log2Ceil(capacity)
+  val countWidth = log2Ceil(capacity + 1)
+
+  require(capacity % idsPerBeat == 0, "Completed bundle ID capacity must be stream-beat aligned")
+}
+
 class ReservationClearRequest extends Bundle {
   val cycle = UInt(64.W)
   val subpartition = UInt(32.W)
@@ -104,10 +114,10 @@ class TrafficGenPortIO extends Bundle {
   val reservationClear = Decoupled(new ReservationClearRequest)
   val issuedAccessWriteback = Decoupled(new L2Access)
   val completedBundleIdWriteEn = Output(Bool())
-  val completedBundleIdWriteIdx = Output(UInt(7.W))
+  val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
   val completedBundleCountWriteEn = Output(Bool())
-  val completedBundleCountWriteData = Output(UInt(8.W))
+  val completedBundleCountWriteData = Output(UInt(CompletedBundleIds.countWidth.W))
   val startRound = Input(Bool())
   val trafficGenDone = Input(Bool())
   val minIssueCycle = Input(UInt(64.W))

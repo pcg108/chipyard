@@ -772,7 +772,7 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
 
-  // 64 bits per ID, so 8 IDs per 512-bit beat; for 128 IDs we need 16 beats = 8192 bits = 1024 bytes
+  // 64 bits per ID, so 8 IDs per 512-bit beat.
   const size_t total_bytes = COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES;
   if (completed_bundle_bytes_received >= total_bytes) {
     return 0;
@@ -802,6 +802,11 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
               sizeof(completed_bundle_ids));
   completed_bundle_count =
       static_cast<uint32_t>(read(mmio_addrs.completed_bundle_count));
+  if (completed_bundle_count > COMPLETED_BUNDLE_ID_COUNT) {
+    std::cout << "[bridge driver] completedBundleIds count exceeds capacity: count="
+              << completed_bundle_count
+              << " capacity=" << COMPLETED_BUNDLE_ID_COUNT << std::endl;
+  }
 
   std::cout << "[bridge driver] completedBundleIds count="
             << completed_bundle_count << std::endl;
@@ -1117,8 +1122,11 @@ void trafficgen_t::tick() {
 
       // decode completed bundle IDs
       message.trafficGenResult.completedBundleIds.clear();
-      message.trafficGenResult.completedBundleIds.reserve(completed_bundle_count);
-      for (size_t i = 0; i < completed_bundle_count && i < COMPLETED_BUNDLE_ID_COUNT; ++i) {
+      const size_t completed_bundle_ids_to_send =
+          std::min(static_cast<size_t>(completed_bundle_count),
+                   COMPLETED_BUNDLE_ID_COUNT);
+      message.trafficGenResult.completedBundleIds.reserve(completed_bundle_ids_to_send);
+      for (size_t i = 0; i < completed_bundle_ids_to_send; ++i) {
         message.trafficGenResult.completedBundleIds.push_back(completed_bundle_ids[i]);
       }
 

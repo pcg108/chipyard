@@ -114,8 +114,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val readReservedSubPartitions = Wire(Bool())
 
     // completedBundleIds will be streamed back from traffic generator to bridge driver.
-    // 128 64-bit bundle IDs require 16 512-bit beats.
-    val completedBundleIdBeats = 16
+    // Each 512-bit beat carries eight 64-bit bundle IDs.
+    val completedBundleIdBeats = CompletedBundleIds.beats
+    val completedBundleBeatIdxWidth = log2Ceil(completedBundleIdBeats)
 
     // Send one 256-bit entry per 512-bit beat and leave the upper half zeroed so
     // the snapshot path only needs a single SyncReadMem read port.
@@ -209,10 +210,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       * completed bundle IDs are written by the target during/after traffic generator, and used for scheduling next batch of accesses
     */
     
-    // vector of integers to store completed bundle IDs completed by target, to be read by bridge driver 
-    val completedBundleIds = RegInit(VecInit(Seq.fill(128)(0.U(64.W)))) // assuming up to 128 completed bundle IDs
+    // Store completed bundle IDs completed by target, to be streamed back to the bridge driver.
+    val completedBundleIds = SyncReadMem(completedBundleIdBeats, Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
     val completedBundleIdsValid = RegInit(true.B)
-    val completedBundleCount = RegInit(0.U(8.W))
+    val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
     val completedBundleCountValid = RegInit(true.B)
 
     when(target.completedBundleCountWriteEn) {
@@ -220,18 +221,31 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       completedBundleCountValid := true.B
     }
     when(target.completedBundleIdWriteEn) {
-      completedBundleIds(target.completedBundleIdWriteIdx) := target.completedBundleIdWriteData
+      val beatIdx = target.completedBundleIdWriteIdx >> log2Ceil(CompletedBundleIds.idsPerBeat)
+      val laneIdx = target.completedBundleIdWriteIdx(log2Ceil(CompletedBundleIds.idsPerBeat) - 1, 0)
+      val writeData = Wire(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
+      writeData.foreach(_ := target.completedBundleIdWriteData)
+      completedBundleIds.write(
+        beatIdx(completedBundleBeatIdxWidth - 1, 0),
+        writeData,
+        UIntToOH(laneIdx, CompletedBundleIds.idsPerBeat).asBools,
+      )
       completedBundleIdsValid := true.B
     }
 
     // trigger for bridge driver to read completedBundleIds 
     val readCompletedBundleIds = Wire(Bool())
 
-    // Each beat packs eight 64-bit completed bundle IDs into one 512-bit stream beat.
-    val completedBundleIdsPacked = Wire(Vec(completedBundleIdBeats, UInt(L2Access.streamWidthBits.W)))
-    for (beat <- 0 until completedBundleIdBeats) {
-      completedBundleIdsPacked(beat) := Cat((0 until 8).reverse.map(idx => completedBundleIds(beat * 8 + idx)))
-    }
+    val completedBundleStreamReadIdx = WireDefault(0.U(completedBundleBeatIdxWidth.W))
+    val completedBundleStreamReadEn = WireDefault(false.B)
+    val completedBundleStreamEntryBits = completedBundleIds.read(
+      completedBundleStreamReadIdx,
+      completedBundleStreamReadEn,
+    )
+    val completedBundleStreamEntryReg = Reg(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
+    val completedBundleStreamReadPending = RegInit(false.B)
+    val completedBundleStreamDataValid = RegInit(false.B)
+    val completedBundleStreamBits = Cat(completedBundleStreamEntryReg.reverse)
 
     /*
      * Following is the stream interface for the bridge module to send data back to bridge driver. This includes:
@@ -250,13 +264,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     ) = Enum(4)
     val streamSource = RegInit(streamSourceIdle)
 
-    // set the stream payload valid based on the current stream source 
-    // note that completed bundle IDs are always valid because they are registers 
+    // set the stream payload valid based on the current stream source
     val streamPayloadValid = MuxLookup(
       streamSource,
       reservedStreamDataValid,
       Seq(
-        streamSourceCompletedBundleIds -> true.B,
+        streamSourceCompletedBundleIds -> completedBundleStreamDataValid,
         streamSourceIssuedAccessWriteback -> issuedAccessStreamDataValid,
       ),
     )
@@ -266,7 +279,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       streamSource,
       reservedStreamBits,
       Seq(
-        streamSourceCompletedBundleIds -> completedBundleIdsPacked(streamBeatIdx),
+        streamSourceCompletedBundleIds -> completedBundleStreamBits,
         streamSourceIssuedAccessWriteback -> L2Access.pack(issuedAccessStreamEntryReg),
       ),
     )
@@ -305,6 +318,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       issuedAccessStreamEntryReg := issuedAccessStreamEntryBits
       issuedAccessStreamReadPending := false.B
       issuedAccessStreamDataValid := true.B
+    }
+    when(completedBundleStreamReadPending) {
+      completedBundleStreamEntryReg := completedBundleStreamEntryBits
+      completedBundleStreamReadPending := false.B
+      completedBundleStreamDataValid := true.B
     }
 
     // write the updated entry back to the reservedSubPartitionsByCycle table when we get a response from the SyncReadMem for a reservation update read, 
@@ -348,6 +366,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       // set initial conditions for when we start streaming completed bundle IDs
       streamSource := streamSourceCompletedBundleIds
       streamBeatIdx := 0.U
+      completedBundleStreamReadIdx := 0.U
+      completedBundleStreamReadEn := true.B
+      completedBundleStreamReadPending := true.B
+      completedBundleStreamDataValid := false.B
     }.elsewhen(readIssuedAccessWriteback && issuedAccessWritebackCount =/= 0.U && !streamActive) {
       // set initial conditions for when we start streaming issued access writebacks
       streamSource := streamSourceIssuedAccessWriteback
@@ -364,9 +386,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           // reset on last beat 
           streamSource := streamSourceIdle
           streamBeatIdx := 0.U
+          completedBundleStreamDataValid := false.B
         }.otherwise {
-          // for bundle IDs, only need to increment index since data is in registers and always valid
-          streamBeatIdx := streamBeatIdx + 1.U
+          val nextBeatIdx = streamBeatIdx + 1.U
+          streamBeatIdx := nextBeatIdx
+          completedBundleStreamReadIdx := nextBeatIdx(completedBundleBeatIdxWidth - 1, 0)
+          completedBundleStreamReadEn := true.B
+          completedBundleStreamReadPending := true.B
+          completedBundleStreamDataValid := false.B
         }
       }.elsewhen(streamSource === streamSourceIssuedAccessWriteback) {
         when(streamLastBeat) {
@@ -1092,6 +1119,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservationClearSweepRemaining := reservedSubPartitionEntries.U
       issuedAccessStreamReadPending := false.B
       issuedAccessStreamDataValid := false.B
+      completedBundleStreamReadPending := false.B
+      completedBundleStreamDataValid := false.B
       reservationUpdateReadPending := false.B
       accessReadReadyReg := true.B
       accessReadHeadPending := false.B
@@ -1114,7 +1143,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreCount := 0.U
       accessStoreMaxCycle := 0.U
       accessStoreHasEntries := false.B
-      completedBundleIds.foreach(_ := 0.U)
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
       completedBundleCountValid := true.B

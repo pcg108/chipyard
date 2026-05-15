@@ -114,8 +114,11 @@ public:
   static constexpr size_t BLOCKED_WARP_BITMAP_BEATS = BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
   static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
   
-  static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 128;
-  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS = 16;
+  static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 4096;
+  static constexpr size_t COMPLETED_BUNDLE_ID_BEATS =
+      COMPLETED_BUNDLE_ID_COUNT / STREAM_WORDS_PER_BEAT;
+  static_assert(COMPLETED_BUNDLE_ID_COUNT % STREAM_WORDS_PER_BEAT == 0,
+                "Completed bundle ID count must be stream-beat aligned");
 
   trafficgen_t(simif_t &simif,
                StreamEngine &stream,

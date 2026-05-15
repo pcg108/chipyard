@@ -40,7 +40,7 @@ constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot
 constexpr std::uint32_t kBlockedWarpSchedulerBits = 2;
 constexpr std::uint32_t kBlockedWarpWarpBits = 9;
 constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
-constexpr std::size_t kMaxCompletedBundleIds = 128;
+constexpr std::size_t kMaxCompletedBundleIds = 4096;
 
 struct WarpKey {
   std::uint32_t smId = 0;
