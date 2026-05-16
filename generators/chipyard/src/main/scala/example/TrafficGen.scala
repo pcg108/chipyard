@@ -434,7 +434,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val completionArb = Module(new RRArbiter(new L2Access, params.numGenerators))
 
   // completion queue definition, with a flag to indicate when the queue may backpressure and cause deadlock
-  val completionQueueDepth = 8
+  val completionQueueDepth = math.max(2, params.numGenerators * params.memOutstanding)
   val completionQueue = Module(new Queue(new L2Access, completionQueueDepth))
   val completionQueueHighWatermark = (completionQueueDepth - 2).U
   val completionQueueNeedsService =
@@ -1204,8 +1204,8 @@ class WithTrafficGen extends Config((site, here, up) => {
 
 class WithRTLTrafficGen extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams(
-    numGenerators = 1,
-    memOutstanding = 16,
+    numGenerators = 4,
+    memOutstanding = 4,
     backend = TrafficGenRTLBackend,
     remapTraceAddresses = true,
     remapBase = 0x100000000L,

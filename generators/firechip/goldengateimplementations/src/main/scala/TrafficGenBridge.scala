@@ -480,6 +480,20 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val cycleHead = SyncReadMem(reservedSubPartitionEntries, UInt(accessIdxWidth.W))
     val cycleTail = SyncReadMem(reservedSubPartitionEntries, UInt(accessIdxWidth.W))
 
+    val accessStoreWriteEn = WireDefault(false.B)
+    val accessStoreWriteAddr = WireDefault(0.U(accessIdxWidth.W))
+    val accessStoreWriteData = Wire(new L2Access)
+    accessStoreWriteData := 0.U.asTypeOf(new L2Access)
+    val nextPtrWriteEn = WireDefault(false.B)
+    val nextPtrWriteAddr = WireDefault(0.U(accessIdxWidth.W))
+    val nextPtrWriteData = WireDefault(0.U(accessIdxWidth.W))
+    val cycleHeadWriteEn = WireDefault(false.B)
+    val cycleHeadWriteAddr = WireDefault(0.U(reservedSubPartitionIdxWidth.W))
+    val cycleHeadWriteData = WireDefault(0.U(accessIdxWidth.W))
+    val cycleTailWriteEn = WireDefault(false.B)
+    val cycleTailWriteAddr = WireDefault(0.U(reservedSubPartitionIdxWidth.W))
+    val cycleTailWriteData = WireDefault(0.U(accessIdxWidth.W))
+
     // free list of access indices to reuse after clearing 
     val freeList = SyncReadMem(key.maxL2AccessEntries, UInt(accessIdxWidth.W))
     val freeListCount = RegInit(0.U(accessIdxWidth.W))
@@ -709,14 +723,22 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
               // use a never-before used slot (free list is empty but store has capacity, so allocate next fresh index from nextUnusedAccessIdx)
               // no free list memory read required
               val newIdx = nextUnusedAccessIdx
-              accessStore.write(newIdx, uploadBits)
-              nextPtr.write(newIdx, invalidAccessIdx)
+              accessStoreWriteEn := true.B
+              accessStoreWriteAddr := newIdx
+              accessStoreWriteData := uploadBits
+              nextPtrWriteEn := true.B
+              nextPtrWriteAddr := newIdx
+              nextPtrWriteData := invalidAccessIdx
               nextUnusedAccessIdx := nextUnusedAccessIdx + 1.U
 
               when(!cycleValid(uploadReservationIdx)) {
                 // if this is the first access for this cycle bucket, write directly to cycle head and tail
-                cycleHead.write(uploadReservationIdx, newIdx)
-                cycleTail.write(uploadReservationIdx, newIdx)
+                cycleHeadWriteEn := true.B
+                cycleHeadWriteAddr := uploadReservationIdx
+                cycleHeadWriteData := newIdx
+                cycleTailWriteEn := true.B
+                cycleTailWriteAddr := uploadReservationIdx
+                cycleTailWriteData := newIdx
                 cycleValid(uploadReservationIdx) := true.B
                 accessStoreCount := accessStoreCount + 1.U
                 markAccessStored(uploadBits.cycleCount)
@@ -764,16 +786,24 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       // get the new accessStore index from free list read
       val newIdx = freeListReadBits
       // write the uploaded access into the access store at the allocated index
-      accessStore.write(newIdx, uploadAllocateBitsReg)
+      accessStoreWriteEn := true.B
+      accessStoreWriteAddr := newIdx
+      accessStoreWriteData := uploadAllocateBitsReg
       // set next pointer for this new entry to invalid to indicate end of list
-      nextPtr.write(newIdx, invalidAccessIdx)
+      nextPtrWriteEn := true.B
+      nextPtrWriteAddr := newIdx
+      nextPtrWriteData := invalidAccessIdx
       // decrement free list count to indicate we have used one entry from free list
       freeListCount := freeListCount - 1.U
 
       when(!cycleValid(uploadAllocateCycleIdxReg)) {
         // if this is the first access for this cycle bucket, write directly to cycle head and tail
-        cycleHead.write(uploadAllocateCycleIdxReg, newIdx)
-        cycleTail.write(uploadAllocateCycleIdxReg, newIdx)
+        cycleHeadWriteEn := true.B
+        cycleHeadWriteAddr := uploadAllocateCycleIdxReg
+        cycleHeadWriteData := newIdx
+        cycleTailWriteEn := true.B
+        cycleTailWriteAddr := uploadAllocateCycleIdxReg
+        cycleTailWriteData := newIdx
         cycleValid(uploadAllocateCycleIdxReg) := true.B
         accessStoreCount := accessStoreCount + 1.U
         markAccessStored(uploadAllocateBitsReg.cycleCount)
@@ -794,8 +824,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // once we get the current tail index, we can update the current tail's next pointer to point to the new entry, 
     // and then update the tail pointer for this cycle bucket to the new entry
     when(uploadAppendTailReadPending) {
-      nextPtr.write(uploadAppendTailReadBits, uploadAppendNewIdxReg)
-      cycleTail.write(uploadAppendCycleIdxReg, uploadAppendNewIdxReg)
+      nextPtrWriteEn := true.B
+      nextPtrWriteAddr := uploadAppendTailReadBits
+      nextPtrWriteData := uploadAppendNewIdxReg
+      cycleTailWriteEn := true.B
+      cycleTailWriteAddr := uploadAppendCycleIdxReg
+      cycleTailWriteData := uploadAppendNewIdxReg
       accessStoreCount := accessStoreCount + 1.U
       markAccessStored(uploadAppendCycleCountReg)
       uploadAppendTailReadPending := false.B
@@ -1046,14 +1080,31 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
       is(accessRetireClearBucket) {
         // clear bucket metadata (cycle head/tail and valid bit)
-        cycleHead.write(accessRetireCycleIdx, invalidAccessIdx)
-        cycleTail.write(accessRetireCycleIdx, invalidAccessIdx)
+        cycleHeadWriteEn := true.B
+        cycleHeadWriteAddr := accessRetireCycleIdx
+        cycleHeadWriteData := invalidAccessIdx
+        cycleTailWriteEn := true.B
+        cycleTailWriteAddr := accessRetireCycleIdx
+        cycleTailWriteData := invalidAccessIdx
         cycleValid(accessRetireCycleIdx) := false.B
         // advance to next bucket and decrement remaining count, or go idle if done
         accessRetireCycleIdx := wrapCycleIdx(accessRetireCycleIdx)
         accessRetireRemaining := accessRetireRemaining - 1.U
         accessRetireState := Mux(accessRetireRemaining === 1.U, accessRetireIdle, accessRetireReadHead)
       }
+    }
+
+    when(accessStoreWriteEn) {
+      accessStore.write(accessStoreWriteAddr, accessStoreWriteData)
+    }
+    when(nextPtrWriteEn) {
+      nextPtr.write(nextPtrWriteAddr, nextPtrWriteData)
+    }
+    when(cycleHeadWriteEn) {
+      cycleHead.write(cycleHeadWriteAddr, cycleHeadWriteData)
+    }
+    when(cycleTailWriteEn) {
+      cycleTail.write(cycleTailWriteAddr, cycleTailWriteData)
     }
 
     // once we have completed retiring accesses and clearing reservations for new base cycle, 
