@@ -359,10 +359,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   dontTouch(io.memInflightAccesses)
 
   // overall state machine for traffic generator round
-  val sIdle :: sRead :: sIssue :: sCompletion :: Nil = Enum(4)
+  val sIdle :: sRead :: sIssue :: Nil = Enum(3)
   val state = RegInit(sIdle)
 
-  // state machine inside completion state to check if the completed access unblocks a warp 
+  // peer state machine that retires returned memory completions while the main issue FSM keeps running
   val cDequeue :: cRequestBlockedWarp :: cWaitBlockedWarp :: Nil = Enum(3)
   val completionState = RegInit(cDequeue)
   
@@ -433,12 +433,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   // queue and arbiter to serialize completions from multiple issue nodes
   val completionArb = Module(new RRArbiter(new L2Access, params.numGenerators))
 
-  // completion queue definition, with a flag to indicate when the queue may backpressure and cause deadlock
+  // completion queue definition
   val completionQueueDepth = math.max(2, params.numGenerators * params.memOutstanding)
   val completionQueue = Module(new Queue(new L2Access, completionQueueDepth))
-  val completionQueueHighWatermark = (completionQueueDepth - 2).U
-  val completionQueueNeedsService =
-    completionQueue.io.deq.valid && completionQueue.io.count >= completionQueueHighWatermark
 
   // arbitrate and enqueue completions from issue nodes
   for (i <- 0 until params.numGenerators) {
@@ -460,11 +457,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issueReadyVec = VecInit((0 until params.numGenerators).map(i => io.issue(i).ready))
   val issueLaneReady = issueReadyVec.asUInt.orR
   val issueLaneOH = PriorityEncoderOH(issueReadyVec.asUInt)
-  val issueCanFire = state === sIssue &&
-    pendingIssueValid &&
-    issueLaneReady &&
-    issuedAccessWritebackQueue.io.enq.ready &&
-    reservationClearQueue.io.enq.ready
 
   // for each table entry, check if entry is valid and matches pending issue bundle ID
   val issueBundleMatchVec = VecInit((0 until bundleTableDepth).map { i =>
@@ -478,6 +470,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issueBundleHasFree = issueBundleFreeVec.asUInt.orR // reduce - at least one free entry
   val issueBundleMatchIdx = PriorityEncoder(issueBundleMatchVec) // index of first matching entry
   val issueBundleFreeIdx = PriorityEncoder(issueBundleFreeVec) // index of first free entry
+  val issueBundleIdx = Mux(issueBundleMatch, issueBundleMatchIdx, issueBundleFreeIdx)
+  val issueBundleCanTrack = issueBundleMatch || issueBundleHasFree
   
   // for each table entry, check if entry is valid and matches completion bundle ID
   val completionBundleMatchVec = VecInit((0 until bundleTableDepth).map { i =>
@@ -485,6 +479,27 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   })
   val completionBundleMatch = completionBundleMatchVec.asUInt.orR // reduce - at least one matching entry
   val completionBundleIdx = PriorityEncoder(completionBundleMatchVec) // index of first matching entry
+  val completionRetireActive = state =/= sIdle
+  val completionWillRetire =
+    completionRetireActive && completionState === cDequeue && completionQueue.io.deq.valid
+  val completionBundleCompleted =
+    completionBundleMatch && bundleTableCount(completionBundleIdx) === 1.U
+  val issueCompletionBundleHazard =
+    completionWillRetire && pendingIssueValid &&
+      completionQueue.io.deq.bits.mBundleId === pendingIssue.mBundleId
+  val issueSideEffectsReady =
+    issueLaneReady &&
+      issuedAccessWritebackQueue.io.enq.ready &&
+      reservationClearQueue.io.enq.ready
+  val issueCanFire = state === sIssue &&
+    pendingIssueValid &&
+    issueSideEffectsReady &&
+    issueBundleCanTrack &&
+    !issueCompletionBundleHazard
+  val completionPathDrained =
+    completionState === cDequeue &&
+      !completionQueue.io.deq.valid &&
+      !completionQueue.io.enq.valid
 
   // issued access queue and reservation clear queues need to be empty for round to complete
   val sideEffectQueuesEmpty =
@@ -574,6 +589,68 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     io.issue(i).bits := issuedAccess
   }
 
+  val completionRetireFire = completionQueue.io.deq.fire
+  val completionCountRetire = completionRetireFire && completionBundleMatch
+
+  val bundleTableValidNext = Wire(Vec(bundleTableDepth, Bool()))
+  val bundleTableIdNext = Wire(Vec(bundleTableDepth, UInt(64.W)))
+  val bundleTableCountNext = Wire(Vec(bundleTableDepth, UInt(32.W)))
+  val bundleTableWakeRelevantNext = Wire(Vec(bundleTableDepth, Bool()))
+  val bundleTableSmIdNext = Wire(Vec(bundleTableDepth, UInt(32.W)))
+  val bundleTableSchedulerIdNext = Wire(Vec(bundleTableDepth, UInt(8.W)))
+  val bundleTableWarpIdNext = Wire(Vec(bundleTableDepth, UInt(32.W)))
+
+  for (i <- 0 until bundleTableDepth) {
+    bundleTableValidNext(i) := bundleTableValid(i)
+    bundleTableIdNext(i) := bundleTableId(i)
+    bundleTableCountNext(i) := bundleTableCount(i)
+    bundleTableWakeRelevantNext(i) := bundleTableWakeRelevant(i)
+    bundleTableSmIdNext(i) := bundleTableSmId(i)
+    bundleTableSchedulerIdNext(i) := bundleTableSchedulerId(i)
+    bundleTableWarpIdNext(i) := bundleTableWarpId(i)
+  }
+
+  when(completionRetireFire && completionBundleMatch) {
+    when(completionBundleCompleted) {
+      bundleTableValidNext(completionBundleIdx) := false.B
+      bundleTableCountNext(completionBundleIdx) := 0.U
+    }.otherwise {
+      bundleTableCountNext(completionBundleIdx) := bundleTableCount(completionBundleIdx) - 1.U
+    }
+  }
+
+  when(issueCanFire) {
+    when(issueBundleMatch) {
+      bundleTableCountNext(issueBundleIdx) := bundleTableCount(issueBundleIdx) + 1.U
+    }.otherwise {
+      bundleTableValidNext(issueBundleIdx) := true.B
+      bundleTableIdNext(issueBundleIdx) := pendingIssue.mBundleId
+      bundleTableCountNext(issueBundleIdx) := 1.U
+      bundleTableWakeRelevantNext(issueBundleIdx) := pendingIssue.mWakeRelevantBundle
+      bundleTableSmIdNext(issueBundleIdx) := pendingIssue.smId
+      bundleTableSchedulerIdNext(issueBundleIdx) := pendingIssue.schedulerId
+      bundleTableWarpIdNext(issueBundleIdx) := pendingIssue.warpId
+    }
+  }
+
+  for (i <- 0 until bundleTableDepth) {
+    bundleTableValid(i) := bundleTableValidNext(i)
+    bundleTableId(i) := bundleTableIdNext(i)
+    bundleTableCount(i) := bundleTableCountNext(i)
+    bundleTableWakeRelevant(i) := bundleTableWakeRelevantNext(i)
+    bundleTableSmId(i) := bundleTableSmIdNext(i)
+    bundleTableSchedulerId(i) := bundleTableSchedulerIdNext(i)
+    bundleTableWarpId(i) := bundleTableWarpIdNext(i)
+  }
+
+  val inflightAccessCountNext = WireDefault(inflightAccessCount)
+  when(issueCanFire && !completionCountRetire) {
+    inflightAccessCountNext := inflightAccessCount + 1.U
+  }.elsewhen(!issueCanFire && completionCountRetire && inflightAccessCount =/= 0.U) {
+    inflightAccessCountNext := inflightAccessCount - 1.U
+  }
+  inflightAccessCount := inflightAccessCountNext
+
   // clear "already consumed" flags when the read response is no longer valid, to allow new responses to be consumed
   when(!io.accessReadDataValid) {
     accessReadDataConsumed := false.B
@@ -606,6 +683,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   assert(accessReadResponseQueue.io.enq.ready || !enqueueNewAccessReadData,
     "TrafficGenRTLEngine access read response queue overflow")
+  assert(!(state === sIssue && pendingIssueValid && issueSideEffectsReady &&
+    !issueCompletionBundleHazard && !issueBundleCanTrack && completionPathDrained),
+    "TrafficGenRTLEngine bundle table capacity exceeded")
 
   // for new data, remember that ID was consumed and store it for duplicate detectio, mark bridge read request as complete
   when(accessReadDataAccepted) {
@@ -663,12 +743,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     // state to read accesses for current model cycle
     is(sRead) {
 
-      when(completionQueueNeedsService) {
-        // opportunistically service completions before the completion queue can backpressure issue nodes.
-        // Round completion remains gated by bucketDrained below.
-        completionState := cDequeue
-        state := sCompletion
-      }.elsewhen(readReqPending) { // if we have a pending read request, wait for it to be accepted and set read enable
+      when(readReqPending) { // if we have a pending read request, wait for it to be accepted and set read enable
         when(io.accessReadReady && !accessReadRequestActive && !io.accessReadDataValid && !io.accessReadBucketDone) {
           io.accessReadEn := true.B
           accessReadRequestActive := true.B
@@ -702,20 +777,21 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         // already marked complete; do not let it block the drain condition.
         pendingAccessReadBucketDone := false.B
       }.elsewhen(bucketDrained) { // cycle bucket fully issued 
-        when(completionQueue.io.deq.valid) { // check for any completions first
-          completionState := cDequeue
-          state := sCompletion
-        }.elsewhen(stopCondition) { // if round completion, then write completed bundle count and signal round complete
-          io.completedBundleCountWriteEn := true.B
-          io.completedBundleCountWriteData := completedBundleCount
-          roundCompletePulse := true.B
-          state := sIdle
-        }.otherwise { // advance to next cycle 
-          modelCycle := modelCycle + 1.U
-          bucketDoneSeen := false.B
-          readReqPending := true.B
-          accessReadDataConsumed := false.B
-          lastConsumedAccessReadId := 0.U
+        // Preserve the original bucket-boundary behavior: returned completions are
+        // retired before evaluating whether the next model cycle can begin.
+        when(completionPathDrained) {
+          when(stopCondition) { // if round completion, then write completed bundle count and signal round complete
+            io.completedBundleCountWriteEn := true.B
+            io.completedBundleCountWriteData := completedBundleCount
+            roundCompletePulse := true.B
+            state := sIdle
+          }.otherwise { // advance to next cycle 
+            modelCycle := modelCycle + 1.U
+            bucketDoneSeen := false.B
+            readReqPending := true.B
+            accessReadDataConsumed := false.B
+            lastConsumedAccessReadId := 0.U
+          }
         }
       }
     }
@@ -729,142 +805,76 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
       when(issueCanFire) {
 
-        // if there is an existing bundle for this access, issue under that bundle and increment the access count. 
-        // Otherwise, allocate a new bundle table entry, issue under that bundle, and set the access count to 1.
-        
-        // find the index for either the existing bundle, or a free entry for a new bundle
-        val bundleIdx = Mux(issueBundleMatch, issueBundleMatchIdx, issueBundleFreeIdx)
-
-        when(issueBundleMatch) {
-
-          // removing these assertions because we allow bundle ID aliasing
-          // make sure that the wake-relevant and warp meta data for bundle matches for this access
-          // assert(bundleTableWakeRelevant(bundleIdx) === pendingIssue.mWakeRelevantBundle,
-          //   "TrafficGenRTLEngine saw inconsistent wake-relevant metadata for a bundle")
-          // assert(bundleTableSmId(bundleIdx) === pendingIssue.smId &&
-          //   bundleTableSchedulerId(bundleIdx) === pendingIssue.schedulerId &&
-          //   bundleTableWarpId(bundleIdx) === pendingIssue.warpId,
-          //   "TrafficGenRTLEngine saw inconsistent warp metadata for a bundle")
-
-          // incremement the bundle count
-          bundleTableCount(bundleIdx) := bundleTableCount(bundleIdx) + 1.U
-        }.otherwise {
-          // set the new bundle table entry for this new bundle
-          assert(issueBundleHasFree, "TrafficGenRTLEngine bundle table capacity exceeded")
-          when(issueBundleHasFree) {
-            bundleTableValid(bundleIdx) := true.B
-            bundleTableId(bundleIdx) := pendingIssue.mBundleId
-            bundleTableCount(bundleIdx) := 1.U
-            bundleTableWakeRelevant(bundleIdx) := pendingIssue.mWakeRelevantBundle
-            bundleTableSmId(bundleIdx) := pendingIssue.smId
-            bundleTableSchedulerId(bundleIdx) := pendingIssue.schedulerId
-            bundleTableWarpId(bundleIdx) := pendingIssue.warpId
-          }
-        }
-
         // increment inflight access count and return to read state
         issuedAccessCount := issuedAccessCount + 1.U
-        inflightAccessCount := inflightAccessCount + 1.U
         pendingIssueValid := false.B
         state := sRead
       }
     }
+  }
 
-    is(sCompletion) {
-      switch(completionState) {
-        is(cDequeue) { 
-          // pop the next next completion off the queue 
-          completionQueue.io.deq.ready := true.B
+  switch(completionState) {
+    is(cDequeue) {
+      completionQueue.io.deq.ready := completionRetireActive
 
-          when(completionQueue.io.deq.fire) {
-            assert(completionBundleMatch, "TrafficGenRTLEngine completed an unknown bundle")
-            assert(inflightAccessCount =/= 0.U, "TrafficGenRTLEngine completed with no inflight accesses")
+      when(completionRetireFire) {
+        assert(completionBundleMatch, "TrafficGenRTLEngine completed an unknown bundle")
+        assert(inflightAccessCount =/= 0.U, "TrafficGenRTLEngine completed with no inflight accesses")
 
-            when(completionBundleMatch) {
-              // check if the count for this bundle is 1, which means this completion will complete the bundle
-              val bundleCompleted = bundleTableCount(completionBundleIdx) === 1.U
+        when(completionBundleMatch) {
+          when(completionBundleCompleted) {
+            assert(completedBundleCount < CompletedBundleIds.capacity.U,
+              "TrafficGenRTLEngine completed bundle queue capacity exceeded")
+            when(completedBundleCount < CompletedBundleIds.capacity.U) {
+              io.completedBundleIdWriteEn := true.B
+              io.completedBundleIdWriteIdx := completedBundleCount(CompletedBundleIds.idxWidth - 1, 0)
+              io.completedBundleIdWriteData := completionQueue.io.deq.bits.mBundleId
+              completedBundleCount := completedBundleCount + 1.U
+            }
 
-              // decrement the inflight access count for this completion
-              when(inflightAccessCount =/= 0.U) {
-                inflightAccessCount := inflightAccessCount - 1.U
-              }
+            completionQuerySmId := bundleTableSmId(completionBundleIdx)
+            completionQuerySchedulerId := bundleTableSchedulerId(completionBundleIdx)
+            completionQueryWarpId := bundleTableWarpId(completionBundleIdx)
 
-              when(bundleCompleted) {
-
-                // write the completed bundle ID back to the bridge module
-                assert(completedBundleCount < CompletedBundleIds.capacity.U,
-                  "TrafficGenRTLEngine completed bundle queue capacity exceeded")
-                when(completedBundleCount < CompletedBundleIds.capacity.U) {
-                  io.completedBundleIdWriteEn := true.B
-                  io.completedBundleIdWriteIdx := completedBundleCount(CompletedBundleIds.idxWidth - 1, 0)
-                  io.completedBundleIdWriteData := completionQueue.io.deq.bits.mBundleId
-                  completedBundleCount := completedBundleCount + 1.U
-                }
-
-                // get the warp metadata for this completed bundle
-                completionQuerySmId := bundleTableSmId(completionBundleIdx)
-                completionQuerySchedulerId := bundleTableSchedulerId(completionBundleIdx)
-                completionQueryWarpId := bundleTableWarpId(completionBundleIdx)
-
-                // invalidate bundle table entry for this completed bundle
-                bundleTableValid(completionBundleIdx) := false.B
-                bundleTableCount(completionBundleIdx) := 0.U
-
-                // if this bundle is wake-relevant, check if the warp is blocked too,
-                // otherwise go back to read
-                when(bundleTableWakeRelevant(completionBundleIdx)) {
-                  completionState := cRequestBlockedWarp
-                }.otherwise {
-                  completionState := cDequeue
-                  state := sRead
-                }
-              }.otherwise {
-                // bundle is not completed, so just decrement bundle count and go back to read
-                bundleTableCount(completionBundleIdx) := bundleTableCount(completionBundleIdx) - 1.U
-                completionState := cDequeue
-                state := sRead
-              }
-            }.otherwise {
-              // unknown bundle completed- ideally this does not happen
-              completionState := cDequeue
-              state := sRead
+            when(bundleTableWakeRelevant(completionBundleIdx)) {
+              completionState := cRequestBlockedWarp
             }
           }
         }
+      }
+    }
 
-        // we completed a wake-relevant bundle, so check if warp is blocked
-        is(cRequestBlockedWarp) { 
-          io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
-            completionQuerySmId,
-            completionQuerySchedulerId,
-            completionQueryWarpId)
-          when(io.blockedWarpQueryReady) {
-            io.blockedWarpQueryEn := true.B
-            completionState := cWaitBlockedWarp
-          }
-        }
+    // A completed wake-relevant bundle may unblock a warp; query the bridge bitmap
+    // in the completion path without taking over the main issue FSM.
+    is(cRequestBlockedWarp) {
+      io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
+        completionQuerySmId,
+        completionQuerySchedulerId,
+        completionQueryWarpId)
+      when(io.blockedWarpQueryReady) {
+        io.blockedWarpQueryEn := true.B
+        completionState := cWaitBlockedWarp
+      }
+    }
 
-        // wait for blocked warp response- if it was blocked, indicate that the round should stop after we drain the current bucket and go back to read
-        is(cWaitBlockedWarp) {
-          io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
-            completionQuerySmId,
-            completionQuerySchedulerId,
-            completionQueryWarpId)
-          when(io.blockedWarpQueryRespValid) {
-            io.blockedWarpQueryRespStored := true.B
-            when(io.blockedWarpQueryResp) {
-              roundStopPending := true.B
-            }
-            completionState := cDequeue
-            state := sRead
-          }
+    is(cWaitBlockedWarp) {
+      io.blockedWarpQueryIdx := BlockedWarpBitmap.indexFromFields(
+        completionQuerySmId,
+        completionQuerySchedulerId,
+        completionQueryWarpId)
+      when(io.blockedWarpQueryRespValid) {
+        io.blockedWarpQueryRespStored := true.B
+        when(io.blockedWarpQueryResp) {
+          roundStopPending := true.B
         }
+        completionState := cDequeue
       }
     }
   }
 
   when(roundCompletePulse) {
     assert(bucketDrained, "TrafficGenRTLEngine completed a round before draining the current bucket")
+    assert(completionPathDrained, "TrafficGenRTLEngine completed a round before draining completions")
     assert(newAccessReadCount === issuedAccessCount,
       "TrafficGenRTLEngine dropped a read access before issue")
   }
