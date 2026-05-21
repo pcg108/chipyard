@@ -7,6 +7,7 @@ import chisel3.util._
 
 import org.chipsalliance.cde.config.Parameters
 import midas.widgets._
+import midas.targetutils.xdc.{RAMStyleHint, RAMStyles}
 import firesim.lib.bridgeutils._
 
 import firechip.bridgeinterfaces._
@@ -70,6 +71,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Table that maps cycle to an occupancy mask. Use SyncReadMem so the larger
     // snapshot stores in RAM resources instead of registers.
     val reservedSubPartitionsByCycle = SyncReadMem(reservedSubPartitionEntries, UInt(reservedSubPartitionEntryWidth.W))
+    RAMStyleHint(reservedSubPartitionsByCycle, RAMStyles.BLOCK)
     // table managed as ring buffer sliding window, so maintain base index and cycle
     val reservedSubPartitionsBaseIdx = RegInit(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedSubPartitionsBaseCycle = RegInit(0.U(64.W))
@@ -182,6 +184,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Store the packed stream representation so synthesis sees one 512-bit memory
     // instead of one large memory per L2Access bundle field.
     val issuedAccessWritebackStore = SyncReadMem(key.maxL2AccessEntries, UInt(L2Access.streamWidthBits.W))
+    RAMStyleHint(issuedAccessWritebackStore, RAMStyles.BLOCK)
     val issuedAccessWritebackCount = RegInit(0.U(32.W))
     val issuedAccessWritebackIdx = RegInit(0.U(32.W))
 
@@ -214,6 +217,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     
     // Store completed bundle IDs completed by target, to be streamed back to the bridge driver.
     val completedBundleIds = SyncReadMem(completedBundleIdBeats, Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
+    // This Vec memory lowers to one physical memory per lane. A single RAMStyleHint
+    // on the aggregate fans out during FIRRTL renaming, which Golden Gate rejects.
     val completedBundleIdsValid = RegInit(true.B)
     val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
     val completedBundleCountValid = RegInit(true.B)
@@ -472,6 +477,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Store packed 512-bit accesses so FIRRTL/Vivado do not split the L2Access
     // bundle into many independent large memories.
     val accessStore = SyncReadMem(key.maxL2AccessEntries, UInt(L2Access.streamWidthBits.W))
+    RAMStyleHint(accessStore, RAMStyles.BLOCK)
     val accessStoreCount = RegInit(0.U(32.W))
     val accessStoreMaxCycle = RegInit(0.U(64.W))
     val accessStoreHasEntries = RegInit(false.B)
@@ -481,8 +487,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     
     // linked list poiners and head/tail pointers for cycle buckets
     val nextPtr = SyncReadMem(key.maxL2AccessEntries, UInt(accessIdxWidth.W))
+    RAMStyleHint(nextPtr, RAMStyles.BLOCK)
     val cycleHead = SyncReadMem(reservedSubPartitionEntries, UInt(accessIdxWidth.W))
+    RAMStyleHint(cycleHead, RAMStyles.BLOCK)
     val cycleTail = SyncReadMem(reservedSubPartitionEntries, UInt(accessIdxWidth.W))
+    RAMStyleHint(cycleTail, RAMStyles.BLOCK)
 
     val accessStoreWriteEn = WireDefault(false.B)
     val accessStoreWriteAddr = WireDefault(0.U(accessIdxWidth.W))
@@ -499,6 +508,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // free list of access indices to reuse after clearing 
     val freeList = SyncReadMem(key.maxL2AccessEntries, UInt(accessIdxWidth.W))
+    RAMStyleHint(freeList, RAMStyles.BLOCK)
     val freeListCount = RegInit(0.U(accessIdxWidth.W))
     val nextUnusedAccessIdx = RegInit(0.U(accessIdxWidth.W))
 
@@ -558,9 +568,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
      * Setup for uploaded blocked warps.
     */
 
-    // store the warps that are currently blocked in the scheduler, for the traffic generator to return on if it unblocks the scheduler
-    // stored as a vec of beats to make it easier to stream
-    val blockedWarpBitmap = RegInit(VecInit(Seq.fill(BlockedWarpBitmap.streamBeatCount)(0.U(L2Access.streamWidthBits.W))))
+    // Store the blocked warp bitmap in memory to avoid a large register array.
+    // The bridge driver uploads every beat before blockedWarpUploadDone is set.
+    val blockedWarpBitmap = SyncReadMem(BlockedWarpBitmap.streamBeatCount, UInt(L2Access.streamWidthBits.W))
+    RAMStyleHint(blockedWarpBitmap, RAMStyles.BLOCK)
     
     // signal to start upload process from bridge driver, which includes both L2 accesses and blocked warp bitmap
     val uploadStart = Wire(Bool())
@@ -600,7 +611,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
       uploadPhase := Mux(uploadCount === 0.U, uploadPhaseBlockedWarpBitmap, uploadPhaseL2Accesses)
-      blockedWarpBitmap.foreach(_ := 0.U)
     }
 
     // unpack the incoming stream beat into L2 access information
@@ -760,10 +770,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           }
         }
 
-        // next, stream blocked warp bitmap data into registers in the bridge module
+        // next, stream blocked warp bitmap data into the bridge-module memory
         is(uploadPhaseBlockedWarpBitmap) {
 
-          blockedWarpBitmap(blockedWarpBeatCount) := streamDeq.bits
+          blockedWarpBitmap.write(blockedWarpBeatCount, streamDeq.bits)
 
           // when completed, indicate to target and bridge driver that blocked warp ID upload done
           when(blockedWarpBeatCount === (BlockedWarpBitmap.streamBeatCount - 1).U) {
@@ -945,24 +955,33 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
     val blockedWarpQueryWordIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.indexBits - 1, BlockedWarpBitmap.streamBeatOffsetBits)
     val blockedWarpQueryBitIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
+    val blockedWarpQueryReadIdx = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
+    val blockedWarpQueryReadEn = WireDefault(false.B)
+    val blockedWarpQueryReadBits = blockedWarpBitmap.read(blockedWarpQueryReadIdx, blockedWarpQueryReadEn)
+    val blockedWarpQueryBitIdxReg = Reg(UInt(BlockedWarpBitmap.streamBeatOffsetBits.W))
     val blockedWarpQueryRespReg = RegInit(false.B)
     val blockedWarpQueryRespValidReg = RegInit(false.B)
     val blockedWarpQueryReadyReg = RegInit(true.B)
     val blockedWarpQueryPending = RegInit(false.B)
+    val blockedWarpQueryReadPending = RegInit(false.B)
     val blockedWarpQueryReq = fire && target.blockedWarpQueryEn && blockedWarpQueryReadyReg
-    val blockedWarpQueryRespReturn = RegNext(blockedWarpQueryReq, false.B)
 
     // respond to blocked warp query by looking up the corresponding bit in the blocked warp bitmap, 
     // but only after the upload is done and the bitmap is valid; hold the response until the target acknowledges it
     when(blockedWarpQueryReq) {
       blockedWarpQueryReadyReg := false.B
       blockedWarpQueryPending := true.B
+      blockedWarpQueryReadPending := true.B
       blockedWarpQueryRespValidReg := false.B
-      blockedWarpQueryRespReg := blockedWarpUploadDone && blockedWarpBitmap(blockedWarpQueryWordIdx)(blockedWarpQueryBitIdx)
+      blockedWarpQueryBitIdxReg := blockedWarpQueryBitIdx
+      blockedWarpQueryReadIdx := blockedWarpQueryWordIdx
+      blockedWarpQueryReadEn := true.B
     }
-    // hold the response until the target acknowledges it, and then mark ready for the next query
-    when(blockedWarpQueryRespReturn) {
+    // The bitmap is a SyncReadMem, so the accepted query returns one cycle after the read is issued.
+    when(blockedWarpQueryReadPending) {
+      blockedWarpQueryRespReg := blockedWarpUploadDone && blockedWarpQueryReadBits(blockedWarpQueryBitIdxReg)
       blockedWarpQueryPending := false.B
+      blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := true.B
     }
     // once the target stores the blocked warp query, we can clear the valid and mark ready for the next query
@@ -973,11 +992,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(accessReadReset) {
       blockedWarpQueryReadyReg := true.B
       blockedWarpQueryPending := false.B
+      blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := false.B
     }
     target.blockedWarpQueryResp := blockedWarpQueryRespReg
     target.blockedWarpQueryRespValid := blockedWarpQueryRespValidReg
-    target.blockedWarpQueryReady := blockedWarpQueryReadyReg && !blockedWarpQueryPending
+    target.blockedWarpQueryReady := blockedWarpQueryReadyReg && !blockedWarpQueryPending && !blockedWarpQueryReadPending
 
     // when the target advances the reservation window, it reports the last
     // cycle processed. Retire access buckets and reservation entries through
@@ -1185,6 +1205,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadBucketDoneReg := false.B
       blockedWarpQueryReadyReg := true.B
       blockedWarpQueryPending := false.B
+      blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := false.B
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U

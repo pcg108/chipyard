@@ -26,7 +26,7 @@ case class TrafficGenParams(
   size: BigInt = 500000000L,
   numGenerators: Int = 1,
   regionStride: BigInt = 0x400000L,
-  maxL2AccessEntries: Int = 262144, // 2^18
+  maxL2AccessEntries: Int = 32768, // 262144, // 2^18
   memOutstanding: Int = 4,
   accessReadResponseDepth: Int = 1024,
   backend: TrafficGenBackend = TrafficGenDPIBackend,
@@ -423,12 +423,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issuedAccessWritebackQueue = Module(new Queue(new L2Access, 4))
   val reservationClearQueue = Module(new Queue(new ReservationClearRequest, 4))
 
-  // queue to immediately capture access read responses from the bridge module 
-  class AccessReadResponse extends Bundle {
-    val bucketDone = Bool()
-    val access = new L2Access
-  }
-  val accessReadResponseQueue = Module(new Queue(new AccessReadResponse, params.accessReadResponseDepth))
+  // queue to immediately capture access read responses from the bridge module.
+  // Store packed accesses so the queue backs onto one wide memory instead of one
+  // memory per L2Access field. Bucket-done is tracked separately.
+  val accessReadResponseQueue = Module(new Queue(UInt(L2Access.streamWidthBits.W), params.accessReadResponseDepth))
+  val accessReadResponseDeqAccess = L2Access.unpack(accessReadResponseQueue.io.deq.bits)
 
   // queue and arbiter to serialize completions from multiple issue nodes
   val completionArb = Module(new RRArbiter(new L2Access, params.numGenerators))
@@ -556,8 +555,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   // default values for access read response queue 
   accessReadResponseQueue.io.enq.valid := false.B
-  accessReadResponseQueue.io.enq.bits.bucketDone := false.B
-  accessReadResponseQueue.io.enq.bits.access := io.accessReadData
+  accessReadResponseQueue.io.enq.bits := L2Access.pack(io.accessReadData)
   accessReadResponseQueue.io.deq.ready := false.B
   completionQueue.io.deq.ready := false.B
 
@@ -670,8 +668,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val accessReadBucketDoneAccepted = state =/= sIdle && !io.accessReadDataValid && io.accessReadBucketDone && io.accessReadBucketDoneReady // fresh bucket-done response
   // push new access read data or bucket done signals into access read response queue to be processed by state machine
   accessReadResponseQueue.io.enq.valid := enqueueNewAccessReadData
-  accessReadResponseQueue.io.enq.bits.bucketDone := false.B
-  accessReadResponseQueue.io.enq.bits.access := io.accessReadData
+  accessReadResponseQueue.io.enq.bits := L2Access.pack(io.accessReadData)
   // we are ready for new data if queue has space for a new access, or it is not new data (need to acknowledge for module to move on)
   io.accessReadDataReady := state =/= sIdle &&
     (accessReadResponseQueue.io.enq.ready || !newAccessReadData)
@@ -759,7 +756,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         when(accessReadResponseQueue.io.deq.valid) {
           accessReadResponseQueue.io.deq.ready := true.B
           // latch the new access and go to issue
-          pendingIssue := accessReadResponseQueue.io.deq.bits.access
+          pendingIssue := accessReadResponseDeqAccess
           pendingIssueValid := true.B
           state := sIssue
         }.elsewhen(pendingAccessReadBucketDone) {

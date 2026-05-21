@@ -877,7 +877,7 @@ public:
       *blockedWarpQueryIdx = blockedWarpIndex(mBlockedWarpQueryList[mBlockedWarpQueryIdx]);
       if (blockedWarpQueryReady) {
         *blockedWarpQueryEn = 1;
-        mState = State::WaitBlockedQueryAccepted;
+        mState = State::WaitBlockedQuery;
       }
       break;
     case State::WaitBlockedQueryAccepted:
