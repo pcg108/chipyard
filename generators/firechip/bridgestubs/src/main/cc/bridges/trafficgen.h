@@ -85,9 +85,10 @@ enum class trafficgen_state_t {
   READING_TRAFFICGEN_OUTPUT,
 };
 
-class trafficgen_t final : public streaming_bridge_driver_t {
+class trafficgen_t final : public bridge_driver_t {
 public:
   static char KIND;
+  static constexpr size_t STREAM_WIDTH_BYTES = 64;
   static constexpr size_t STREAM_WORD_BITS = 256;
   static constexpr size_t STREAM_WORD_COUNT = 8192;
   static constexpr size_t STREAM_WORDS_PER_ENTRY = STREAM_WORD_BITS / 64;
@@ -121,14 +122,21 @@ public:
                 "Completed bundle ID count must be stream-beat aligned");
 
   trafficgen_t(simif_t &simif,
-               StreamEngine &stream,
                const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
                int trafficgenno,
                const std::vector<std::string> &args,
-               int stream_to_host_idx,
-               int stream_to_host_depth,
-               int stream_from_host_idx,
-               int stream_from_host_depth);
+               uint64_t bram_base,
+               uint64_t semantic_access_upload_offset,
+               uint64_t semantic_blocked_upload_offset,
+               uint64_t raw_access_store_offset,
+               uint64_t raw_issued_access_writeback_store_offset,
+               uint64_t raw_reserved_subpartitions_offset,
+               uint64_t raw_blocked_warp_bitmap_offset,
+               uint64_t raw_completed_bundle_ids_offset,
+               uint64_t access_window_bytes,
+               uint64_t blocked_window_bytes,
+               uint64_t reserved_window_bytes,
+               uint64_t completed_window_bytes);
 
   ~trafficgen_t() override;
 
@@ -140,10 +148,18 @@ private:
   class socket_client_t;
 
   const TRAFFICGENBRIDGEMODULE_struct mmio_addrs;
-  const int stream_to_host_idx;
-  const int stream_to_host_depth;
-  const int stream_from_host_idx;
-  const int stream_from_host_depth;
+  const uint64_t bram_base;
+  const uint64_t semantic_access_upload_offset;
+  const uint64_t semantic_blocked_upload_offset;
+  const uint64_t raw_access_store_offset;
+  const uint64_t raw_issued_access_writeback_store_offset;
+  const uint64_t raw_reserved_subpartitions_offset;
+  const uint64_t raw_blocked_warp_bitmap_offset;
+  const uint64_t raw_completed_bundle_ids_offset;
+  const uint64_t access_window_bytes;
+  const uint64_t blocked_window_bytes;
+  const uint64_t reserved_window_bytes;
+  const uint64_t completed_window_bytes;
   std::uint64_t min_issue_cycle = 0;
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
@@ -167,8 +183,7 @@ private:
   size_t reserved_subpartition_bytes_received = 0;
   bool reserved_subpartitions_metadata_latched = false;
   
-  size_t upload_cursor = 0;
-  size_t blocked_warp_bitmap_upload_cursor = 0;
+  bool upload_written_to_bram = false;
   trafficgen_upload_phase_t upload_phase = trafficgen_upload_phase_t::l2_accesses;
   bool target_busy = false;
   bool round_completion_pause_issued = false;
@@ -180,6 +195,7 @@ private:
   size_t process_completed_bundle_ids_stream();
   size_t process_issued_access_writeback_stream();
   void push_upload_data();
+  void write_schedule_to_bram();
   void connect_gpu_model_socket();
   bool receive_main_loop_complete_from_gpu_model() const;
   void send_reserved_subpartitions_snapshot() const;

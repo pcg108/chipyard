@@ -26,7 +26,7 @@ case class TrafficGenParams(
   size: BigInt = 500000000L,
   numGenerators: Int = 1,
   regionStride: BigInt = 0x400000L,
-  maxL2AccessEntries: Int = 262144, // 262144, // 2^18
+  maxL2AccessEntries: Int = 65536, // 2^16
   memOutstanding: Int = 4,
   accessReadResponseDepth: Int = 1024,
   backend: TrafficGenBackend = TrafficGenDPIBackend,

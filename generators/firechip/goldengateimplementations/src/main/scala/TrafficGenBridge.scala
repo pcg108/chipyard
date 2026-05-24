@@ -6,24 +6,69 @@ import chisel3._
 import chisel3.util._
 
 import org.chipsalliance.cde.config.Parameters
+import freechips.rocketchip.amba.axi4._
+import freechips.rocketchip.diplomacy._
+import midas.core.CPUManagedAXI4Key
 import midas.widgets._
 import midas.targetutils.xdc.{RAMStyleHint, RAMStyles}
 import firesim.lib.bridgeutils._
 
 import firechip.bridgeinterfaces._
 
+object TrafficGenBRAMAddressMap {
+  val base: BigInt   = BigInt("40000000", 16)
+  val stride: BigInt = BigInt("08000000", 16)
+  val size: BigInt   = stride
+
+  val semanticAccessUploadOffset: BigInt = BigInt("00000000", 16)
+  val semanticBlockedUploadOffset: BigInt = BigInt("01000000", 16)
+
+  val rawAccessStoreOffset: BigInt              = BigInt("02000000", 16)
+  val rawIssuedAccessWritebackStoreOffset: BigInt = BigInt("03000000", 16)
+  val rawReservedSubPartitionsOffset: BigInt    = BigInt("04000000", 16)
+  val rawBlockedWarpBitmapOffset: BigInt        = BigInt("04080000", 16)
+  val rawCompletedBundleIdsOffset: BigInt       = BigInt("04090000", 16)
+}
+
 class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     extends BridgeModule[HostPortIO[TrafficGenBridgeTargetIO]]()(p)
-    with StreamToHostCPU
-    with StreamFromHostCPU {
+    with UsesCPUManagedBRAM {
 
-  val toHostCPUQueueDepth = 1024
-  val fromHostCPUQueueDepth = 1024
+  private val cpuManagedAXI4Params = p(CPUManagedAXI4Key).get
+  private val bramBeatBytes        = cpuManagedAXI4Params.dataBits / 8
+  require(cpuManagedAXI4Params.dataBits == L2Access.streamWidthBits, "TrafficGen direct BRAM path expects 512-bit CPU-managed XDMA")
+
+  val bramBase: BigInt = TrafficGenBRAMAddressMap.base + BigInt(getWId) * TrafficGenBRAMAddressMap.stride
+  val bramSize: BigInt = TrafficGenBRAMAddressMap.size
+  val bramAddress: Seq[AddressSet] = Seq(AddressSet(bramBase, bramSize - 1))
+  val bramSlaveNode: AXI4SlaveNode = AXI4SlaveNode(
+    Seq(
+      AXI4SlavePortParameters(
+        slaves = Seq(
+          AXI4SlaveParameters(
+            address       = bramAddress,
+            resources     = (new MemoryDevice).reg,
+            regionType    = RegionType.UNCACHED,
+            executable    = false,
+            supportsWrite = TransferSizes(bramBeatBytes, 4096),
+            supportsRead  = TransferSizes(bramBeatBytes, 4096),
+            interleavedId = Some(0),
+          )
+        ),
+        beatBytes = bramBeatBytes,
+      )
+    )
+  )
 
   lazy val module = new BridgeModuleImp(this) {
     val io = IO(new WidgetIO())
     val hPort = IO(HostPort(new TrafficGenBridgeTargetIO))
     val target = hPort.hBits.trafficgen
+    val streamDeq = Wire(Decoupled(UInt(L2Access.streamWidthBits.W)))
+    val streamEnq = Wire(Decoupled(UInt(L2Access.streamWidthBits.W)))
+    streamDeq.valid := false.B
+    streamDeq.bits := 0.U
+    streamEnq.ready := false.B
 
     /*
      * Bridge-driver control and target clock gating.
@@ -132,9 +177,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // index and enable signals to read from SyncReadMem for streaming out reserved sub-partition data
     val reservedStreamReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
     val reservedStreamReadEn = WireDefault(false.B)
+    val axiRawReservedReadIdx = WireDefault(0.U(log2Ceil(reservedSubPartitionEntries).W))
+    val axiRawReservedReadEn = WireDefault(false.B)
     val reservedStreamEntryBits = reservedSubPartitionsByCycle.read(
-      reservedStreamReadIdx,
-      reservedStreamReadEn,
+      Mux(axiRawReservedReadEn, axiRawReservedReadIdx, reservedStreamReadIdx),
+      reservedStreamReadEn || axiRawReservedReadEn,
     )
 
     // latch read data from SyncReadMem in a register and pad to 512 bits for streaming to bridge driver
@@ -175,6 +222,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // sweep-in-progress signal 
     val reservationClearSweepActive = reservationClearSweepRemaining =/= 0.U
 
+    val accessIdxWidth = log2Ceil(key.maxL2AccessEntries + 1)
+
 
     /*
       * target issued accesses are buffered into issuedAccssWritebackStore for logging in the GPU model
@@ -187,12 +236,17 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     RAMStyleHint(issuedAccessWritebackStore, RAMStyles.BLOCK)
     val issuedAccessWritebackCount = RegInit(0.U(32.W))
     val issuedAccessWritebackIdx = RegInit(0.U(32.W))
+    val issuedAccessWritebackStoreWriteEn = WireDefault(false.B)
+    val issuedAccessWritebackStoreWriteAddr = WireDefault(0.U(accessIdxWidth.W))
+    val issuedAccessWritebackStoreWriteData = WireDefault(0.U(L2Access.streamWidthBits.W))
 
     val doIssuedAccessWriteback = target.issuedAccessWriteback.valid && fire &&
       issuedAccessWritebackIdx < key.maxL2AccessEntries.U
     target.issuedAccessWriteback.ready := doIssuedAccessWriteback
     when(doIssuedAccessWriteback) {
-      issuedAccessWritebackStore.write(issuedAccessWritebackIdx, L2Access.pack(target.issuedAccessWriteback.bits))
+      issuedAccessWritebackStoreWriteEn := true.B
+      issuedAccessWritebackStoreWriteAddr := issuedAccessWritebackIdx(accessIdxWidth - 1, 0)
+      issuedAccessWritebackStoreWriteData := L2Access.pack(target.issuedAccessWriteback.bits)
       issuedAccessWritebackIdx := issuedAccessWritebackIdx + 1.U
       issuedAccessWritebackCount := issuedAccessWritebackCount + 1.U
     }
@@ -201,9 +255,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val readIssuedAccessWriteback = Wire(Bool())
     val issuedAccessStreamReadIdx = WireDefault(0.U(streamBeatIdxWidth.W))
     val issuedAccessStreamReadEn = WireDefault(false.B)
+    val axiRawIssuedReadIdx = WireDefault(0.U(accessIdxWidth.W))
+    val axiRawIssuedReadEn = WireDefault(false.B)
     val issuedAccessStreamEntryBits = issuedAccessWritebackStore.read(
-      issuedAccessStreamReadIdx,
-      issuedAccessStreamReadEn,
+      Mux(axiRawIssuedReadEn, axiRawIssuedReadIdx, issuedAccessStreamReadIdx),
+      issuedAccessStreamReadEn || axiRawIssuedReadEn,
     )
     // staging register to hold packed issued access read from SyncReadMem before streaming to bridge driver
     val issuedAccessStreamEntryReg = Reg(UInt(L2Access.streamWidthBits.W))
@@ -222,6 +278,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val completedBundleIdsValid = RegInit(true.B)
     val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
     val completedBundleCountValid = RegInit(true.B)
+    val completedBundleIdsWriteEn = WireDefault(false.B)
+    val completedBundleIdsWriteAddr = WireDefault(0.U(completedBundleBeatIdxWidth.W))
+    val completedBundleIdsWriteData = Wire(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
+    completedBundleIdsWriteData.foreach(_ := 0.U)
+    val completedBundleIdsWriteMask = Wire(Vec(CompletedBundleIds.idsPerBeat, Bool()))
+    completedBundleIdsWriteMask.foreach(_ := false.B)
 
     when(target.completedBundleCountWriteEn) {
       completedBundleCount := target.completedBundleCountWriteData
@@ -232,11 +294,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       val laneIdx = target.completedBundleIdWriteIdx(log2Ceil(CompletedBundleIds.idsPerBeat) - 1, 0)
       val writeData = Wire(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
       writeData.foreach(_ := target.completedBundleIdWriteData)
-      completedBundleIds.write(
-        beatIdx(completedBundleBeatIdxWidth - 1, 0),
-        writeData,
-        UIntToOH(laneIdx, CompletedBundleIds.idsPerBeat).asBools,
-      )
+      completedBundleIdsWriteEn := true.B
+      completedBundleIdsWriteAddr := beatIdx(completedBundleBeatIdxWidth - 1, 0)
+      completedBundleIdsWriteData := writeData
+      completedBundleIdsWriteMask.zip(UIntToOH(laneIdx, CompletedBundleIds.idsPerBeat).asBools).foreach { case (dst, src) =>
+        dst := src
+      }
       completedBundleIdsValid := true.B
     }
 
@@ -245,9 +308,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     val completedBundleStreamReadIdx = WireDefault(0.U(completedBundleBeatIdxWidth.W))
     val completedBundleStreamReadEn = WireDefault(false.B)
+    val axiRawCompletedReadIdx = WireDefault(0.U(completedBundleBeatIdxWidth.W))
+    val axiRawCompletedReadEn = WireDefault(false.B)
     val completedBundleStreamEntryBits = completedBundleIds.read(
-      completedBundleStreamReadIdx,
-      completedBundleStreamReadEn,
+      Mux(axiRawCompletedReadEn, axiRawCompletedReadIdx, completedBundleStreamReadIdx),
+      completedBundleStreamReadEn || axiRawCompletedReadEn,
     )
     val completedBundleStreamEntryReg = Reg(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
     val completedBundleStreamReadPending = RegInit(false.B)
@@ -482,7 +547,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessStoreMaxCycle = RegInit(0.U(64.W))
     val accessStoreHasEntries = RegInit(false.B)
 
-    val accessIdxWidth = log2Ceil(key.maxL2AccessEntries + 1)
     val invalidAccessIdx = key.maxL2AccessEntries.U(accessIdxWidth.W)
     
     // linked list poiners and head/tail pointers for cycle buckets
@@ -572,6 +636,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // The bridge driver uploads every beat before blockedWarpUploadDone is set.
     val blockedWarpBitmap = SyncReadMem(BlockedWarpBitmap.streamBeatCount, UInt(L2Access.streamWidthBits.W))
     RAMStyleHint(blockedWarpBitmap, RAMStyles.BLOCK)
+    val blockedWarpBitmapWriteEn = WireDefault(false.B)
+    val blockedWarpBitmapWriteAddr = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
+    val blockedWarpBitmapWriteData = WireDefault(0.U(L2Access.streamWidthBits.W))
     
     // signal to start upload process from bridge driver, which includes both L2 accesses and blocked warp bitmap
     val uploadStart = Wire(Bool())
@@ -773,7 +840,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         // next, stream blocked warp bitmap data into the bridge-module memory
         is(uploadPhaseBlockedWarpBitmap) {
 
-          blockedWarpBitmap.write(blockedWarpBeatCount, streamDeq.bits)
+          blockedWarpBitmapWriteEn := true.B
+          blockedWarpBitmapWriteAddr := blockedWarpBeatCount
+          blockedWarpBitmapWriteData := streamDeq.bits
 
           // when completed, indicate to target and bridge driver that blocked warp ID upload done
           when(blockedWarpBeatCount === (BlockedWarpBitmap.streamBeatCount - 1).U) {
@@ -869,7 +938,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessReadHeadBits = cycleHead.read(accessReadHeadIdx, accessReadHeadEn)
     val accessReadEntryIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessReadEntryEn = WireDefault(false.B)
-    val accessReadDataBits = accessStore.read(accessReadEntryIdx, accessReadEntryEn)
+    val axiRawAccessReadIdx = WireDefault(0.U(accessIdxWidth.W))
+    val axiRawAccessReadEn = WireDefault(false.B)
+    val accessReadDataBits = accessStore.read(
+      Mux(axiRawAccessReadEn, axiRawAccessReadIdx, accessReadEntryIdx),
+      accessReadEntryEn || axiRawAccessReadEn,
+    )
     val accessReadData = L2Access.unpack(accessReadDataBits)
     val accessReadNextPtr = nextPtr.read(accessReadEntryIdx, accessReadEntryEn)
     val (accessReadCycleInWindow, accessReadCycleIdx) = reservationWindowLookup(target.accessReadCycle)
@@ -957,7 +1031,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val blockedWarpQueryBitIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
     val blockedWarpQueryReadIdx = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
     val blockedWarpQueryReadEn = WireDefault(false.B)
-    val blockedWarpQueryReadBits = blockedWarpBitmap.read(blockedWarpQueryReadIdx, blockedWarpQueryReadEn)
+    val axiRawBlockedReadIdx = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
+    val axiRawBlockedReadEn = WireDefault(false.B)
+    val blockedWarpQueryReadBits = blockedWarpBitmap.read(
+      Mux(axiRawBlockedReadEn, axiRawBlockedReadIdx, blockedWarpQueryReadIdx),
+      blockedWarpQueryReadEn || axiRawBlockedReadEn,
+    )
     val blockedWarpQueryBitIdxReg = Reg(UInt(BlockedWarpBitmap.streamBeatOffsetBits.W))
     val blockedWarpQueryRespReg = RegInit(false.B)
     val blockedWarpQueryRespValidReg = RegInit(false.B)
@@ -998,6 +1077,222 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.blockedWarpQueryResp := blockedWarpQueryRespReg
     target.blockedWarpQueryRespValid := blockedWarpQueryRespValidReg
     target.blockedWarpQueryReady := blockedWarpQueryReadyReg && !blockedWarpQueryPending && !blockedWarpQueryReadPending
+
+    /*
+     * Direct CPU-managed XDMA access to TrafficGen BRAM-backed stores.
+     * Production upload writes drive the same internal streamDeq consumed by the
+     * existing semantic upload FSM. Raw windows directly access the physical
+     * SyncReadMems and are intended for bring-up/corruption tests while the
+     * traffic generator is idle.
+     */
+    val bramAxi = bramSlaveNode.in.head._1
+    val bramAddrBits = cpuManagedAXI4Params.addrBits
+    val bramBeatOffsetBits = log2Ceil(bramBeatBytes)
+    val bramBaseU = bramBase.U(bramAddrBits.W)
+
+    def localAddr(addr: UInt): UInt = addr - bramBaseU
+    def inBramRange(addr: UInt, offset: BigInt, bytes: BigInt): Bool = {
+      val a = localAddr(addr)
+      a >= offset.U && a < (offset + bytes).U
+    }
+    def beatIndex(addr: UInt, offset: BigInt): UInt =
+      ((localAddr(addr) - offset.U) >> bramBeatOffsetBits).asUInt
+
+    val accessWindowBytes = BigInt(key.maxL2AccessEntries) * bramBeatBytes
+    val blockedWindowBytes = BigInt(BlockedWarpBitmap.streamBeatCount) * bramBeatBytes
+    val reservedWindowBytes = BigInt(reservedSubPartitionEntries) * bramBeatBytes
+    val completedWindowBytes = BigInt(completedBundleIdBeats) * bramBeatBytes
+
+    val axiWriteActive = RegInit(false.B)
+    val axiWriteAddr = Reg(UInt(bramAddrBits.W))
+    val axiWriteBeatsRemaining = Reg(UInt(9.W))
+    val axiWriteRespValid = RegInit(false.B)
+    val axiWriteId = Reg(chiselTypeOf(bramAxi.aw.bits.id))
+    val axiWriteUser = Reg(chiselTypeOf(bramAxi.aw.bits.user))
+
+    bramAxi.aw.ready := !axiWriteActive && !axiWriteRespValid
+    bramAxi.b.valid := axiWriteRespValid
+    bramAxi.b.bits.resp := 0.U
+    bramAxi.b.bits.id := axiWriteId
+    bramAxi.b.bits.user := axiWriteUser
+
+    when(bramAxi.aw.fire) {
+      axiWriteActive := true.B
+      axiWriteAddr := bramAxi.aw.bits.addr
+      axiWriteBeatsRemaining := bramAxi.aw.bits.len +& 1.U
+      axiWriteId := bramAxi.aw.bits.id
+      axiWriteUser := bramAxi.aw.bits.user
+    }
+    when(bramAxi.b.fire) {
+      axiWriteRespValid := false.B
+    }
+
+    val writeSemanticAccess = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.semanticAccessUploadOffset, accessWindowBytes)
+    val writeSemanticBlocked = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.semanticBlockedUploadOffset, blockedWindowBytes)
+    val writeRawAccess = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset, accessWindowBytes)
+    val writeRawIssued = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
+    val writeRawReserved = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawReservedSubPartitionsOffset, reservedWindowBytes)
+    val writeRawBlocked = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset, blockedWindowBytes)
+    val writeRawCompleted = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
+    val writeSemantic = writeSemanticAccess || writeSemanticBlocked
+
+    streamDeq.valid := axiWriteActive && bramAxi.w.valid && writeSemantic && !axiWriteRespValid
+    streamDeq.bits := bramAxi.w.bits.data
+    bramAxi.w.ready := axiWriteActive && !axiWriteRespValid && Mux(writeSemantic, streamDeq.ready, true.B)
+
+    val axiWriteLastBeat = axiWriteBeatsRemaining === 1.U
+    when(bramAxi.w.fire) {
+      when(writeRawAccess) {
+        accessStoreWriteEn := true.B
+        accessStoreWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset)(accessIdxWidth - 1, 0)
+        accessStoreWriteData := bramAxi.w.bits.data
+      }
+      when(writeRawIssued) {
+        issuedAccessWritebackStoreWriteEn := true.B
+        issuedAccessWritebackStoreWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset)(accessIdxWidth - 1, 0)
+        issuedAccessWritebackStoreWriteData := bramAxi.w.bits.data
+      }
+      when(writeRawReserved) {
+        reservationTableWriteEn := true.B
+        reservationTableWriteIdx := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawReservedSubPartitionsOffset)(reservedSubPartitionIdxWidth - 1, 0)
+        reservationTableWriteBits := bramAxi.w.bits.data(reservedSubPartitionEntryWidth - 1, 0)
+      }
+      when(writeRawBlocked) {
+        blockedWarpBitmapWriteEn := true.B
+        blockedWarpBitmapWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset)(BlockedWarpBitmap.streamBeatIdxBits - 1, 0)
+        blockedWarpBitmapWriteData := bramAxi.w.bits.data
+      }
+      when(writeRawCompleted) {
+        completedBundleIdsWriteEn := true.B
+        completedBundleIdsWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset)(completedBundleBeatIdxWidth - 1, 0)
+        completedBundleIdsWriteData := bramAxi.w.bits.data.asTypeOf(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
+        completedBundleIdsWriteMask.foreach(_ := true.B)
+      }
+
+      axiWriteAddr := axiWriteAddr + bramBeatBytes.U
+      axiWriteBeatsRemaining := axiWriteBeatsRemaining - 1.U
+      when(axiWriteLastBeat) {
+        axiWriteActive := false.B
+        axiWriteRespValid := true.B
+      }
+    }
+
+    val (
+      axiReadRouteNone ::
+      axiReadRouteAccess ::
+      axiReadRouteIssued ::
+      axiReadRouteReserved ::
+      axiReadRouteBlocked ::
+      axiReadRouteCompleted ::
+      Nil
+    ) = Enum(6)
+
+    val axiReadActive = RegInit(false.B)
+    val axiReadAddr = Reg(UInt(bramAddrBits.W))
+    val axiReadBeatsRemaining = Reg(UInt(9.W))
+    val axiReadPending = RegInit(false.B)
+    val axiReadRespValid = RegInit(false.B)
+    val axiReadLastReg = RegInit(false.B)
+    val axiReadPendingLast = RegInit(false.B)
+    val axiReadRouteReg = RegInit(axiReadRouteNone)
+    val axiReadDataReg = Reg(UInt(L2Access.streamWidthBits.W))
+    val axiReadId = Reg(chiselTypeOf(bramAxi.ar.bits.id))
+    val axiReadUser = Reg(chiselTypeOf(bramAxi.ar.bits.user))
+
+    bramAxi.ar.ready := !axiReadActive && !axiReadPending && !axiReadRespValid
+    bramAxi.r.valid := axiReadRespValid
+    bramAxi.r.bits.data := axiReadDataReg
+    bramAxi.r.bits.resp := 0.U
+    bramAxi.r.bits.last := axiReadLastReg
+    bramAxi.r.bits.id := axiReadId
+    bramAxi.r.bits.user := axiReadUser
+
+    when(bramAxi.ar.fire) {
+      axiReadActive := true.B
+      axiReadAddr := bramAxi.ar.bits.addr
+      axiReadBeatsRemaining := bramAxi.ar.bits.len +& 1.U
+      axiReadId := bramAxi.ar.bits.id
+      axiReadUser := bramAxi.ar.bits.user
+    }
+    when(bramAxi.r.fire) {
+      axiReadRespValid := false.B
+    }
+
+    val readRawAccess = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset, accessWindowBytes)
+    val readRawIssued = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
+    val readRawReserved = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawReservedSubPartitionsOffset, reservedWindowBytes)
+    val readRawBlocked = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset, blockedWindowBytes)
+    val readRawCompleted = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
+    val axiReadIssue = axiReadActive && !axiReadPending && !axiReadRespValid
+    val axiReadLastIssue = axiReadBeatsRemaining === 1.U
+
+    axiRawAccessReadIdx := beatIndex(
+      axiReadAddr,
+      TrafficGenBRAMAddressMap.rawAccessStoreOffset,
+    )(accessIdxWidth - 1, 0)
+    axiRawAccessReadEn := axiReadIssue && readRawAccess
+    axiRawIssuedReadIdx := beatIndex(
+      axiReadAddr,
+      TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset,
+    )(accessIdxWidth - 1, 0)
+    axiRawIssuedReadEn := axiReadIssue && readRawIssued
+    axiRawReservedReadIdx := beatIndex(
+      axiReadAddr,
+      TrafficGenBRAMAddressMap.rawReservedSubPartitionsOffset,
+    )(reservedSubPartitionIdxWidth - 1, 0)
+    axiRawReservedReadEn := axiReadIssue && readRawReserved
+    axiRawBlockedReadIdx := beatIndex(
+      axiReadAddr,
+      TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset,
+    )(BlockedWarpBitmap.streamBeatIdxBits - 1, 0)
+    axiRawBlockedReadEn := axiReadIssue && readRawBlocked
+    axiRawCompletedReadIdx := beatIndex(
+      axiReadAddr,
+      TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset,
+    )(completedBundleBeatIdxWidth - 1, 0)
+    axiRawCompletedReadEn := axiReadIssue && readRawCompleted
+    val axiAccessReadBits = accessReadDataBits
+    val axiIssuedReadBits = issuedAccessStreamEntryBits
+    val axiReservedReadBits = reservedStreamEntryBits
+    val axiBlockedReadBits = blockedWarpQueryReadBits
+    val axiCompletedReadBits = completedBundleStreamEntryBits
+
+    when(axiReadIssue) {
+      axiReadPending := true.B
+      axiReadPendingLast := axiReadLastIssue
+      axiReadRouteReg := MuxCase(
+        axiReadRouteNone,
+        Seq(
+          readRawAccess -> axiReadRouteAccess,
+          readRawIssued -> axiReadRouteIssued,
+          readRawReserved -> axiReadRouteReserved,
+          readRawBlocked -> axiReadRouteBlocked,
+          readRawCompleted -> axiReadRouteCompleted,
+        ),
+      )
+      axiReadAddr := axiReadAddr + bramBeatBytes.U
+      axiReadBeatsRemaining := axiReadBeatsRemaining - 1.U
+      when(axiReadLastIssue) {
+        axiReadActive := false.B
+      }
+    }
+
+    when(axiReadPending) {
+      axiReadDataReg := MuxLookup(
+        axiReadRouteReg,
+        0.U(L2Access.streamWidthBits.W),
+        Seq(
+          axiReadRouteAccess -> axiAccessReadBits,
+          axiReadRouteIssued -> axiIssuedReadBits,
+          axiReadRouteReserved -> Cat(0.U((L2Access.streamWidthBits - reservedSubPartitionEntryWidth).W), axiReservedReadBits),
+          axiReadRouteBlocked -> axiBlockedReadBits,
+          axiReadRouteCompleted -> axiCompletedReadBits.asUInt,
+        ),
+      )
+      axiReadLastReg := axiReadPendingLast
+      axiReadRespValid := true.B
+      axiReadPending := false.B
+    }
 
     // when the target advances the reservation window, it reports the last
     // cycle processed. Retire access buckets and reservation entries through
@@ -1119,6 +1414,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     when(accessStoreWriteEn) {
       accessStore.write(accessStoreWriteAddr, accessStoreWriteData)
+    }
+    when(issuedAccessWritebackStoreWriteEn) {
+      issuedAccessWritebackStore.write(issuedAccessWritebackStoreWriteAddr, issuedAccessWritebackStoreWriteData)
+    }
+    when(blockedWarpBitmapWriteEn) {
+      blockedWarpBitmap.write(blockedWarpBitmapWriteAddr, blockedWarpBitmapWriteData)
+    }
+    when(completedBundleIdsWriteEn) {
+      completedBundleIds.write(completedBundleIdsWriteAddr, completedBundleIdsWriteData, completedBundleIdsWriteMask)
     }
     when(nextPtrWriteEn) {
       nextPtr.write(nextPtrWriteAddr, nextPtrWriteData)
@@ -1302,12 +1606,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         "trafficgen_t",
         "trafficgen",
         Seq(
-          UInt32(toHostStreamIdx),
-          UInt32(toHostCPUQueueDepth),
-          UInt32(fromHostStreamIdx),
-          UInt32(fromHostCPUQueueDepth),
+          UInt64(bramBase),
+          UInt64(TrafficGenBRAMAddressMap.semanticAccessUploadOffset),
+          UInt64(TrafficGenBRAMAddressMap.semanticBlockedUploadOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawAccessStoreOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawReservedSubPartitionsOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset),
+          UInt64(accessWindowBytes),
+          UInt64(blockedWindowBytes),
+          UInt64(reservedWindowBytes),
+          UInt64(completedWindowBytes),
         ),
-        hasStreams = true,
       )
     }
   }

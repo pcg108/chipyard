@@ -1,6 +1,7 @@
 // See LICENSE for license details
 
 #include "trafficgen.h"
+#include "bridges/cpu_managed_stream.h"
 #include "core/simif.h"
 
 #include <arpa/inet.h>
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -37,6 +39,7 @@ namespace {
 
 constexpr std::uint16_t kGpuModelSocketPort = 50051;
 constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
+constexpr std::size_t kXDMABufferAlignment = 4096;
 
 struct ReservationsMessage {
   L2SubpartitionReservationsByCycle reservedSubpartitionsByCycle;
@@ -225,6 +228,78 @@ std::string errno_message(const std::string &prefix) {
   std::ostringstream oss;
   oss << prefix << ": " << std::strerror(errno);
   return oss.str();
+}
+
+std::string hex_u64(std::uint64_t value) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << value;
+  return oss.str();
+}
+
+struct FreeDeleter {
+  void operator()(std::uint8_t *ptr) const { std::free(ptr); }
+};
+
+using AlignedBytes = std::unique_ptr<std::uint8_t, FreeDeleter>;
+
+AlignedBytes make_aligned_bytes(std::size_t size) {
+  void *ptr = nullptr;
+  const int rc = posix_memalign(&ptr, kXDMABufferAlignment, size);
+  if (rc != 0) {
+    throw std::runtime_error("posix_memalign failed: " +
+                             std::string(std::strerror(rc)));
+  }
+  return AlignedBytes(static_cast<std::uint8_t *>(ptr));
+}
+
+void xdma_write_exact(CPUManagedStreamIO &xdma,
+                      std::uint64_t addr,
+                      const void *data,
+                      std::size_t size,
+                      const std::string &what) {
+  const auto failed = std::numeric_limits<std::size_t>::max();
+  const char *cursor = static_cast<const char *>(data);
+  std::size_t done = 0;
+  while (done < size) {
+    errno = 0;
+    const std::size_t written =
+        xdma.cpu_managed_axi4_write(addr + done, cursor + done, size - done);
+    if (written == failed) {
+      throw std::runtime_error(what + " failed at " + hex_u64(addr + done) +
+                               ": " + std::strerror(errno));
+    }
+    if (written == 0 || written > size - done) {
+      throw std::runtime_error(
+          what + " short write at " + hex_u64(addr + done) + ": " +
+          std::to_string(written) + " of " + std::to_string(size - done));
+    }
+    done += written;
+  }
+}
+
+void xdma_read_exact(CPUManagedStreamIO &xdma,
+                     std::uint64_t addr,
+                     void *data,
+                     std::size_t size,
+                     const std::string &what) {
+  const auto failed = std::numeric_limits<std::size_t>::max();
+  char *cursor = static_cast<char *>(data);
+  std::size_t done = 0;
+  while (done < size) {
+    errno = 0;
+    const std::size_t received =
+        xdma.cpu_managed_axi4_read(addr + done, cursor + done, size - done);
+    if (received == failed) {
+      throw std::runtime_error(what + " failed at " + hex_u64(addr + done) +
+                               ": " + std::strerror(errno));
+    }
+    if (received == 0 || received > size - done) {
+      throw std::runtime_error(
+          what + " short read at " + hex_u64(addr + done) + ": " +
+          std::to_string(received) + " of " + std::to_string(size - done));
+    }
+    done += received;
+  }
 }
 
 void create_directory_if_needed(const std::string &path) {
@@ -518,20 +593,35 @@ static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
 }
 
 trafficgen_t::trafficgen_t(simif_t &simif,
-                           StreamEngine &stream,
                            const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
                            int /*trafficgenno*/,
                            const std::vector<std::string> & /*args*/,
-                           int stream_to_host_idx,
-                           int stream_to_host_depth,
-                           int stream_from_host_idx,
-                           int stream_from_host_depth)
-    : streaming_bridge_driver_t(simif, stream, &KIND),
+                           uint64_t bram_base,
+                           uint64_t semantic_access_upload_offset,
+                           uint64_t semantic_blocked_upload_offset,
+                           uint64_t raw_access_store_offset,
+                           uint64_t raw_issued_access_writeback_store_offset,
+                           uint64_t raw_reserved_subpartitions_offset,
+                           uint64_t raw_blocked_warp_bitmap_offset,
+                           uint64_t raw_completed_bundle_ids_offset,
+                           uint64_t access_window_bytes,
+                           uint64_t blocked_window_bytes,
+                           uint64_t reserved_window_bytes,
+                           uint64_t completed_window_bytes)
+    : bridge_driver_t(simif, &KIND),
       mmio_addrs(mmio_addrs),
-      stream_to_host_idx(stream_to_host_idx),
-      stream_to_host_depth(stream_to_host_depth),
-      stream_from_host_idx(stream_from_host_idx),
-      stream_from_host_depth(stream_from_host_depth) {
+      bram_base(bram_base),
+      semantic_access_upload_offset(semantic_access_upload_offset),
+      semantic_blocked_upload_offset(semantic_blocked_upload_offset),
+      raw_access_store_offset(raw_access_store_offset),
+      raw_issued_access_writeback_store_offset(raw_issued_access_writeback_store_offset),
+      raw_reserved_subpartitions_offset(raw_reserved_subpartitions_offset),
+      raw_blocked_warp_bitmap_offset(raw_blocked_warp_bitmap_offset),
+      raw_completed_bundle_ids_offset(raw_completed_bundle_ids_offset),
+      access_window_bytes(access_window_bytes),
+      blocked_window_bytes(blocked_window_bytes),
+      reserved_window_bytes(reserved_window_bytes),
+      completed_window_bytes(completed_window_bytes) {
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
 }
@@ -556,8 +646,7 @@ void trafficgen_t::init() {
   min_issue_cycle = 0;
   l2_accesses.clear();
   blocked_warp_bitmap.fill(0);
-  upload_cursor = 0;
-  blocked_warp_bitmap_upload_cursor = 0;
+  upload_written_to_bram = false;
   upload_phase = trafficgen_upload_phase_t::done;
   round_completion_pause_issued = false;
   reserved_subpartitions_read_issued = false;
@@ -695,32 +784,26 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
     reserved_subpartitions_metadata_latched = true;
   }
 
-  // stop if we have read the full buffer
-  if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
+  if (reserved_subpartition_bytes_received >= reserved_window_bytes) {
     return 0;
   }
 
-  // Try to pull between 0 to remaining bytes into reserved_subpartitions_words
-  auto *snapshot_bytes = reinterpret_cast<uint8_t *>(reserved_subpartitions_words.data());  // pointer to byte array of reserved_subpartitions_words
-  const size_t remaining_bytes = STREAM_BATCH_BYTES - reserved_subpartition_bytes_received;
-  const auto bytes_received = pull(this->stream_to_host_idx,
-                                    snapshot_bytes + reserved_subpartition_bytes_received,
-                                    remaining_bytes,
-                                    0);
+  if (reserved_window_bytes != STREAM_BATCH_BYTES) {
+    throw std::runtime_error("TrafficGen reserved-subpartition BRAM window size mismatch");
+  }
 
-  // return if stream was empty, we overflowed the buffer, or we haven't received the full buffer yet                                 
-  if (bytes_received == 0) {
-    return 0;
-  }
-  if (bytes_received > remaining_bytes) {
-    std::cout << "[bridge driver] reservedSubPartitionsByCycle overrun: "
-              << "remaining=" << remaining_bytes
-              << " got=" << bytes_received << std::endl;
-    std::abort();
-  }
-  if (reserved_subpartition_bytes_received + bytes_received < STREAM_BATCH_BYTES) {
-    return bytes_received;
-  }
+  auto &xdma = simif.get_cpu_managed_stream_io();
+  auto snapshot_bytes = make_aligned_bytes(reserved_window_bytes);
+  xdma_read_exact(
+      xdma,
+      bram_base + raw_reserved_subpartitions_offset,
+      snapshot_bytes.get(),
+      reserved_window_bytes,
+      "XDMA read while reading reservedSubPartitionsByCycle");
+  std::memcpy(reserved_subpartitions_words.data(),
+              snapshot_bytes.get(),
+              reserved_window_bytes);
+  reserved_subpartition_bytes_received = reserved_window_bytes;
 
   // The stream buffer now holds the full streamed snapshot with one 256-bit
   // entry in the low half of each 512-bit beat; decode each logical cycle entry.
@@ -767,7 +850,7 @@ size_t trafficgen_t::process_reserved_subpartitions_stream() {
             << " baseIdx=" << reserved_subpartitions_base_idx
             << " baseCycle=" << reserved_subpartitions_base_cycle << std::endl;
 
-  return bytes_received;
+  return reserved_window_bytes;
 }
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
@@ -778,24 +861,21 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
     return 0;
   }
 
-  const size_t remaining_bytes = total_bytes - completed_bundle_bytes_received;
-  const auto bytes_received =
-      pull(this->stream_to_host_idx,
-           completed_bundle_stream_bytes.data() + completed_bundle_bytes_received,
-           remaining_bytes,
-           0);
-  if (bytes_received == 0) {
-    return 0;
+  if (completed_window_bytes < total_bytes) {
+    throw std::runtime_error("TrafficGen completed-bundle BRAM window is too small");
   }
-  if (bytes_received > remaining_bytes) {
-    std::cout << "[bridge driver] completedBundleIds overrun: remaining="
-              << remaining_bytes << " got=" << bytes_received << std::endl;
-    std::abort();
-  }
-  completed_bundle_bytes_received += bytes_received;
-  if (completed_bundle_bytes_received < total_bytes) {
-    return bytes_received;
-  }
+  auto &xdma = simif.get_cpu_managed_stream_io();
+  auto stream_bytes = make_aligned_bytes(total_bytes);
+  xdma_read_exact(
+      xdma,
+      bram_base + raw_completed_bundle_ids_offset,
+      stream_bytes.get(),
+      total_bytes,
+      "XDMA read while reading completedBundleIds");
+  std::memcpy(completed_bundle_stream_bytes.data(),
+              stream_bytes.get(),
+              total_bytes);
+  completed_bundle_bytes_received += total_bytes;
 
   std::memcpy(completed_bundle_ids.data(),
               completed_bundle_stream_bytes.data(),
@@ -815,7 +895,7 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
               << "]=" << completed_bundle_ids[i] << std::endl;
   }
 
-  return bytes_received;
+  return total_bytes;
 }
 
 size_t
@@ -835,25 +915,22 @@ trafficgen_t::process_issued_access_writeback_stream() {
     return 0;
   }
 
-  const size_t remaining_bytes = total_bytes - issued_access_writeback_bytes_received;
-  const auto bytes_received =
-      pull(this->stream_to_host_idx,
-           issued_access_writeback_stream_bytes.data() +
-               issued_access_writeback_bytes_received,
-           remaining_bytes,
-           0);
-  if (bytes_received == 0) {
-    return 0;
+  if (total_bytes > access_window_bytes) {
+    throw std::runtime_error("TrafficGen issued-access readback exceeds BRAM access window");
   }
-  if (bytes_received > remaining_bytes) {
-    std::cout << "[bridge driver] issuedAccessWriteback overrun: remaining="
-              << remaining_bytes << " got=" << bytes_received << std::endl;
-    std::abort();
-  }
-  issued_access_writeback_bytes_received += bytes_received;
-  if (issued_access_writeback_bytes_received < total_bytes) {
-    return bytes_received;
-  }
+  auto &xdma = simif.get_cpu_managed_stream_io();
+  auto stream_bytes = make_aligned_bytes(total_bytes);
+  xdma_read_exact(
+      xdma,
+      bram_base + raw_issued_access_writeback_store_offset,
+      stream_bytes.get(),
+      total_bytes,
+      "XDMA read while reading issuedAccessWriteback");
+  issued_access_writeback_stream_bytes.resize(total_bytes);
+  std::memcpy(issued_access_writeback_stream_bytes.data(),
+              stream_bytes.get(),
+              total_bytes);
+  issued_access_writeback_bytes_received += total_bytes;
 
   issued_access_writeback_entries.clear();
   issued_access_writeback_entries.reserve(issued_access_writeback_count);
@@ -866,96 +943,54 @@ trafficgen_t::process_issued_access_writeback_stream() {
 
   std::cout << "[bridge driver] issuedAccessWriteback count="
             << issued_access_writeback_count << std::endl;
-  return bytes_received;
+  return total_bytes;
+}
+
+void trafficgen_t::write_schedule_to_bram() {
+  if (upload_written_to_bram) {
+    return;
+  }
+
+  auto &xdma = simif.get_cpu_managed_stream_io();
+
+  const size_t access_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
+  if (access_bytes > access_window_bytes) {
+    throw std::runtime_error("TrafficGen L2 access upload exceeds BRAM access window");
+  }
+  if (access_bytes != 0) {
+    auto packed_accesses = make_aligned_bytes(access_bytes);
+    std::memset(packed_accesses.get(), 0, access_bytes);
+    auto *packed_words = reinterpret_cast<std::uint64_t *>(packed_accesses.get());
+    for (size_t i = 0; i < l2_accesses.size(); ++i) {
+      pack_l2_access(l2_accesses[i], packed_words + i * STREAM_WORDS_PER_BEAT);
+    }
+    xdma_write_exact(
+        xdma,
+        bram_base + semantic_access_upload_offset,
+        packed_accesses.get(),
+        access_bytes,
+        "XDMA write while uploading TrafficGen L2 accesses");
+  }
+
+  const size_t bitmap_bytes = BLOCKED_WARP_BITMAP_BEATS * STREAM_WIDTH_BYTES;
+  if (bitmap_bytes > blocked_window_bytes) {
+    throw std::runtime_error("TrafficGen blocked-warp upload exceeds BRAM bitmap window");
+  }
+  auto bitmap_upload = make_aligned_bytes(bitmap_bytes);
+  std::memcpy(bitmap_upload.get(), blocked_warp_bitmap.data(), bitmap_bytes);
+  xdma_write_exact(
+      xdma,
+      bram_base + semantic_blocked_upload_offset,
+      bitmap_upload.get(),
+      bitmap_bytes,
+      "XDMA write while uploading TrafficGen blocked-warp bitmap");
+
+  upload_written_to_bram = true;
+  upload_phase = trafficgen_upload_phase_t::done;
 }
 
 void trafficgen_t::push_upload_data() {
-
-  /*
-    L2 accesses: a vector of L2 access structs
-    blocked warps: bitmap with 1 bit per warp tuple (SM, scheduler, warp id), stored as an array of 64-bit integers, with each bit representing whether the corresponding warp tuple is blocked
-  */
-
-
-  if (upload_phase == trafficgen_upload_phase_t::done) {
-    return;
-  }
-
-  // first upload the L2 access pattern
-  if (upload_phase == trafficgen_upload_phase_t::l2_accesses) {
-
-    // we are sending 1 l2 access per 512-bit stream beat 
-    const size_t total_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
-
-    // move on when all access uploaded
-    if (upload_cursor >= total_bytes) {
-      upload_phase = trafficgen_upload_phase_t::blocked_warp_bitmap;
-      return;
-    }
-
-    // find which l2_accesses entry contains the next unsent byte
-    const size_t entry_index = upload_cursor / L2_ACCESS_STREAM_BYTES;
-    // how far into that entry the next unsent byte is
-    const size_t entry_byte_offset = upload_cursor % L2_ACCESS_STREAM_BYTES;
-    // how much of the whole L2 access upload is still unsent 
-    const size_t remaining_bytes = total_bytes - upload_cursor;
-
-    // figure out how many whole entries we can pack into the next stream chunk given unsent byte offset and stream depth
-    const size_t chunk_bytes = std::min(remaining_bytes, static_cast<size_t>(stream_from_host_depth) * L2_ACCESS_STREAM_BYTES);
-    const size_t packed_bytes = entry_byte_offset + chunk_bytes;
-    const size_t chunk_entries = (packed_bytes + L2_ACCESS_STREAM_BYTES - 1) / L2_ACCESS_STREAM_BYTES;
-
-    // Pack enough whole entries to cover the byte range we still need to stream.
-    std::vector<uint64_t> inbuf(chunk_entries * 8, 0);
-    auto *words = inbuf.data();
-
-    // pack the chunk of L2 accesses starting from the entry containing the next unsent byte
-    for (size_t i = 0; i < chunk_entries; ++i) {
-      pack_l2_access(l2_accesses[entry_index + i], words + (i * 8));
-    }
-
-    // send bytes from entry_byte_offset onwards
-    auto *chunk_start = reinterpret_cast<uint8_t *>(inbuf.data()) + entry_byte_offset;
-    const auto bytes_pushed = push(stream_from_host_idx, chunk_start, chunk_bytes, 0);
-    upload_cursor += bytes_pushed;
-
-    // if we sent all of them, move on to blocked warp bitmap
-    if (upload_cursor >= total_bytes) {
-      upload_phase = trafficgen_upload_phase_t::blocked_warp_bitmap;
-    }
-    return;
-  }
-
-  // next upload the blocked warp bitmap
-  if (upload_phase == trafficgen_upload_phase_t::blocked_warp_bitmap) {
-
-    // blocked warp bitmap is just a simple byte stream of the bitmap array, since each index corresponds to a specific warp 
-    const size_t total_bytes = BLOCKED_WARP_BITMAP_BEATS * STREAM_WIDTH_BYTES;
-
-    // complete when all accesses uploaded
-    if (blocked_warp_bitmap_upload_cursor >= total_bytes) {
-      upload_phase = trafficgen_upload_phase_t::done;
-      return;
-    }
-
-    const size_t remaining_bytes = total_bytes - blocked_warp_bitmap_upload_cursor;
-    const size_t chunk_bytes = std::min(
-        remaining_bytes,
-        static_cast<size_t>(stream_from_host_depth) * STREAM_WIDTH_BYTES);
-
-    auto *bitmap_bytes = reinterpret_cast<uint8_t *>(blocked_warp_bitmap.data());
-    const auto bytes_pushed =
-        push(stream_from_host_idx,
-             bitmap_bytes + blocked_warp_bitmap_upload_cursor,
-             chunk_bytes,
-             0);
-    blocked_warp_bitmap_upload_cursor += bytes_pushed;
-
-    // complete when all beats sent
-    if (blocked_warp_bitmap_upload_cursor >= total_bytes) {
-      upload_phase = trafficgen_upload_phase_t::done;
-    }
-  }
+  write_schedule_to_bram();
 }
 
 void trafficgen_t::tick() {
@@ -976,7 +1011,6 @@ void trafficgen_t::tick() {
         break;
       }
 
-      // trigger bridge module to send reservedSubPartitionsByCycle by stream
       reserved_subpartition_bytes_received = 0;
       reserved_subpartitions_metadata_latched = false;
       reserved_subpartitions_base_idx = 0;
@@ -991,16 +1025,10 @@ void trafficgen_t::tick() {
     break;
   case trafficgen_state_t::READ_RESERVED_PARTITIONS:
 
-    // trigger bridge module to send reservedSubPartitionsByCycle by stream
-    if (!reserved_subpartitions_read_issued) {
-      write(mmio_addrs.read_reserved_subpartitions, 1);
-      reserved_subpartitions_read_issued = true;
-    }
-  
-    // read from stream until we have received the full reservedSubPartitionByCycle bitmap
+    // read reservedSubPartitionByCycle bitmap directly through XDMA
     reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
-    if (reserved_subpartition_bytes_received >= STREAM_BATCH_BYTES) {
-      std::cout << "[bridge driver] completed reading reservedSubPartitionsByCycle stream data, bytes received="
+    if (reserved_subpartition_bytes_received >= reserved_window_bytes) {
+      std::cout << "[bridge driver] completed reading reservedSubPartitionsByCycle BRAM data, bytes received="
                 << reserved_subpartition_bytes_received << std::endl;
       
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
@@ -1009,9 +1037,8 @@ void trafficgen_t::tick() {
       // read the L2 access schedule, blocked warp IDs, and min issue cycle from gpu_model via socket
       receive_schedule_from_gpu_model();
 
-      // Reset upload progress and kick off host->target streaming.
-      upload_cursor = 0;
-      blocked_warp_bitmap_upload_cursor = 0;
+      // Reset upload progress and kick off host->target BRAM upload.
+      upload_written_to_bram = false;
       upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
                                          : trafficgen_upload_phase_t::l2_accesses;
       write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
@@ -1028,7 +1055,7 @@ void trafficgen_t::tick() {
     break;
   case trafficgen_state_t::UPLOAD_SCHEDULE:
 
-    // write schedule and blocked warp bitmap to bridge module via stream
+    // write schedule and blocked warp bitmap to bridge module via XDMA
     push_upload_data();
 
     if (upload_phase == trafficgen_upload_phase_t::done &&
@@ -1077,9 +1104,6 @@ void trafficgen_t::tick() {
         issued_access_writeback_stream_bytes.assign(static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES, 0);
         issued_access_writeback_bytes_received = 0;
         issued_access_writeback_entries.clear();
-        if (issued_access_writeback_count != 0) {
-          write(mmio_addrs.read_issued_access_writeback, 1);
-        }
         issued_access_writeback_read_issued = true;
       }
       if (issued_access_writeback_bytes_received < static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES) {
@@ -1093,7 +1117,6 @@ void trafficgen_t::tick() {
       if (!completed_bundle_read_issued) {
         completed_bundle_stream_bytes.fill(0);
         completed_bundle_bytes_received = 0;
-        write(mmio_addrs.read_completed_bundle_ids, 1);
         completed_bundle_read_issued = true;
       }
       if (completed_bundle_bytes_received < COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES) {
@@ -1174,6 +1197,4 @@ void trafficgen_t::tick() {
   }
 }
 
-void trafficgen_t::finish() {
-  pull_flush(stream_to_host_idx);
-}
+void trafficgen_t::finish() {}
