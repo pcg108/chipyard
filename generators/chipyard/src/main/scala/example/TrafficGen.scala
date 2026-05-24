@@ -26,7 +26,7 @@ case class TrafficGenParams(
   size: BigInt = 500000000L,
   numGenerators: Int = 1,
   regionStride: BigInt = 0x400000L,
-  maxL2AccessEntries: Int = 32768, // 262144, // 2^18
+  maxL2AccessEntries: Int = 262144, // 262144, // 2^18
   memOutstanding: Int = 4,
   accessReadResponseDepth: Int = 1024,
   backend: TrafficGenBackend = TrafficGenDPIBackend,
@@ -740,8 +740,27 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     // state to read accesses for current model cycle
     is(sRead) {
 
-      when(readReqPending) { // if we have a pending read request, wait for it to be accepted and set read enable
-        when(io.accessReadReady && !accessReadRequestActive && !io.accessReadDataValid && !io.accessReadBucketDone) {
+      when(accessReadResponseQueue.io.deq.valid) {
+        accessReadResponseQueue.io.deq.ready := true.B
+        // Latch the buffered access before servicing more read-request bookkeeping.
+        // The bridge can deliver the final access just after bucket done is observed.
+        pendingIssue := accessReadResponseDeqAccess
+        pendingIssueValid := true.B
+        state := sIssue
+      }.elsewhen(pendingAccessReadBucketDone && !bucketDoneSeen && !enqueueNewAccessReadData) {
+        // A bucket-done response completes the active read request. Retire it
+        // before the read-pending path can keep reasserting accessReadEn.
+        bucketDoneSeen := true.B
+        pendingAccessReadBucketDone := false.B
+        readReqPending := false.B
+        accessReadRequestActive := false.B
+        // advance the reservation window to retire the old bucket
+        io.reservationWindowAdvanceCycle := modelCycle
+        io.reservationWindowAdvanceEn := true.B
+      }.elsewhen(readReqPending) { // if we have a pending read request, keep it asserted until the bridge returns a response
+        when(accessReadRequestActive) {
+          io.accessReadEn := true.B
+        }.elsewhen(io.accessReadReady && !io.accessReadDataValid && !io.accessReadBucketDone) {
           io.accessReadEn := true.B
           accessReadRequestActive := true.B
           accessReadDataConsumed := false.B
@@ -752,27 +771,13 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
           readReqPending := false.B
         }
       }.elsewhen(!bucketDoneSeen) { // we are still processing a current cycle bucket
-        // dequeue an accepted access from the access read response queue and use it in issue
-        when(accessReadResponseQueue.io.deq.valid) {
-          accessReadResponseQueue.io.deq.ready := true.B
-          // latch the new access and go to issue
-          pendingIssue := accessReadResponseDeqAccess
-          pendingIssueValid := true.B
-          state := sIssue
-        }.elsewhen(pendingAccessReadBucketDone) {
-          // note that the bucket completed for round completion checks after we drain the bucket
-          bucketDoneSeen := true.B
-          pendingAccessReadBucketDone := false.B
-          // advance the reservation window to retire the old bucket
-          io.reservationWindowAdvanceCycle := modelCycle
-          io.reservationWindowAdvanceEn := true.B
-        }.otherwise {
-          readReqPending := true.B
-        }
+        readReqPending := true.B
       }.elsewhen(pendingAccessReadBucketDone) {
         // A duplicate bucket-done response may be acknowledged after the bucket was
         // already marked complete; do not let it block the drain condition.
         pendingAccessReadBucketDone := false.B
+        readReqPending := false.B
+        accessReadRequestActive := false.B
       }.elsewhen(bucketDrained) { // cycle bucket fully issued 
         // Preserve the original bucket-boundary behavior: returned completions are
         // retired before evaluating whether the next model cycle can begin.
