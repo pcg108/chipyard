@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -28,6 +29,8 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t reserved_subpartitions_base_cycle_low;
   uint64_t reserved_subpartitions_base_cycle_high;
   uint64_t upload_count;
+  uint64_t access_store_max_cycle_low;
+  uint64_t access_store_max_cycle_high;
   uint64_t upload_start;
   uint64_t round_complete;
   uint64_t upload_done;
@@ -53,6 +56,8 @@ struct trafficgen_l2_access_t {
   uint64_t id;
   uint64_t address;
   uint64_t cycle_count;
+  uint64_t l1_to_l2_cycle;
+  uint64_t elapsed_cycle;
   uint32_t m_subpartition;
   uint32_t m_set_index;
   uint64_t m_tag;
@@ -161,7 +166,17 @@ private:
   const uint64_t reserved_window_bytes;
   const uint64_t completed_window_bytes;
   std::uint64_t min_issue_cycle = 0;
+  double memory_issue_stretch_scale = 1.0;
+  bool has_first_issue_cycle = false;
+  std::uint64_t first_issue_cycle = 0;
+  std::string trace_root;
+  std::string kernel_name;
   std::vector<trafficgen_l2_access_t> l2_accesses;
+  std::map<std::uint64_t, std::vector<trafficgen_l2_access_t>>
+      pending_accesses_by_cycle;
+  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
+  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_l1_to_l2_by_id;
+  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_elapsed_by_id;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
   std::array<uint64_t, STREAM_BATCH_BEATS * STREAM_WORDS_PER_BEAT>
       reserved_subpartitions_words{};
@@ -200,6 +215,9 @@ private:
   bool receive_main_loop_complete_from_gpu_model() const;
   void send_reserved_subpartitions_snapshot() const;
   void receive_schedule_from_gpu_model();
+  void rebuild_flat_l2_accesses_from_pending();
+  void rebuild_reserved_subpartitions_from_pending();
+  void depopulate_processed_accesses(std::uint64_t current_cycle_after_issue);
 
   bool trafficGenActive = false;
 };

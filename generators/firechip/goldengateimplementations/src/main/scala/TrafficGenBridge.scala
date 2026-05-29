@@ -218,7 +218,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // current physical ring buffer index being cleared 
     val reservationClearSweepIdx = RegInit(0.U(reservedSubPartitionIdxWidth.W)) 
     // how many entries we still need to clear 
-    val reservationClearSweepRemaining = RegInit(reservedSubPartitionEntries.U(reservationClearSweepCountWidth.W)) 
+    val reservationClearSweepRemaining = RegInit(0.U(reservationClearSweepCountWidth.W))
     // sweep-in-progress signal 
     val reservationClearSweepActive = reservationClearSweepRemaining =/= 0.U
 
@@ -591,7 +591,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // SyncReadMem contents are undefined after reset. Initialize the bucket
     // metadata to the invalid sentinel before accepting uploads or target reads.
     val bucketMetadataClearSweepIdx = RegInit(0.U(reservedSubPartitionIdxWidth.W))
-    val bucketMetadataClearSweepRemaining = RegInit(reservedSubPartitionEntries.U(reservationClearSweepCountWidth.W))
+    val bucketMetadataClearSweepRemaining = RegInit(0.U(reservationClearSweepCountWidth.W))
     val bucketMetadataClearSweepActive = bucketMetadataClearSweepRemaining =/= 0.U
 
     // state machine to retire completed cycle buckets and free their access store entries
@@ -644,6 +644,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val uploadStart = Wire(Bool())
     // written by bridge driver to indicate how many L2 accesses we are uploading
     val uploadCount = RegInit(0.U(32.W))
+    val uploadMaxCycleLow = RegInit(0.U(32.W))
+    val uploadMaxCycleHigh = RegInit(0.U(32.W))
+    val uploadMaxCycle = Cat(uploadMaxCycleHigh, uploadMaxCycleLow)
     // count of L2 accesses uploaded so far
     val uploadRecvCount = RegInit(0.U(32.W))
     // indicate currently uploading L2 accesses and blocked warps
@@ -666,18 +669,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // initial state for uploading
     when(uploadStart) {
-      uploadActive := true.B
-      uploadDone := uploadCount === 0.U
-      uploadRecvCount := 0.U
+      uploadActive := false.B
+      uploadDone := true.B
+      uploadRecvCount := uploadCount
       uploadOverflow := false.B
 
-      blockedWarpUploadDone := false.B
+      blockedWarpUploadDone := true.B
       blockedWarpBeatCount := 0.U
 
       accessReadReset := true.B
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
-      uploadPhase := Mux(uploadCount === 0.U, uploadPhaseBlockedWarpBitmap, uploadPhaseL2Accesses)
+      uploadPhase := uploadPhaseIdle
+      accessStoreCount := uploadCount
+      accessStoreMaxCycle := uploadMaxCycle
+      accessStoreHasEntries := uploadCount =/= 0.U
     }
 
     // unpack the incoming stream beat into L2 access information
@@ -758,8 +764,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // if we are updating reservation for upload, it is a set, otherwise it is a clear 
     val issueUploadReservation = streamDeq.fire && uploadPhase === uploadPhaseL2Accesses &&
       uploadReservationInWindow && canAllocateAccessIdx
-    val issueClearReservation = !reservationUpdaterBusy && !issueUploadReservation && clearStreamValid
-    target.reservationClear.ready := issueClearReservation
+    val issueClearReservation = false.B
+    target.reservationClear.ready := true.B
 
     //// do reservation table updates for uploads and clears (used up where we get reservationUpdateReadBits)
     // if the upload reservation is in the window, we can latch the update to the reservation table 
@@ -924,18 +930,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
      * Respond to traffic-generator queries for accesses and blocked warps, then retire completed cycle buckets.
      */
 
-    // target requests one logical cycle bucket at a time. The bridge walks the
-    // linked list for that bucket and then returns an explicit bucket-done.
+    // target requests one logical cycle bucket at a time. The bridge scans a
+    // flat accessStore sorted by cycleCount and returns each matching entry,
+    // followed by an explicit bucket-done. A one-entry peek buffer preserves
+    // the first future-cycle access for the next request.
     val accessReadDataReg = Reg(new L2Access)
     val accessReadDataValidReg = RegInit(false.B)
     val accessReadBucketDoneReg = RegInit(false.B)
     val accessReadReadyReg = RegInit(true.B)
-    val accessReadHeadPending = RegInit(false.B)
-    val accessReadEntryPending = RegInit(false.B)
-    val accessReadNextIdxReg = Reg(UInt(accessIdxWidth.W))
-    val accessReadHeadIdx = WireDefault(0.U(reservedSubPartitionIdxWidth.W))
-    val accessReadHeadEn = WireDefault(false.B)
-    val accessReadHeadBits = cycleHead.read(accessReadHeadIdx, accessReadHeadEn)
+    val accessReadServingReg = RegInit(false.B)
+    val accessReadReqCycleReg = Reg(UInt(64.W))
+    val accessReadCursor = RegInit(0.U(accessIdxWidth.W))
+    val accessReadPeekBitsReg = Reg(UInt(L2Access.streamWidthBits.W))
+    val accessReadPeekValidReg = RegInit(false.B)
+    val accessReadFetchPending = RegInit(false.B)
+    val accessReadWaitForEnLow = RegInit(false.B)
     val accessReadEntryIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessReadEntryEn = WireDefault(false.B)
     val axiRawAccessReadIdx = WireDefault(0.U(accessIdxWidth.W))
@@ -944,76 +953,79 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       Mux(axiRawAccessReadEn, axiRawAccessReadIdx, accessReadEntryIdx),
       accessReadEntryEn || axiRawAccessReadEn,
     )
-    val accessReadData = L2Access.unpack(accessReadDataBits)
-    val accessReadNextPtr = nextPtr.read(accessReadEntryIdx, accessReadEntryEn)
-    val (accessReadCycleInWindow, accessReadCycleIdx) = reservationWindowLookup(target.accessReadCycle)
+    val accessReadPeekData = L2Access.unpack(accessReadPeekBitsReg)
     val accessReadCanAccept = accessReadReadyReg &&
-      !accessReadHeadPending &&
-      !accessReadEntryPending &&
+      !accessReadServingReg &&
+      !accessReadFetchPending &&
       !accessReadDataValidReg &&
       !accessReadBucketDoneReg &&
-      !bucketMetadataClearSweepActive &&
-      !accessRetireActive &&
+      !accessReadWaitForEnLow &&
       !baseAdvancePending
     val accessReadReq = fire && target.accessReadEn && accessReadCanAccept
     val accessReadDataFire = fire && accessReadDataValidReg && target.accessReadDataReady
     val accessReadBucketDoneFire = fire && accessReadBucketDoneReg && target.accessReadBucketDoneReady
 
-    // upon receiving a read request, first check if requested cycle is in the window, and if so, read the bucket head
     when(accessReadReq) {
       accessReadReadyReg := false.B
+      accessReadServingReg := true.B
+      accessReadReqCycleReg := target.accessReadCycle
       accessReadDataValidReg := false.B
       accessReadBucketDoneReg := false.B
-      when(accessReadCycleInWindow) {
-        accessReadHeadIdx := accessReadCycleIdx
-        accessReadHeadEn := true.B
-        accessReadHeadPending := true.B
-      }.otherwise {
-        accessReadBucketDoneReg := true.B
-      }
+      accessReadWaitForEnLow := true.B
     }
-    // get the head access entry for this cycle bucket, and indicate we have a pending read of an access entry
-    // the next pointer read is done in parallel
-    when(accessReadHeadPending) {
-      accessReadHeadPending := false.B
-      when(accessReadHeadBits === invalidAccessIdx) {
-        accessReadBucketDoneReg := true.B
-      }.otherwise {
-        accessReadEntryIdx := accessReadHeadBits
+
+    when(fire && !target.accessReadEn) {
+      accessReadWaitForEnLow := false.B
+    }
+
+    when(accessReadServingReg &&
+      !accessReadFetchPending &&
+      !accessReadDataValidReg &&
+      !accessReadBucketDoneReg) {
+      when(accessReadPeekValidReg) {
+        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
+          "TrafficGen flat accessStore returned stale/unsorted access")
+        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
+          accessReadDataReg := accessReadPeekData
+          accessReadDataValidReg := true.B
+          accessReadPeekValidReg := false.B
+          accessReadCursor := accessReadCursor + 1.U
+        }.otherwise {
+          accessReadBucketDoneReg := true.B
+        }
+      }.elsewhen(accessReadCursor < accessStoreCount) {
+        accessReadEntryIdx := accessReadCursor
         accessReadEntryEn := true.B
-        accessReadNextIdxReg := accessReadHeadBits
-        accessReadEntryPending := true.B
+        accessReadFetchPending := true.B
+      }.otherwise {
+        accessReadBucketDoneReg := true.B
       }
     }
-    // latch the access entry data for the head and the pointer to the next entry in the bucket linked list 
-    // and indicate valid to the target 
-    when(accessReadEntryPending) {
-      accessReadDataReg := accessReadData
-      accessReadNextIdxReg := accessReadNextPtr
-      accessReadDataValidReg := true.B
-      accessReadEntryPending := false.B
+
+    when(accessReadFetchPending) {
+      accessReadPeekBitsReg := accessReadDataBits
+      accessReadPeekValidReg := true.B
+      accessReadFetchPending := false.B
     }
-    // when the target accepts the data, issue the next read for the next entry, or indicate the bucket is done 
+
     when(accessReadDataFire) {
       accessReadDataValidReg := false.B
-      when(accessReadNextIdxReg === invalidAccessIdx) {
-        accessReadBucketDoneReg := true.B
-      }.otherwise {
-        accessReadEntryIdx := accessReadNextIdxReg
-        accessReadEntryEn := true.B
-        accessReadEntryPending := true.B
-      }
     }
-    // when the bucket is done and the target accepts the bucket-done signal, we can mark ready for the next read request
+
     when(accessReadBucketDoneFire) {
       accessReadBucketDoneReg := false.B
+      accessReadServingReg := false.B
       accessReadReadyReg := true.B
     }
+
     // reset signals 
     when(accessReadReset) {
       accessReadReadyReg := true.B
-      accessReadHeadPending := false.B
-      accessReadEntryPending := false.B
+      accessReadServingReg := false.B
+      accessReadCursor := 0.U
+      accessReadPeekValidReg := false.B
+      accessReadFetchPending := false.B
+      accessReadWaitForEnLow := false.B
       accessReadDataValidReg := false.B
       accessReadBucketDoneReg := false.B
     }
@@ -1294,9 +1306,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       axiReadPending := false.B
     }
 
-    // when the target advances the reservation window, it reports the last
-    // cycle processed. Retire access buckets and reservation entries through
-    // that cycle before sliding the physical cycle window forward.
+    // When the target advances the reservation window, it reports the last
+    // cycle processed. The host now rebuilds and uploads the complete flat
+    // access store for pending accesses, so window advance only slides the
+    // logical base and drops the store when all uploaded accesses are known
+    // to be behind the target.
     when(
       reservationWindowAdvanceEn &&
       reservationWindowAdvanceCycle >= reservedSubPartitionsBaseCycle &&
@@ -1311,21 +1325,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       val clampedDelta = Mux(cycleDelta >= reservedSubPartitionEntries.U, reservedSubPartitionEntries.U, cycleDelta)
       // compute next physical ring buffer index for reservation/access window base
       val nextBaseIdxWide = reservedSubPartitionsBaseIdx +& clampedDelta(reservedSubPartitionIdxWidth - 1, 0)
-      pendingBaseIdx := Mux(
+      reservedSubPartitionsBaseIdx := Mux(
         nextBaseIdxWide >= reservedSubPartitionEntries.U,
         nextBaseIdxWide - reservedSubPartitionEntries.U,
         nextBaseIdxWide,
       )(reservedSubPartitionIdxWidth - 1, 0)
-      pendingBaseCycle := nextReservationBaseCycle
-      baseAdvancePending := true.B
-      // track how many cycles need to be retired based on how much we are advancing the window, and start retiring from the current base index
-      // for both accesses and reservation entries
-      accessRetireCycleIdx := reservedSubPartitionsBaseIdx
-      accessRetireRemaining := clampedDelta(reservedSubPartitionIdxWidth, 0)
-      accessRetireState := accessRetireReadHead
-      reservationClearSweepIdx := reservedSubPartitionsBaseIdx
-      reservationClearSweepRemaining := clampedDelta(reservationClearSweepCountWidth - 1, 0)
+      reservedSubPartitionsBaseCycle := nextReservationBaseCycle
+      baseAdvancePending := false.B
+      reservationClearSweepRemaining := 0.U
       when(accessStoreHasEntries && accessStoreMaxCycle <= reservationWindowAdvanceCycle) {
+        accessStoreCount := 0.U
         accessStoreHasEntries := false.B
         accessStoreMaxCycle := 0.U
       }
@@ -1494,17 +1503,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       reservedStreamDataValid := false.B
       reservedStreamStartPending := false.B
       reservationClearSweepIdx := 0.U
-      reservationClearSweepRemaining := reservedSubPartitionEntries.U
+      reservationClearSweepRemaining := 0.U
       issuedAccessStreamReadPending := false.B
       issuedAccessStreamDataValid := false.B
       completedBundleStreamReadPending := false.B
       completedBundleStreamDataValid := false.B
       reservationUpdateReadPending := false.B
       bucketMetadataClearSweepIdx := 0.U
-      bucketMetadataClearSweepRemaining := reservedSubPartitionEntries.U
+      bucketMetadataClearSweepRemaining := 0.U
       accessReadReadyReg := true.B
-      accessReadHeadPending := false.B
-      accessReadEntryPending := false.B
+      accessReadServingReg := false.B
+      accessReadCursor := 0.U
+      accessReadPeekValidReg := false.B
+      accessReadFetchPending := false.B
       accessReadDataValidReg := false.B
       accessReadBucketDoneReg := false.B
       blockedWarpQueryReadyReg := true.B
@@ -1523,6 +1534,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreCount := 0.U
       accessStoreMaxCycle := 0.U
       accessStoreHasEntries := false.B
+      uploadMaxCycleLow := 0.U
+      uploadMaxCycleHigh := 0.U
       completedBundleCount := 0.U
       completedBundleIdsValid := true.B
       completedBundleCountValid := true.B
@@ -1561,6 +1574,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // bridge driver triggers to start sending L2 Accesses and blocked warp bitmap to the bridge module
     genWORegInit(uploadCount, "upload_count", 0.U)
+    genWORegInit(uploadMaxCycleLow, "access_store_max_cycle_low", 0.U)
+    genWORegInit(uploadMaxCycleHigh, "access_store_max_cycle_high", 0.U)
     Pulsify(genWORegInit(uploadStart, "upload_start", false.B), pulseLength = 1)
 
     genROReg(roundCompleteLatched, "round_complete")

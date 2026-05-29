@@ -18,16 +18,20 @@
 #include <cassert>
 #include <cinttypes>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -40,6 +44,9 @@ namespace {
 constexpr std::uint16_t kGpuModelSocketPort = 50051;
 constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
 constexpr std::size_t kXDMABufferAlignment = 4096;
+constexpr const char *kDefaultTraceFolder =
+    "/home/prashanth/gpu_model/accel-sim-data-rodinia_nn";
+constexpr const char *kDefaultKernelName = "kernel_1__Z6euclidPcffPfiii";
 
 struct ReservationsMessage {
   L2SubpartitionReservationsByCycle reservedSubpartitionsByCycle;
@@ -357,6 +364,124 @@ void log_socket_round_inputs_for_compare(
             << " blocked_warps=" << blocked_warp_ids.size() << std::endl;
 }
 
+std::string plusarg_value(const std::vector<std::string> &args,
+                          const std::string &key) {
+  const std::string prefix = "+" + key + "=";
+  for (const auto &arg : args) {
+    if (arg.rfind(prefix, 0) == 0) {
+      return arg.substr(prefix.size());
+    }
+  }
+  return "";
+}
+
+std::filesystem::path normalize_trace_root(std::filesystem::path trace_folder) {
+  std::error_code ec;
+  if (trace_folder.filename() == "l2_trace") {
+    const auto canonical = std::filesystem::weakly_canonical(trace_folder, ec);
+    return ec ? trace_folder.lexically_normal() : canonical;
+  }
+
+  const auto l2_trace_path = trace_folder / "l2_trace";
+  if (std::filesystem::exists(l2_trace_path, ec) &&
+      std::filesystem::is_directory(l2_trace_path, ec)) {
+    const auto canonical =
+        std::filesystem::weakly_canonical(l2_trace_path, ec);
+    return ec ? l2_trace_path.lexically_normal() : canonical;
+  }
+
+  const auto canonical = std::filesystem::weakly_canonical(trace_folder, ec);
+  return ec ? trace_folder.lexically_normal() : canonical;
+}
+
+struct trafficgen_runtime_config_t {
+  std::filesystem::path trace_root;
+  std::string kernel_name;
+};
+
+trafficgen_runtime_config_t parse_runtime_config(
+    const std::vector<std::string> &args) {
+  std::string trace_folder = plusarg_value(args, "trafficgen-trace-folder");
+  if (trace_folder.empty()) {
+    trace_folder = plusarg_value(args, "trafficgen-trace-root");
+  }
+  if (trace_folder.empty()) {
+    trace_folder = kDefaultTraceFolder;
+  }
+
+  std::string kernel_name = plusarg_value(args, "trafficgen-kernel");
+  if (kernel_name.empty()) {
+    kernel_name = kDefaultKernelName;
+  }
+
+  return {normalize_trace_root(trace_folder), kernel_name};
+}
+
+std::map<std::uint64_t, int> load_timing_data(
+    const std::filesystem::path &timing_path) {
+  std::map<std::uint64_t, int> timings;
+  std::ifstream input(timing_path);
+  if (!input.is_open()) {
+    return timings;
+  }
+
+  std::string line;
+  while (std::getline(input, line)) {
+    std::unordered_map<std::string, std::string> fields;
+    std::istringstream stream(line);
+    std::string token;
+    while (stream >> token) {
+      const std::size_t equal_pos = token.find('=');
+      if (equal_pos == std::string::npos || equal_pos + 1 >= token.size()) {
+        continue;
+      }
+      fields[token.substr(0, equal_pos)] = token.substr(equal_pos + 1);
+    }
+
+    const auto request_uid_it = fields.find("request_uid");
+    const auto elapsed_it = fields.find("elapsed_cycle");
+    if (request_uid_it == fields.end() || elapsed_it == fields.end()) {
+      continue;
+    }
+
+    const auto request_uid = static_cast<std::uint64_t>(
+        std::strtoull(request_uid_it->second.c_str(), nullptr, 0));
+    const int elapsed_cycle = std::atoi(elapsed_it->second.c_str());
+    timings[request_uid] = elapsed_cycle;
+  }
+
+  return timings;
+}
+
+bool find_access_time(const trafficgen_runtime_config_t &config,
+                      const trafficgen_l2_access_t &access,
+                      int &access_time) {
+  using scheduler_key_t = std::tuple<std::string, std::string, std::uint32_t, std::uint32_t>;
+  static std::map<scheduler_key_t, std::map<std::uint64_t, int>> cache;
+
+  const scheduler_key_t key{
+      config.trace_root.string(),
+      config.kernel_name,
+      access.sm_id,
+      static_cast<std::uint32_t>(access.scheduler_id)};
+  auto found = cache.find(key);
+  if (found == cache.end()) {
+    const auto timing_path =
+        config.trace_root / config.kernel_name /
+        ("shader_" + std::to_string(access.sm_id)) /
+        ("scheduler_" + std::to_string(static_cast<unsigned>(access.scheduler_id))) /
+        "l2_to_icnt_timing.txt";
+    found = cache.emplace(key, load_timing_data(timing_path)).first;
+  }
+
+  const auto timing_it = found->second.find(access.id);
+  if (timing_it == found->second.end()) {
+    return false;
+  }
+  access_time = timing_it->second;
+  return true;
+}
+
 std::uint64_t host_to_network_64(std::uint64_t value) {
   const std::uint32_t high =
       htonl(static_cast<std::uint32_t>(value >> 32));
@@ -595,7 +720,7 @@ static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
 trafficgen_t::trafficgen_t(simif_t &simif,
                            const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
                            int /*trafficgenno*/,
-                           const std::vector<std::string> & /*args*/,
+                           const std::vector<std::string> &args,
                            uint64_t bram_base,
                            uint64_t semantic_access_upload_offset,
                            uint64_t semantic_blocked_upload_offset,
@@ -624,6 +749,14 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       completed_window_bytes(completed_window_bytes) {
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
+  const std::string stretch_scale =
+      plusarg_value(args, "trafficgen-memory-issue-stretch-scale");
+  if (!stretch_scale.empty()) {
+    memory_issue_stretch_scale = std::max(std::strtod(stretch_scale.c_str(), nullptr), 1e-9);
+  }
+  const auto runtime_config = parse_runtime_config(args);
+  trace_root = runtime_config.trace_root.string();
+  kernel_name = runtime_config.kernel_name;
 }
 
 trafficgen_t::~trafficgen_t() = default;
@@ -644,7 +777,13 @@ void trafficgen_t::init() {
   reserved_subpartition_bytes_received = 0;
   reserved_subpartitions_metadata_latched = false;
   min_issue_cycle = 0;
+  has_first_issue_cycle = false;
+  first_issue_cycle = 0;
   l2_accesses.clear();
+  pending_accesses_by_cycle.clear();
+  pending_access_cycle_by_id.clear();
+  pending_access_l1_to_l2_by_id.clear();
+  pending_access_elapsed_by_id.clear();
   blocked_warp_bitmap.fill(0);
   upload_written_to_bram = false;
   upload_phase = trafficgen_upload_phase_t::done;
@@ -695,6 +834,44 @@ void trafficgen_t::send_reserved_subpartitions_snapshot() const {
             << reserved_subpartitions_by_cycle.size() << " payload_bytes=" << payload.size() << std::endl;
 }
 
+void trafficgen_t::rebuild_flat_l2_accesses_from_pending() {
+  l2_accesses.clear();
+  l2_accesses.reserve(pending_access_cycle_by_id.size());
+  for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
+    (void)cycle;
+    l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.end());
+  }
+}
+
+void trafficgen_t::rebuild_reserved_subpartitions_from_pending() {
+  reserved_subpartitions_by_cycle.clear();
+  for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
+    auto &reserved_subpartitions = reserved_subpartitions_by_cycle[cycle];
+    for (const auto &access : accesses) {
+      reserved_subpartitions.insert(access.m_subpartition);
+    }
+    if (reserved_subpartitions.empty()) {
+      reserved_subpartitions_by_cycle.erase(cycle);
+    }
+  }
+}
+
+void trafficgen_t::depopulate_processed_accesses(
+    std::uint64_t current_cycle_after_issue) {
+  for (auto bucket_it = pending_accesses_by_cycle.begin();
+       bucket_it != pending_accesses_by_cycle.end() &&
+       bucket_it->first <= current_cycle_after_issue;) {
+    for (const auto &access : bucket_it->second) {
+      pending_access_cycle_by_id.erase(access.id);
+      pending_access_l1_to_l2_by_id.erase(access.id);
+      pending_access_elapsed_by_id.erase(access.id);
+    }
+    bucket_it = pending_accesses_by_cycle.erase(bucket_it);
+  }
+  rebuild_flat_l2_accesses_from_pending();
+  rebuild_reserved_subpartitions_from_pending();
+}
+
 void trafficgen_t::receive_schedule_from_gpu_model() {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
@@ -708,13 +885,14 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
                                       message.blockedWarpIds);
 
   min_issue_cycle = message.min_issue_cycle;
-  l2_accesses.clear();
-  l2_accesses.reserve(message.allL2TraceSteps.size());
+  const trafficgen_runtime_config_t runtime_config{
+      std::filesystem::path(trace_root), kernel_name};
   for (const auto &wire_access : message.allL2TraceSteps) {
     trafficgen_l2_access_t access{};
     access.id = wire_access.mUniqueId;
     access.address = wire_access.mAddress;
     access.cycle_count = wire_access.mCycleCount;
+    access.l1_to_l2_cycle = wire_access.mL1ToL2Cycle;
     access.m_subpartition = checked_u32(
         static_cast<std::uint64_t>(wire_access.mSubpartition),
         "l2 access subpartition");
@@ -734,15 +912,34 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     access.m_bundle_id = wire_access.mBundleId;
     access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle;
     access.m_is_write = wire_access.mIsWrite;
-    l2_accesses.push_back(access);
+    if (!has_first_issue_cycle) {
+      first_issue_cycle = access.cycle_count;
+      has_first_issue_cycle = true;
+    }
+    if (memory_issue_stretch_scale > 1.0 &&
+        access.cycle_count >= first_issue_cycle) {
+      const double issue_cycle_delta =
+          static_cast<double>(access.cycle_count - first_issue_cycle);
+      access.cycle_count =
+          first_issue_cycle +
+          static_cast<std::uint64_t>(
+              std::llround(issue_cycle_delta * memory_issue_stretch_scale));
+    }
+    int access_time = 0;
+    if (find_access_time(runtime_config, access, access_time)) {
+      access.elapsed_cycle =
+          static_cast<std::uint64_t>(std::max(access_time, 0));
+    } else {
+      access.elapsed_cycle = 0;
+    }
+    if (pending_access_cycle_by_id.emplace(access.id, access.cycle_count).second) {
+      pending_accesses_by_cycle[access.cycle_count].push_back(access);
+      pending_access_l1_to_l2_by_id[access.id] = access.l1_to_l2_cycle;
+      pending_access_elapsed_by_id[access.id] = access.elapsed_cycle;
+    }
   }
-
-  std::stable_sort(l2_accesses.begin(),
-                   l2_accesses.end(),
-                   [](const trafficgen_l2_access_t &lhs,
-                      const trafficgen_l2_access_t &rhs) {
-                     return lhs.cycle_count < rhs.cycle_count;
-                   });
+  rebuild_flat_l2_accesses_from_pending();
+  rebuild_reserved_subpartitions_from_pending();
 
   blocked_warp_bitmap.fill(0);
   for (const auto &warp_key : message.blockedWarpIds) {
@@ -752,105 +949,27 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   }
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
-            << "l2_accesses=" << l2_accesses.size()
+            << "new_l2_accesses=" << message.allL2TraceSteps.size()
+            << " pending_l2_accesses=" << l2_accesses.size()
             << " blocked_warps=" << message.blockedWarpIds.size()
             << " min_issue_cycle=" << min_issue_cycle << std::endl;
 }
 
 
 size_t trafficgen_t::process_reserved_subpartitions_stream() {
-  /*
-    reservedSubPartitionsByCycle is stored in bridge module as a ring buffer, with 8192 rows of 256 bits
-    each row corresponds to a cycle and has a bitmap of which subpartitions are reserved for that cycle 
-    the base index and base cycle of the ring buffer are read from MMIO
-  */
-
-  // read the base index and base cycle for ring buffer from MMIO
-  if (!reserved_subpartitions_metadata_latched) {
-    
-    // read base index into ring buffer
-    reserved_subpartitions_base_idx = static_cast<uint32_t>(read(mmio_addrs.reserved_subpartitions_base_idx));
-    if (reserved_subpartitions_base_idx >= STREAM_WORD_COUNT) {
-      std::cout << "[bridge driver] reservedSubPartitions baseIdx out of range: "
-                << reserved_subpartitions_base_idx << std::endl;
-      std::abort();
-    }
-
-    // read base cycle corresponding to that base index
-    reserved_subpartitions_base_cycle =
-        (static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_high)) << 32) |
-        static_cast<std::uint64_t>(read(mmio_addrs.reserved_subpartitions_base_cycle_low));
-
-    reserved_subpartitions_metadata_latched = true;
-  }
-
   if (reserved_subpartition_bytes_received >= reserved_window_bytes) {
     return 0;
   }
 
-  if (reserved_window_bytes != STREAM_BATCH_BYTES) {
-    throw std::runtime_error("TrafficGen reserved-subpartition BRAM window size mismatch");
-  }
+  const size_t remaining_bytes =
+      reserved_window_bytes - reserved_subpartition_bytes_received;
+  rebuild_reserved_subpartitions_from_pending();
 
-  auto &xdma = simif.get_cpu_managed_stream_io();
-  auto snapshot_bytes = make_aligned_bytes(reserved_window_bytes);
-  xdma_read_exact(
-      xdma,
-      bram_base + raw_reserved_subpartitions_offset,
-      snapshot_bytes.get(),
-      reserved_window_bytes,
-      "XDMA read while reading reservedSubPartitionsByCycle");
-  std::memcpy(reserved_subpartitions_words.data(),
-              snapshot_bytes.get(),
-              reserved_window_bytes);
-  reserved_subpartition_bytes_received = reserved_window_bytes;
-
-  // The stream buffer now holds the full streamed snapshot with one 256-bit
-  // entry in the low half of each 512-bit beat; decode each logical cycle entry.
-  reserved_subpartitions_by_cycle.clear();
-  // iterate through every cycle
-  for (size_t offset = 0; offset < STREAM_WORD_COUNT; ++offset) {
-
-    // starting at base index, wrap around the ring buffer 
-    const size_t ring_idx = (static_cast<size_t>(reserved_subpartitions_base_idx) + offset) % STREAM_WORD_COUNT;
-    // get to the 256-bit payload in the low half of the streamed 512-bit beat
-    const size_t beat_word_base = ring_idx * STREAM_WORDS_PER_BEAT;
-
-    bool any_reserved = false;
-    std::unordered_set<unsigned> reserved_subpartitions;
-    // loop through the 256 bits in 64-bit chunks
-    for (size_t word_idx = 0; word_idx < STREAM_WORDS_PER_ENTRY; ++word_idx) {
-
-      const uint64_t word = reserved_subpartitions_words[beat_word_base + word_idx];
-
-      // skip when no subpartitions are reserved for this chunk
-      if (word == 0) {
-        continue;
-      }
-
-      // if any bit is set, then add that index to the reserved subpartitions for this cycle
-      any_reserved = true;
-      for (unsigned bit_idx = 0; bit_idx < 64; ++bit_idx) {
-        if ((word & (1ULL << bit_idx)) != 0) {
-          reserved_subpartitions.insert(static_cast<unsigned>(word_idx * 64 + bit_idx));
-        }
-      }
-    }
-    if (!any_reserved) {
-      continue;
-    }
-
-    // add this to the reserved_subpartitions_by_cycle map for the given cycle
-    const std::uint64_t cycle = reserved_subpartitions_base_cycle + static_cast<std::uint64_t>(offset);
-    reserved_subpartitions_by_cycle.emplace(cycle, std::move(reserved_subpartitions));
-  }
-
-  std::cout << "[bridge driver] decoded reservedSubPartitionsByCycle: cycles="
+  std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
             << reserved_subpartitions_by_cycle.size()
-            << " baseIdx=" << reserved_subpartitions_base_idx
-            << " baseCycle=" << reserved_subpartitions_base_cycle << std::endl;
+            << " pending_accesses=" << l2_accesses.size() << std::endl;
 
-  return reserved_window_bytes;
+  return remaining_bytes;
 }
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
@@ -957,6 +1076,9 @@ void trafficgen_t::write_schedule_to_bram() {
   if (access_bytes > access_window_bytes) {
     throw std::runtime_error("TrafficGen L2 access upload exceeds BRAM access window");
   }
+  if (l2_accesses.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error("TrafficGen L2 access upload count exceeds MMIO width");
+  }
   if (access_bytes != 0) {
     auto packed_accesses = make_aligned_bytes(access_bytes);
     std::memset(packed_accesses.get(), 0, access_bytes);
@@ -966,7 +1088,7 @@ void trafficgen_t::write_schedule_to_bram() {
     }
     xdma_write_exact(
         xdma,
-        bram_base + semantic_access_upload_offset,
+        bram_base + raw_access_store_offset,
         packed_accesses.get(),
         access_bytes,
         "XDMA write while uploading TrafficGen L2 accesses");
@@ -980,10 +1102,19 @@ void trafficgen_t::write_schedule_to_bram() {
   std::memcpy(bitmap_upload.get(), blocked_warp_bitmap.data(), bitmap_bytes);
   xdma_write_exact(
       xdma,
-      bram_base + semantic_blocked_upload_offset,
+      bram_base + raw_blocked_warp_bitmap_offset,
       bitmap_upload.get(),
       bitmap_bytes,
       "XDMA write while uploading TrafficGen blocked-warp bitmap");
+
+  const std::uint64_t max_cycle =
+      l2_accesses.empty() ? 0 : l2_accesses.back().cycle_count;
+  write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
+  write(mmio_addrs.access_store_max_cycle_low,
+        static_cast<uint32_t>(max_cycle & 0xffffffffULL));
+  write(mmio_addrs.access_store_max_cycle_high,
+        static_cast<uint32_t>(max_cycle >> 32));
+  write(mmio_addrs.upload_start, 1);
 
   upload_written_to_bram = true;
   upload_phase = trafficgen_upload_phase_t::done;
@@ -1041,8 +1172,6 @@ void trafficgen_t::tick() {
       upload_written_to_bram = false;
       upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
                                          : trafficgen_upload_phase_t::l2_accesses;
-      write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
-      write(mmio_addrs.upload_start, 1);
       write(mmio_addrs.min_issue_cycle_low,
             static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
       write(mmio_addrs.min_issue_cycle_high,
@@ -1134,8 +1263,14 @@ void trafficgen_t::tick() {
         issued_access_point.requestUid = access.id;
         issued_access_point.address = access.address;
         issued_access_point.cycleIssued = access.cycle_count;
-        issued_access_point.l1ToL2Cycle = 0;
-        issued_access_point.elapsedCycle = 0;
+        const auto l1_to_l2_it = pending_access_l1_to_l2_by_id.find(access.id);
+        if (l1_to_l2_it != pending_access_l1_to_l2_by_id.end()) {
+          issued_access_point.l1ToL2Cycle = l1_to_l2_it->second;
+        }
+        const auto elapsed_it = pending_access_elapsed_by_id.find(access.id);
+        if (elapsed_it != pending_access_elapsed_by_id.end()) {
+          issued_access_point.elapsedCycle = elapsed_it->second;
+        }
         issued_access_point.smId = access.sm_id;
         issued_access_point.schedulerId = access.scheduler_id;
         issued_access_point.warpId = access.warp_id;
@@ -1160,7 +1295,11 @@ void trafficgen_t::tick() {
            << 32) |
           static_cast<std::uint64_t>(
               read(mmio_addrs.current_cycle_after_issue_low));
-      message.hasPendingWork = read(mmio_addrs.has_pending_work) != 0;
+      depopulate_processed_accesses(
+          message.trafficGenResult.currentCycleAfterIssue);
+      message.hasPendingWork =
+          (read(mmio_addrs.has_pending_work) != 0) ||
+          !pending_accesses_by_cycle.empty();
 
       if (!gpu_model_socket_client) {
         throw std::runtime_error(

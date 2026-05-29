@@ -26,7 +26,7 @@ case class TrafficGenParams(
   size: BigInt = 500000000L,
   numGenerators: Int = 1,
   regionStride: BigInt = 0x400000L,
-  maxL2AccessEntries: Int = 65536, // 2^16
+  maxL2AccessEntries: Int = 32768, // 2^18
   memOutstanding: Int = 4,
   accessReadResponseDepth: Int = 1024,
   backend: TrafficGenBackend = TrafficGenDPIBackend,
@@ -488,8 +488,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       completionQueue.io.deq.bits.mBundleId === pendingIssue.mBundleId
   val issueSideEffectsReady =
     issueLaneReady &&
-      issuedAccessWritebackQueue.io.enq.ready &&
-      reservationClearQueue.io.enq.ready
+      issuedAccessWritebackQueue.io.enq.ready
   val issueCanFire = state === sIssue &&
     pendingIssueValid &&
     issueSideEffectsReady &&
@@ -803,7 +802,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       // then go back to read for next access or bucket done
 
       issuedAccessWritebackQueue.io.enq.valid := issueCanFire
-      reservationClearQueue.io.enq.valid := issueCanFire
 
       when(issueCanFire) {
 

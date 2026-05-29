@@ -512,16 +512,17 @@ const AccessMetadataMap &loadAccessMetadata(
   return metadataCache.emplace(key, std::move(metadata)).first->second;
 }
 
-int findAccessTime(const Access &access) {
+bool findAccessTime(const Access &access, int &accessTime) {
   const auto timingFiles = findTimingFiles(access.smId, access.schedulerId);
   for (const auto &timingFile : timingFiles) {
     const auto &timings = loadTimingData(timingFile);
     const auto it = timings.find(access.id);
     if (it != timings.end()) {
-      return it->second;
+      accessTime = it->second;
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 Access enrichAccessMetadata(Access access) {
@@ -807,6 +808,8 @@ public:
         mPendingBundleIdIdx = 0;
         mRoundCurrentCycle = mCurrentCycle;
         mRoundHasPendingWork = false;
+        mRoundHasFutureIssueWork =
+            accessStoreHasEntries && accessStoreMaxCycle > mAccessLoadEndCycle;
         mRoundMinIssueCycle = minIssueCycle;
         ++mRoundNumber;
         const bool skipAccessLoad =
@@ -1127,7 +1130,8 @@ private:
 
     const auto finalizeResult = [this, &pendingByCycle]() {
       mRoundCurrentCycle = mCurrentCycle;
-      mRoundHasPendingWork = !pendingByCycle.empty() || !mInflight.empty();
+      mRoundHasPendingWork =
+          !pendingByCycle.empty() || mRoundHasFutureIssueWork || !mInflight.empty();
       try {
         logRoundOutputSnapshots(mRoundNumber,
                                 mIssuedAccessPoints,
@@ -1167,7 +1171,32 @@ private:
       return completedBlockedWarpBundle;
     };
 
-    if (pendingByCycle.empty() && !mInflight.empty()) {
+    const auto advanceToMinIssueCycle = [this, &retireCompletedAccesses,
+                                         &finalizeResult]() {
+      while (mCurrentCycle < mRoundMinIssueCycle) {
+        const auto nextFinishIt = std::min_element(
+            mInflight.begin(),
+            mInflight.end(),
+            [](const auto &lhs, const auto &rhs) {
+              return lhs.second.finishCycle < rhs.second.finishCycle;
+            });
+        if (nextFinishIt != mInflight.end() &&
+            nextFinishIt->second.finishCycle <= mRoundMinIssueCycle &&
+            nextFinishIt->second.finishCycle > mCurrentCycle) {
+          mCurrentCycle = nextFinishIt->second.finishCycle;
+        } else {
+          mCurrentCycle = mRoundMinIssueCycle;
+        }
+        if (retireCompletedAccesses()) {
+          finalizeResult();
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (pendingByCycle.empty() && !mInflight.empty() &&
+        !mRoundHasFutureIssueWork) {
       while (!mInflight.empty()) {
         const auto nextFinishIt = std::min_element(
             mInflight.begin(),
@@ -1188,13 +1217,23 @@ private:
 
     while (true) {
       if (pendingByCycle.empty()) {
+        if (mRoundHasFutureIssueWork && advanceToMinIssueCycle()) {
+          return;
+        }
         break;
       }
 
       const auto pendingIt = pendingByCycle.find(mCurrentCycle);
       if (pendingIt != pendingByCycle.end()) {
         for (const auto &access : pendingIt->second) {
-          const std::uint64_t elapsedCycle = static_cast<std::uint64_t>(std::max(findAccessTime(access), 0));
+          int accessTime = 0;
+          if (!findAccessTime(access, accessTime)) {
+            dpiLog() << "[Warning] No timing data found for access with UID "
+                     << access.id << " at cycle " << mCurrentCycle << "\n";
+            continue;
+          }
+          const std::uint64_t elapsedCycle =
+              static_cast<std::uint64_t>(std::max(accessTime, 0));
 
           Access issuedAccess = access;
           issuedAccess.cycleCount = mCurrentCycle;
@@ -1210,8 +1249,6 @@ private:
               static_cast<unsigned>(access.warpId),
               access.isWrite,
           });
-          mReservationClearQueue.push_back(
-              ReservationClear{mCurrentCycle, access.subpartition});
           clearReservedSubpartition(access.cycleCount, access.subpartition);
           mInflight[access.id] = PendingAccessInfo{
               mCurrentCycle + elapsedCycle,
@@ -1224,6 +1261,7 @@ private:
           bundleInfo.warpKey = access.warpKey();
           bundleInfo.wakeRelevant = access.wakeRelevantBundle;
         }
+        mReservedSubpartitionsByCycle.erase(mCurrentCycle);
         pendingByCycle.erase(pendingIt);
       }
 
@@ -1266,6 +1304,7 @@ private:
   std::uint64_t mRoundCurrentCycle = 0;
   std::uint64_t mRoundMinIssueCycle = 0;
   bool mRoundHasPendingWork = false;
+  bool mRoundHasFutureIssueWork = false;
   std::uint64_t mRoundNumber = 0;
   ReservedSubpartitionsByCycle mReservedSubpartitionsByCycle;
 };
