@@ -40,6 +40,8 @@ constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot
 constexpr std::uint32_t kBlockedWarpSchedulerBits = 2;
 constexpr std::uint32_t kBlockedWarpWarpBits = 9;
 constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
+constexpr std::uint32_t kRoundExitScheduling = 0;
+constexpr std::uint32_t kRoundExitCapacity = 1;
 constexpr std::size_t kMaxCompletedBundleIds = 4096;
 
 struct WarpKey {
@@ -703,6 +705,9 @@ public:
     mPendingBundleIdIdx = 0;
     mRoundCurrentCycle = 0;
     mRoundHasPendingWork = false;
+    mRoundHasFutureIssueWork = false;
+    mRoundCapacityBounded = false;
+    mRoundExitReason = kRoundExitScheduling;
     mAccessLoadCycle = 0;
     mAccessLoadEndCycle = 0;
     mAccessReadDataConsumed = false;
@@ -733,6 +738,7 @@ public:
       svBit *hasPendingWork,
       svBit *roundStarted,
       svBit *roundComplete,
+      std::uint32_t *roundExitReason,
       std::uint64_t *currentCycleAfterIssue,
       std::uint32_t *dpiState,
       svBit *accessReadEn,
@@ -759,6 +765,7 @@ public:
     *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
     *roundStarted = 0;
     *roundComplete = 0;
+    *roundExitReason = mRoundExitReason;
     *currentCycleAfterIssue = mCurrentCycle;
     *dpiState = stateCode(mState);
     *accessReadEn = 0;
@@ -785,6 +792,7 @@ public:
       *hasPendingWork = 0;
       *roundStarted = 0;
       *roundComplete = 0;
+      *roundExitReason = mRoundExitReason;
       *currentCycleAfterIssue = mCurrentCycle;
       *dpiState = kDpiStateFatalConfigError;
       return;
@@ -797,7 +805,9 @@ public:
         mAccessLoadCycle = mCurrentCycle;
         const bool loadToMaxResidentCycle =
             minIssueCycle == std::numeric_limits<std::uint64_t>::max();
-        mAccessLoadEndCycle = loadToMaxResidentCycle ? accessStoreMaxCycle : minIssueCycle;
+        mAccessLoadEndCycle =
+            loadToMaxResidentCycle ? accessStoreMaxCycle
+                                   : std::min(accessStoreMaxCycle, minIssueCycle);
         resetAccessReadResponseConsumption();
         mBlockedWarpQueryIdx = 0;
         mBlockedWarpSet.clear();
@@ -808,6 +818,9 @@ public:
         mPendingBundleIdIdx = 0;
         mRoundCurrentCycle = mCurrentCycle;
         mRoundHasPendingWork = false;
+        mRoundExitReason = kRoundExitScheduling;
+        mRoundCapacityBounded =
+            accessStoreHasEntries && accessStoreMaxCycle < minIssueCycle;
         mRoundHasFutureIssueWork =
             accessStoreHasEntries && accessStoreMaxCycle > mAccessLoadEndCycle;
         mRoundMinIssueCycle = minIssueCycle;
@@ -946,6 +959,7 @@ public:
         *currentCycleAfterIssue = mRoundCurrentCycle;
         *hasPendingWork = mRoundHasPendingWork ? 1 : 0;
         *roundComplete = 1;
+        *roundExitReason = mRoundExitReason;
         mState = State::Idle;
         roundFinishedThisStep = true;
       }
@@ -959,10 +973,12 @@ public:
       *targetBusy = 0;
       *hasPendingWork = mRoundHasPendingWork ? 1 : 0;
       *currentCycleAfterIssue = mRoundCurrentCycle;
+      *roundExitReason = mRoundExitReason;
     } else {
       *targetBusy = (mState != State::Idle) ? 1 : 0;
       *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
       *currentCycleAfterIssue = mCurrentCycle;
+      *roundExitReason = mRoundExitReason;
     }
     *dpiState = stateCode(mState);
   }
@@ -1128,10 +1144,18 @@ private:
     mPendingBundleIdIdx = 0;
     mRoundCurrentCycle = mCurrentCycle;
 
-    const auto finalizeResult = [this, &pendingByCycle]() {
+    const auto finalizeResult = [this, &pendingByCycle](bool schedulingExit) {
       mRoundCurrentCycle = mCurrentCycle;
       mRoundHasPendingWork =
           !pendingByCycle.empty() || mRoundHasFutureIssueWork || !mInflight.empty();
+      if (schedulingExit) {
+        mRoundExitReason = kRoundExitScheduling;
+      } else if (mRoundCapacityBounded && pendingByCycle.empty() &&
+          mCurrentCycle < mRoundMinIssueCycle) {
+        mRoundExitReason = kRoundExitCapacity;
+      } else {
+        mRoundExitReason = kRoundExitScheduling;
+      }
       try {
         logRoundOutputSnapshots(mRoundNumber,
                                 mIssuedAccessPoints,
@@ -1188,7 +1212,7 @@ private:
           mCurrentCycle = mRoundMinIssueCycle;
         }
         if (retireCompletedAccesses()) {
-          finalizeResult();
+          finalizeResult(true);
           return true;
         }
       }
@@ -1196,7 +1220,7 @@ private:
     };
 
     if (pendingByCycle.empty() && !mInflight.empty() &&
-        !mRoundHasFutureIssueWork) {
+        !mRoundHasFutureIssueWork && !mRoundCapacityBounded) {
       while (!mInflight.empty()) {
         const auto nextFinishIt = std::min_element(
             mInflight.begin(),
@@ -1209,7 +1233,7 @@ private:
           mCurrentCycle = nextFinishIt->second.finishCycle;
         }
         if (retireCompletedAccesses()) {
-          finalizeResult();
+          finalizeResult(true);
           return;
         }
       }
@@ -1266,18 +1290,19 @@ private:
       }
 
       if (retireCompletedAccesses()) {
-        finalizeResult();
+        finalizeResult(true);
         return;
       }
 
       if (mCurrentCycle >= mRoundMinIssueCycle) {
-        break;
+        finalizeResult(true);
+        return;
       }
 
       ++mCurrentCycle;
     }
 
-    finalizeResult();
+    finalizeResult(false);
   }
 
   State mState = State::Idle;
@@ -1305,6 +1330,8 @@ private:
   std::uint64_t mRoundMinIssueCycle = 0;
   bool mRoundHasPendingWork = false;
   bool mRoundHasFutureIssueWork = false;
+  bool mRoundCapacityBounded = false;
+  std::uint32_t mRoundExitReason = kRoundExitScheduling;
   std::uint64_t mRoundNumber = 0;
   ReservedSubpartitionsByCycle mReservedSubpartitionsByCycle;
 };
@@ -1350,6 +1377,7 @@ extern "C" void trafficgen_dpi_step(
     svBit *has_pending_work,
     svBit *round_started,
     svBit *round_complete,
+    std::uint32_t *round_exit_reason,
     std::uint64_t *current_cycle_after_issue,
     std::uint32_t *dpi_state,
     svBit *access_read_en,
@@ -1427,6 +1455,7 @@ extern "C" void trafficgen_dpi_step(
       has_pending_work,
       round_started,
       round_complete,
+      round_exit_reason,
       current_cycle_after_issue,
       dpi_state,
       access_read_en,

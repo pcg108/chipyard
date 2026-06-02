@@ -13,7 +13,7 @@ import freechips.rocketchip.tilelink._
 
 import chipyard.iobinders.TrafficGenPortPeripheralIO
 import testchipip.util.ClockedIO
-import firechip.bridgeinterfaces.{BlockedWarpBitmap, CompletedBundleIds, L2Access, ReservationClearRequest}
+import firechip.bridgeinterfaces.{BlockedWarpBitmap, CompletedBundleIds, L2Access, TrafficGenRoundExitReason}
 
 sealed trait TrafficGenBackend
 case object TrafficGenDPIBackend extends TrafficGenBackend
@@ -49,6 +49,8 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   val roundStarted = Output(Bool())
   // TG reaches min_issue_cycle, unblocks a blocked warp, issues all accesses
   val roundComplete = Output(Bool())
+  // why the last round completed: scheduling exit or access-store capacity exit
+  val roundExitReason = Output(UInt(2.W))
   // TG still has a scheduling round active or memory requests in flight
   val hasPendingWork = Output(Bool())
   // Debug: current TrafficGen DPI state machine state.
@@ -69,8 +71,6 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
 
   //// Target -> Host execution data
 
-  // TG issue logic will enqueue clear requests here to remove the issued subpartition from reservedSubPartitionsByCycle without stalling on bridge RMW latency.
-  val reservationClear = Decoupled(new ReservationClearRequest)
   // TG issue logic will enqueue the actual issued L2 accesses here with cycleCount updated to the real issue cycle.
   val issuedAccessWriteback = Decoupled(new L2Access)
 
@@ -168,6 +168,7 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val has_pending_work = Output(Bool())
     val round_started = Output(Bool())
     val round_complete = Output(Bool())
+    val round_exit_reason = Output(UInt(2.W))
     val current_cycle_after_issue = Output(UInt(64.W))
     val dpi_state = Output(UInt(32.W))
 
@@ -257,43 +258,31 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   dpi.io.blocked_warp_query_resp := io.blockedWarpQueryResp
   dpi.io.blocked_warp_query_ready := io.blockedWarpQueryReady
 
-  val reservationClearLanes = Wire(Vec(params.numGenerators, Decoupled(new ReservationClearRequest)))
   val issuedAccessWritebackLanes = Wire(Vec(params.numGenerators, Decoupled(new L2Access)))
 
-  val reservationClearQueues = Seq.fill(params.numGenerators) {
-    Module(new Queue(new ReservationClearRequest, 4))
-  }
   val issuedAccessWritebackQueues = Seq.fill(params.numGenerators) {
     Module(new Queue(new L2Access, 4))
   }
-  val reservationClearArb = Module(new RRArbiter(new ReservationClearRequest, params.numGenerators))
   val issuedAccessWritebackArb = Module(new RRArbiter(new L2Access, params.numGenerators))
 
   for (i <- 0 until params.numGenerators) {
-    reservationClearQueues(i).io.enq.valid := reservationClearLanes(i).valid
-    reservationClearQueues(i).io.enq.bits := reservationClearLanes(i).bits
-    reservationClearLanes(i).ready := reservationClearQueues(i).io.enq.ready
-    reservationClearArb.io.in(i) <> reservationClearQueues(i).io.deq
-
     issuedAccessWritebackQueues(i).io.enq.valid := issuedAccessWritebackLanes(i).valid
     issuedAccessWritebackQueues(i).io.enq.bits := issuedAccessWritebackLanes(i).bits
     issuedAccessWritebackLanes(i).ready := issuedAccessWritebackQueues(i).io.enq.ready
     issuedAccessWritebackArb.io.in(i) <> issuedAccessWritebackQueues(i).io.deq
   }
 
-  io.reservationClear.valid := reservationClearArb.io.out.valid
-  io.reservationClear.bits := reservationClearArb.io.out.bits
-  reservationClearArb.io.out.ready := io.reservationClear.ready
   io.issuedAccessWriteback.valid := issuedAccessWritebackArb.io.out.valid
   io.issuedAccessWriteback.bits := issuedAccessWritebackArb.io.out.bits
   issuedAccessWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
 
   dpi.io.issued_access_writeback_ready := issuedAccessWritebackLanes(0).ready
-  dpi.io.reservation_clear_ready := reservationClearLanes(0).ready
+  dpi.io.reservation_clear_ready := true.B
 
   io.currentCycleAfterIssue := currentCycleAfterIssue
   io.roundStarted := roundStarted
   io.roundComplete := roundComplete
+  io.roundExitReason := dpi.io.round_exit_reason
 
   io.accessReadCycle := dpi.io.access_read_cycle
   io.accessReadEn := dpi.io.access_read_en
@@ -322,9 +311,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     io.issue(i).valid := false.B
     io.issue(i).bits := 0.U.asTypeOf(new L2Access)
     io.completion(i).ready := true.B
-    reservationClearLanes(i).valid := (if (i == 0) dpi.io.reservation_clear_valid else false.B)
-    reservationClearLanes(i).bits.cycle := dpi.io.reservation_clear_cycle
-    reservationClearLanes(i).bits.subpartition := dpi.io.reservation_clear_subpartition
     issuedAccessWritebackLanes(i).valid := (if (i == 0) dpi.io.issued_access_writeback_valid else false.B)
     issuedAccessWritebackLanes(i).bits.id := dpi.io.issued_access_writeback_id
     issuedAccessWritebackLanes(i).bits.address := dpi.io.issued_access_writeback_address
@@ -393,6 +379,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val inflightAccessCount = RegInit(0.U(32.W))
   // completed bundle count to write back to bridge module 
   val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
+  // latched round result state. Capacity refills are part of one GPU scheduler
+  // round, so these stay stable until the next target round starts.
+  val roundCapacityBounded = RegInit(false.B)
+  val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
+  val currentCycleAfterIssueReg = RegInit(0.U(64.W))
 
   /*
     In-flight bundle table (~mOutstandingBundles in DPI) to track the number of issued but not completed accesses per bundle, to know when a bundle completes. 
@@ -419,9 +410,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val completionQuerySchedulerId = Reg(UInt(8.W))
   val completionQueryWarpId = Reg(UInt(32.W))
 
-  // queues to store issued accesses and completion clears to send to bridge module
+  // queue to store issued accesses for bridge-module readback
   val issuedAccessWritebackQueue = Module(new Queue(new L2Access, 4))
-  val reservationClearQueue = Module(new Queue(new ReservationClearRequest, 4))
 
   // queue to immediately capture access read responses from the bridge module.
   // Store packed accesses so the queue backs onto one wide memory instead of one
@@ -447,12 +437,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   // set the issued access cycle as targetCycle because this is used just for plotting and correlation
   issuedAccess.cycleCount := targetCycle // modelCycle
 
-  val reservationClear = Wire(new ReservationClearRequest)
-  reservationClear.cycle := pendingIssue.cycleCount
-  reservationClear.subpartition := pendingIssue.mSubpartition
-
   // determine if we can issue the pending access to any of the issue nodes, and if so which one
-  // conditions: ready issue node, pending issue is valid, issuedAccess/reservationClear queues have space 
+  // conditions: ready issue node, pending issue is valid, issuedAccess queue has space
   val issueReadyVec = VecInit((0 until params.numGenerators).map(i => io.issue(i).ready))
   val issueLaneReady = issueReadyVec.asUInt.orR
   val issueLaneOH = PriorityEncoderOH(issueReadyVec.asUInt)
@@ -499,18 +485,22 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       !completionQueue.io.deq.valid &&
       !completionQueue.io.enq.valid
 
-  // issued access queue and reservation clear queues need to be empty for round to complete
+  // issued access queue needs to be empty for round to complete
   val sideEffectQueuesEmpty =
-    !issuedAccessWritebackQueue.io.deq.valid && !reservationClearQueue.io.deq.valid
+    !issuedAccessWritebackQueue.io.deq.valid
   // fully completed cycle bucket 
   val bucketDrained = bucketDoneSeen && !pendingIssueValid && sideEffectQueuesEmpty &&
     !pendingAccessReadBucketDone &&
     !accessReadResponseQueue.io.deq.valid
 
-  // a round ends with either we the access store is empty, 
-  // or we reach min issue cycle (if finite) or the max cycle in the store (we issued everything)
+  // accessStoreMaxCycle is the last uploaded cycle bucket. Capacity exits must
+  // happen after that bucket drains, and should report the first unissued cycle.
   val accessStoreEndReached = !io.accessStoreHasEntries || modelCycle >= io.accessStoreMaxCycle
-  val stopCondition = roundStopPending || modelCycle >= io.minIssueCycle || accessStoreEndReached
+  val minIssueCycleReached = modelCycle >= io.minIssueCycle
+  val schedulingExitReached = roundStopPending || minIssueCycleReached || !io.accessStoreHasEntries
+  val capacityExitReached = roundCapacityBounded && accessStoreEndReached &&
+    !schedulingExitReached && modelCycle < io.minIssueCycle
+  val stopCondition = schedulingExitReached || capacityExitReached
   val roundCompletePulse = WireDefault(false.B)
 
   // The bridge can hold a read response valid across multiple target steps; consume each ID once.
@@ -527,30 +517,33 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   io.startTrafficGen := false.B // tie this off since we are reusing the IO interface
   io.targetBusy := (state =/= sIdle) && !roundCompletePulse
-  // we still have pending work if we have either not issued all accesses, or all issued accesses haven't completed
+  // Target-local pending work only. The bridge driver ORs this with the C++
+  // pending-access map to account for chunks not yet uploaded to accessStore.
   io.hasPendingWork := state =/= sIdle ||
     inflightAccessCount =/= 0.U ||
     io.memActive ||
-    io.accessStoreHasEntries
+    pendingIssueValid ||
+    readReqPending ||
+    pendingAccessReadBucketDone ||
+    accessReadResponseQueue.io.deq.valid ||
+    issuedAccessWritebackQueue.io.deq.valid ||
+    completionQueue.io.deq.valid ||
+    completionQueue.io.enq.valid ||
+    completionState =/= cDequeue
   io.roundStarted := false.B
   io.roundComplete := roundCompletePulse
+  io.roundExitReason := roundExitReasonReg
   io.dpiState := state.asUInt // exposes current state through DPI state signal 
-  io.currentCycleAfterIssue := modelCycle
+  io.currentCycleAfterIssue := currentCycleAfterIssueReg
 
-  // connect bridge module reservation clear to reservation clear queue
-  io.reservationClear.valid := reservationClearQueue.io.deq.valid
-  io.reservationClear.bits := reservationClearQueue.io.deq.bits
-  reservationClearQueue.io.deq.ready := io.reservationClear.ready
   // connect bridge module issued access writeback to issued access queue
   io.issuedAccessWriteback.valid := issuedAccessWritebackQueue.io.deq.valid
   io.issuedAccessWriteback.bits := issuedAccessWritebackQueue.io.deq.bits
   issuedAccessWritebackQueue.io.deq.ready := io.issuedAccessWriteback.ready
 
-  // default values for issued access and reservation clear queues 
+  // default values for issued access queue
   issuedAccessWritebackQueue.io.enq.valid := false.B
   issuedAccessWritebackQueue.io.enq.bits := issuedAccess
-  reservationClearQueue.io.enq.valid := false.B
-  reservationClearQueue.io.enq.bits := reservationClear
 
   // default values for access read response queue 
   accessReadResponseQueue.io.enq.valid := false.B
@@ -730,6 +723,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         pendingIssueValid := false.B
         roundStopPending := false.B
         completedBundleCount := 0.U
+        roundCapacityBounded := io.accessStoreHasEntries && io.accessStoreMaxCycle < io.minIssueCycle
+        roundExitReasonReg := TrafficGenRoundExitReason.scheduling
+        currentCycleAfterIssueReg := modelCycle
         completionState := cDequeue
         io.roundStarted := true.B
         state := sRead
@@ -753,7 +749,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         pendingAccessReadBucketDone := false.B
         readReqPending := false.B
         accessReadRequestActive := false.B
-        // advance the reservation window to retire the old bucket
+        // advance the access window to retire the old bucket
         io.reservationWindowAdvanceCycle := modelCycle
         io.reservationWindowAdvanceEn := true.B
       }.elsewhen(readReqPending) { // if we have a pending read request, keep it asserted until the bridge returns a response
@@ -784,6 +780,15 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
           when(stopCondition) { // if round completion, then write completed bundle count and signal round complete
             io.completedBundleCountWriteEn := true.B
             io.completedBundleCountWriteData := completedBundleCount
+            when(capacityExitReached) {
+              val nextModelCycle = modelCycle + 1.U
+              currentCycleAfterIssueReg := nextModelCycle
+              roundExitReasonReg := TrafficGenRoundExitReason.capacity
+              modelCycle := nextModelCycle
+            }.otherwise {
+              currentCycleAfterIssueReg := modelCycle
+              roundExitReasonReg := TrafficGenRoundExitReason.scheduling
+            }
             roundCompletePulse := true.B
             state := sIdle
           }.otherwise { // advance to next cycle 
@@ -938,11 +943,9 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.hasPendingWork := engine.io.hasPendingWork
       io.roundStarted := engine.io.roundStarted
       io.roundComplete := engine.io.roundComplete
+      io.roundExitReason := engine.io.roundExitReason
       io.currentCycleAfterIssue := engine.io.currentCycleAfterIssue
       io.dpiState := engine.io.dpiState
-      io.reservationClear.valid := engine.io.reservationClear.valid
-      io.reservationClear.bits := engine.io.reservationClear.bits
-      engine.io.reservationClear.ready := io.reservationClear.ready
       io.issuedAccessWriteback.valid := engine.io.issuedAccessWriteback.valid
       io.issuedAccessWriteback.bits := engine.io.issuedAccessWriteback.bits
       engine.io.issuedAccessWriteback.ready := io.issuedAccessWriteback.ready
@@ -984,7 +987,8 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x28 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
         0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue(31, 0))),
         0x3C -> Seq(RegField.r(32, io.currentCycleAfterIssue(63, 32))),
-        0x40 -> Seq(RegField.r(32, io.dpiState))
+        0x40 -> Seq(RegField.r(32, io.dpiState)),
+        0x44 -> Seq(RegField.r(2, io.roundExitReason))
       )
     }
   }
@@ -1015,7 +1019,7 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
 
   // traffic generator should:
   //- continuously read from the L2 access store
-  //- issue accesses and depopulate reservedSubPartitionsByCycle, set baseCycle/Idx
+  //- issue accesses and advance the bridge access window
   //- track when issued acceses return and populate completedBundleIds
   //- stop at min_issue_cycle or when unblocking a blocked warp
   //- report currentCycle after issue
@@ -1161,9 +1165,9 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.startTrafficGen <> trafficGenTL.module.io.startTrafficGen
       outerIO.bits.roundStarted <> trafficGenTL.module.io.roundStarted
       outerIO.bits.roundComplete <> trafficGenTL.module.io.roundComplete
+      outerIO.bits.roundExitReason <> trafficGenTL.module.io.roundExitReason
       outerIO.bits.currentCycleAfterIssue <> trafficGenTL.module.io.currentCycleAfterIssue
       outerIO.bits.dpiState <> trafficGenTL.module.io.dpiState
-      outerIO.bits.reservationClear <> trafficGenTL.module.io.reservationClear
       outerIO.bits.issuedAccessWriteback <> trafficGenTL.module.io.issuedAccessWriteback
       outerIO.bits.completedBundleIdWriteEn <> trafficGenTL.module.io.completedBundleIdWriteEn
       outerIO.bits.completedBundleIdWriteIdx <> trafficGenTL.module.io.completedBundleIdWriteIdx

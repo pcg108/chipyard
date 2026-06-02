@@ -98,9 +98,9 @@ object CompletedBundleIds {
   require(capacity % idsPerBeat == 0, "Completed bundle ID capacity must be stream-beat aligned")
 }
 
-class ReservationClearRequest extends Bundle {
-  val cycle = UInt(64.W)
-  val subpartition = UInt(32.W)
+object TrafficGenRoundExitReason {
+  val scheduling = 0.U(2.W)
+  val capacity = 1.U(2.W)
 }
 
 class TrafficGenPortIO extends Bundle {
@@ -109,9 +109,9 @@ class TrafficGenPortIO extends Bundle {
   val startTrafficGen = Output(Bool())
   val roundStarted = Output(Bool())
   val roundComplete = Output(Bool())
+  val roundExitReason = Output(UInt(2.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val reservationClear = Decoupled(new ReservationClearRequest)
   val issuedAccessWriteback = Decoupled(new L2Access)
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))

@@ -10,6 +10,7 @@
 #include <boost/archive/binary_oarchive.hpp>
 #include <boost/serialization/access.hpp>
 #include <boost/serialization/library_version_type.hpp>
+#include <boost/serialization/map.hpp>
 #include <boost/serialization/set.hpp>
 #include <boost/serialization/string.hpp>
 #include <boost/serialization/unordered_map.hpp>
@@ -41,12 +42,15 @@ char trafficgen_t::KIND;
 
 namespace {
 
+constexpr std::uint32_t kRoundExitCapacity = 1;
+
 constexpr std::uint16_t kGpuModelSocketPort = 50051;
 constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
 constexpr std::size_t kXDMABufferAlignment = 4096;
 constexpr const char *kDefaultTraceFolder =
     "/home/prashanth/gpu_model/accel-sim-data-rodinia_nn";
 constexpr const char *kDefaultKernelName = "kernel_1__Z6euclidPcffPfiii";
+constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0";
 
 struct ReservationsMessage {
   L2SubpartitionReservationsByCycle reservedSubpartitionsByCycle;
@@ -173,6 +177,18 @@ private:
   }
 };
 
+struct OrderedReservedSubpartitionsSnapshot {
+  OrderedL2SubpartitionReservationsByCycle reservationsByCycle;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & reservationsByCycle;
+  }
+};
+
 struct IssuedAccessPoint {
   std::uint64_t requestUid = 0;
   std::uint64_t address = 0;
@@ -230,6 +246,57 @@ private:
     ar & hasPendingWork;
   }
 };
+
+struct IssuedAccessesSnapshot {
+  std::vector<IssuedAccessPoint> issuedAccesses;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & issuedAccesses;
+  }
+};
+
+struct CompletedBundleIdsSnapshot {
+  std::vector<std::uint64_t> completedBundleIds;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & completedBundleIds;
+  }
+};
+
+struct CurrentCycleAfterIssueSnapshot {
+  std::uint64_t currentCycleAfterIssue = 0;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & currentCycleAfterIssue;
+  }
+};
+
+struct MinIssueCycleSnapshot {
+  std::uint64_t minIssueCycle = 0;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & minIssueCycle;
+  }
+};
+
+std::vector<socket_l2_access_t> current_round_all_l2_trace_steps;
+std::set<socket_warp_key_t> current_round_blocked_warp_ids;
 
 std::string errno_message(const std::string &prefix) {
   std::ostringstream oss;
@@ -362,6 +429,15 @@ void log_socket_round_inputs_for_compare(
             << "round_dir=" << round_dir
             << " l2_accesses=" << all_l2_trace_steps.size()
             << " blocked_warps=" << blocked_warp_ids.size() << std::endl;
+}
+
+OrderedL2SubpartitionReservationsByCycle ordered_reservations(
+    const L2SubpartitionReservationsByCycle &reservations) {
+  OrderedL2SubpartitionReservationsByCycle ordered;
+  for (const auto &[cycle, subpartitions] : reservations) {
+    ordered[cycle].insert(subpartitions.begin(), subpartitions.end());
+  }
+  return ordered;
 }
 
 std::string plusarg_value(const std::vector<std::string> &args,
@@ -722,30 +798,22 @@ trafficgen_t::trafficgen_t(simif_t &simif,
                            int /*trafficgenno*/,
                            const std::vector<std::string> &args,
                            uint64_t bram_base,
-                           uint64_t semantic_access_upload_offset,
-                           uint64_t semantic_blocked_upload_offset,
                            uint64_t raw_access_store_offset,
                            uint64_t raw_issued_access_writeback_store_offset,
-                           uint64_t raw_reserved_subpartitions_offset,
                            uint64_t raw_blocked_warp_bitmap_offset,
                            uint64_t raw_completed_bundle_ids_offset,
                            uint64_t access_window_bytes,
                            uint64_t blocked_window_bytes,
-                           uint64_t reserved_window_bytes,
                            uint64_t completed_window_bytes)
     : bridge_driver_t(simif, &KIND),
       mmio_addrs(mmio_addrs),
       bram_base(bram_base),
-      semantic_access_upload_offset(semantic_access_upload_offset),
-      semantic_blocked_upload_offset(semantic_blocked_upload_offset),
       raw_access_store_offset(raw_access_store_offset),
       raw_issued_access_writeback_store_offset(raw_issued_access_writeback_store_offset),
-      raw_reserved_subpartitions_offset(raw_reserved_subpartitions_offset),
       raw_blocked_warp_bitmap_offset(raw_blocked_warp_bitmap_offset),
       raw_completed_bundle_ids_offset(raw_completed_bundle_ids_offset),
       access_window_bytes(access_window_bytes),
       blocked_window_bytes(blocked_window_bytes),
-      reserved_window_bytes(reserved_window_bytes),
       completed_window_bytes(completed_window_bytes) {
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
@@ -757,6 +825,10 @@ trafficgen_t::trafficgen_t(simif_t &simif,
   const auto runtime_config = parse_runtime_config(args);
   trace_root = runtime_config.trace_root.string();
   kernel_name = runtime_config.kernel_name;
+  const std::string round_log_dir =
+      plusarg_value(args, "trafficgen-round-log-dir");
+  round_log_root = std::filesystem::path(kRoundLogBase) /
+                   (round_log_dir.empty() ? "trafficgen_bridge" : round_log_dir);
 }
 
 trafficgen_t::~trafficgen_t() = default;
@@ -774,8 +846,11 @@ void trafficgen_t::init() {
   issued_access_writeback_count = 0;
   issued_access_writeback_bytes_received = 0;
   issued_access_writeback_read_issued = false;
-  reserved_subpartition_bytes_received = 0;
-  reserved_subpartitions_metadata_latched = false;
+  accumulated_issued_accesses.clear();
+  accumulated_completed_bundle_ids.clear();
+  logical_round_number = 0;
+  current_round_all_l2_trace_steps.clear();
+  current_round_blocked_warp_ids.clear();
   min_issue_cycle = 0;
   has_first_issue_cycle = false;
   first_issue_cycle = 0;
@@ -786,13 +861,8 @@ void trafficgen_t::init() {
   pending_access_elapsed_by_id.clear();
   blocked_warp_bitmap.fill(0);
   upload_written_to_bram = false;
-  upload_phase = trafficgen_upload_phase_t::done;
   round_completion_pause_issued = false;
-  reserved_subpartitions_read_issued = false;
-  reserved_subpartitions_base_idx = 0;
-  reserved_subpartitions_base_cycle = 0;
-  reserved_subpartitions_words.fill(0);
-  reserved_subpartitions_by_cycle.clear();
+  round_input_reserved_subpartitions.clear();
   state = trafficgen_state_t::IDLE;
 }
 
@@ -819,41 +889,70 @@ bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
   return message.mainLoopComplete;
 }
 
-void trafficgen_t::send_reserved_subpartitions_snapshot() const {
+void trafficgen_t::send_reserved_subpartitions_snapshot(
+    const L2SubpartitionReservationsByCycle &reservations) const {
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
         "gpu_model socket client is not initialized");
   }
 
   ReservationsMessage message;
-  message.reservedSubpartitionsByCycle = reserved_subpartitions_by_cycle;
+  message.reservedSubpartitionsByCycle = reservations;
   const std::string payload = serialize_message(message);
   gpu_model_socket_client->send_frame(payload);
 
   std::cout << "[bridge driver] sent reservedSubPartitionsByCycle to gpu_model_socket: cycles="
-            << reserved_subpartitions_by_cycle.size() << " payload_bytes=" << payload.size() << std::endl;
+            << reservations.size() << " payload_bytes=" << payload.size() << std::endl;
 }
 
-void trafficgen_t::rebuild_flat_l2_accesses_from_pending() {
+void trafficgen_t::build_next_l2_access_chunk() {
   l2_accesses.clear();
-  l2_accesses.reserve(pending_access_cycle_by_id.size());
+  const size_t max_entries = access_window_bytes / L2_ACCESS_STREAM_BYTES;
+  if (pending_accesses_by_cycle.empty()) {
+    return;
+  }
+  if (max_entries == 0) {
+    throw std::runtime_error("TrafficGen L2 access BRAM window has zero entry capacity");
+  }
+
+  const auto &first_bucket = pending_accesses_by_cycle.begin()->second;
+  if (first_bucket.size() > max_entries) {
+    std::ostringstream oss;
+    oss << "TrafficGen cycle bucket exceeds maxL2AccessEntries: cycle="
+        << pending_accesses_by_cycle.begin()->first
+        << " bucket_entries=" << first_bucket.size()
+        << " capacity=" << max_entries;
+    throw std::runtime_error(oss.str());
+  }
+
+  size_t chunk_entries = 0;
   for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
     (void)cycle;
+    if (chunk_entries + accesses.size() > max_entries) {
+      break;
+    }
     l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.end());
+    chunk_entries += accesses.size();
   }
+
+  std::cout << "[bridge driver] built L2 access chunk: chunk_entries="
+            << l2_accesses.size()
+            << " pending_entries=" << pending_access_cycle_by_id.size()
+            << " capacity=" << max_entries << std::endl;
 }
 
-void trafficgen_t::rebuild_reserved_subpartitions_from_pending() {
-  reserved_subpartitions_by_cycle.clear();
+L2SubpartitionReservationsByCycle trafficgen_t::build_reserved_subpartitions_from_pending() const {
+  L2SubpartitionReservationsByCycle reservations;
   for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
-    auto &reserved_subpartitions = reserved_subpartitions_by_cycle[cycle];
+    auto &reserved_subpartitions = reservations[cycle];
     for (const auto &access : accesses) {
       reserved_subpartitions.insert(access.m_subpartition);
     }
     if (reserved_subpartitions.empty()) {
-      reserved_subpartitions_by_cycle.erase(cycle);
+      reservations.erase(cycle);
     }
   }
+  return reservations;
 }
 
 void trafficgen_t::depopulate_processed_accesses(
@@ -868,8 +967,106 @@ void trafficgen_t::depopulate_processed_accesses(
     }
     bucket_it = pending_accesses_by_cycle.erase(bucket_it);
   }
-  rebuild_flat_l2_accesses_from_pending();
-  rebuild_reserved_subpartitions_from_pending();
+}
+
+void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
+  std::unordered_set<std::uint64_t> uploaded_ids;
+  uploaded_ids.reserve(l2_accesses.size());
+  for (const auto &access : l2_accesses) {
+    uploaded_ids.insert(access.id);
+  }
+
+  for (auto bucket_it = pending_accesses_by_cycle.begin();
+       bucket_it != pending_accesses_by_cycle.end();) {
+    auto &accesses = bucket_it->second;
+    accesses.erase(
+        std::remove_if(accesses.begin(),
+                       accesses.end(),
+                       [this, &uploaded_ids](const trafficgen_l2_access_t &access) {
+                         if (uploaded_ids.find(access.id) == uploaded_ids.end()) {
+                           return false;
+                         }
+                         pending_access_cycle_by_id.erase(access.id);
+                         pending_access_l1_to_l2_by_id.erase(access.id);
+                         pending_access_elapsed_by_id.erase(access.id);
+                         return true;
+                       }),
+        accesses.end());
+    if (accesses.empty()) {
+      bucket_it = pending_accesses_by_cycle.erase(bucket_it);
+    } else {
+      ++bucket_it;
+    }
+  }
+}
+
+void trafficgen_t::log_logical_round_for_compare(
+    const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
+    const std::vector<std::uint64_t> &completed_bundle_ids,
+    std::uint64_t current_cycle_after_issue) const {
+  if (logical_round_number == 0) {
+    return;
+  }
+
+  const std::filesystem::path round_dir =
+      round_log_root / format_round_log_dir(logical_round_number);
+  create_directory_if_needed(round_log_root.string());
+  create_directory_if_needed(round_dir.string());
+
+  std::vector<IssuedAccessPoint> issued_snapshot_points;
+  issued_snapshot_points.reserve(issued_accesses.size());
+  for (const auto &access : issued_accesses) {
+    IssuedAccessPoint point{};
+    point.requestUid = access.request_uid;
+    point.address = access.address;
+    point.cycleIssued = access.cycle_issued;
+    point.l1ToL2Cycle = access.l1_to_l2_cycle;
+    point.elapsedCycle = access.elapsed_cycle;
+    point.smId = access.sm_id;
+    point.schedulerId = access.scheduler_id;
+    point.warpId = access.warp_id;
+    point.isWrite = access.is_write;
+    issued_snapshot_points.push_back(point);
+  }
+
+  write_socket_snapshot((round_dir / "reserved_subpartitions.bin").string(),
+                        OrderedReservedSubpartitionsSnapshot{
+                            round_input_reserved_subpartitions});
+  write_socket_snapshot((round_dir / "all_l2_trace_steps.bin").string(),
+                        SocketAllL2TraceStepsSnapshot{current_round_all_l2_trace_steps});
+  write_socket_snapshot((round_dir / "blocked_warp_ids.bin").string(),
+                        SocketBlockedWarpIdsSnapshot{current_round_blocked_warp_ids});
+  write_socket_snapshot((round_dir / "min_issue_cycle.bin").string(),
+                        MinIssueCycleSnapshot{min_issue_cycle});
+  write_socket_snapshot((round_dir / "issued_accesses.bin").string(),
+                        IssuedAccessesSnapshot{issued_snapshot_points});
+  write_socket_snapshot((round_dir / "completed_bundle_ids.bin").string(),
+                        CompletedBundleIdsSnapshot{completed_bundle_ids});
+  write_socket_snapshot((round_dir / "current_cycle_after_issue.bin").string(),
+                        CurrentCycleAfterIssueSnapshot{current_cycle_after_issue});
+
+  std::size_t reserved_subpartition_count = 0;
+  for (const auto &[cycle, subpartitions] : round_input_reserved_subpartitions) {
+    (void)cycle;
+    reserved_subpartition_count += subpartitions.size();
+  }
+  std::ofstream manifest(round_dir / "manifest.txt");
+  if (!manifest.is_open()) {
+    throw std::runtime_error("failed to write round manifest: " +
+                             (round_dir / "manifest.txt").string());
+  }
+  manifest << "round=" << logical_round_number << "\n";
+  manifest << "files=reserved_subpartitions.bin,all_l2_trace_steps.bin,"
+           << "blocked_warp_ids.bin,min_issue_cycle.bin,issued_accesses.bin,"
+           << "completed_bundle_ids.bin,current_cycle_after_issue.bin\n";
+  manifest << "reserved_cycle_count=" << round_input_reserved_subpartitions.size() << "\n";
+  manifest << "reserved_subpartition_count=" << reserved_subpartition_count << "\n";
+  manifest << "all_l2_trace_steps_count=" << current_round_all_l2_trace_steps.size() << "\n";
+  manifest << "blocked_warp_ids_count=" << current_round_blocked_warp_ids.size() << "\n";
+  manifest << "min_issue_cycle=" << min_issue_cycle << "\n";
+  manifest << "issued_accesses_count=" << issued_accesses.size() << "\n";
+  manifest << "completed_bundle_ids_count=" << completed_bundle_ids.size() << "\n";
+  manifest << "current_cycle_after_issue=" << current_cycle_after_issue << "\n";
 }
 
 void trafficgen_t::receive_schedule_from_gpu_model() {
@@ -881,6 +1078,9 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   const SchedulerRoundMessage message =
       gpu_model_socket_client->recv_message<SchedulerRoundMessage>();
 
+  ++logical_round_number;
+  current_round_all_l2_trace_steps = message.allL2TraceSteps;
+  current_round_blocked_warp_ids = message.blockedWarpIds;
   log_socket_round_inputs_for_compare(message.allL2TraceSteps,
                                       message.blockedWarpIds);
 
@@ -938,8 +1138,9 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
       pending_access_elapsed_by_id[access.id] = access.elapsed_cycle;
     }
   }
-  rebuild_flat_l2_accesses_from_pending();
-  rebuild_reserved_subpartitions_from_pending();
+  accumulated_issued_accesses.clear();
+  accumulated_completed_bundle_ids.clear();
+  build_next_l2_access_chunk();
 
   blocked_warp_bitmap.fill(0);
   for (const auto &warp_key : message.blockedWarpIds) {
@@ -950,27 +1151,12 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
-            << " pending_l2_accesses=" << l2_accesses.size()
+            << " pending_l2_accesses=" << pending_access_cycle_by_id.size()
+            << " chunk_l2_accesses=" << l2_accesses.size()
             << " blocked_warps=" << message.blockedWarpIds.size()
             << " min_issue_cycle=" << min_issue_cycle << std::endl;
 }
 
-
-size_t trafficgen_t::process_reserved_subpartitions_stream() {
-  if (reserved_subpartition_bytes_received >= reserved_window_bytes) {
-    return 0;
-  }
-
-  const size_t remaining_bytes =
-      reserved_window_bytes - reserved_subpartition_bytes_received;
-  rebuild_reserved_subpartitions_from_pending();
-
-  std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
-            << reserved_subpartitions_by_cycle.size()
-            << " pending_accesses=" << l2_accesses.size() << std::endl;
-
-  return remaining_bytes;
-}
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
 
@@ -1117,7 +1303,6 @@ void trafficgen_t::write_schedule_to_bram() {
   write(mmio_addrs.upload_start, 1);
 
   upload_written_to_bram = true;
-  upload_phase = trafficgen_upload_phase_t::done;
 }
 
 void trafficgen_t::push_upload_data() {
@@ -1127,14 +1312,15 @@ void trafficgen_t::push_upload_data() {
 void trafficgen_t::tick() {
   switch (state) {
   case trafficgen_state_t::IDLE:
-    // Wait for the traffic generator to be kicked off.
 
+    // Wait for the traffic generator to be kicked off.
     if (read(mmio_addrs.start_trafficgen)) {
       std::cout << "[bridge driver] start signal received, starting traffic generation" << std::endl;
       
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
 
+      // if the full kernel scheduling is complete, then return to IDLE
       if (receive_main_loop_complete_from_gpu_model()) {
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
@@ -1142,53 +1328,42 @@ void trafficgen_t::tick() {
         break;
       }
 
-      reserved_subpartition_bytes_received = 0;
-      reserved_subpartitions_metadata_latched = false;
-      reserved_subpartitions_base_idx = 0;
-      reserved_subpartitions_base_cycle = 0;
-      reserved_subpartitions_words.fill(0);
-      reserved_subpartitions_by_cycle.clear();
-      reserved_subpartitions_read_issued = false;
-
-      state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
+      state = trafficgen_state_t::SEND_RESERVED_PARTITIONS;
     }
 
     break;
-  case trafficgen_state_t::READ_RESERVED_PARTITIONS:
+  case trafficgen_state_t::SEND_RESERVED_PARTITIONS:
+    {
+      const auto reservations = build_reserved_subpartitions_from_pending();
+      std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
+                << reservations.size()
+                << " pending_accesses=" << pending_access_cycle_by_id.size() << std::endl;
 
-    // read reservedSubPartitionByCycle bitmap directly through XDMA
-    reserved_subpartition_bytes_received += process_reserved_subpartitions_stream();
-    if (reserved_subpartition_bytes_received >= reserved_window_bytes) {
-      std::cout << "[bridge driver] completed reading reservedSubPartitionsByCycle BRAM data, bytes received="
-                << reserved_subpartition_bytes_received << std::endl;
-      
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
-      send_reserved_subpartitions_snapshot();
+      round_input_reserved_subpartitions =
+          ordered_reservations(reservations);
+      send_reserved_subpartitions_snapshot(reservations);
 
       // read the L2 access schedule, blocked warp IDs, and min issue cycle from gpu_model via socket
       receive_schedule_from_gpu_model();
 
       // Reset upload progress and kick off host->target BRAM upload.
       upload_written_to_bram = false;
-      upload_phase = l2_accesses.empty() ? trafficgen_upload_phase_t::blocked_warp_bitmap
-                                         : trafficgen_upload_phase_t::l2_accesses;
       write(mmio_addrs.min_issue_cycle_low,
             static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
       write(mmio_addrs.min_issue_cycle_high,
             static_cast<uint32_t>(min_issue_cycle >> 32));
-      reserved_subpartitions_read_issued = false;
-      
+
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
+
+      break;
     }
-  
-    break;
   case trafficgen_state_t::UPLOAD_SCHEDULE:
 
     // write schedule and blocked warp bitmap to bridge module via XDMA
     push_upload_data();
 
-    if (upload_phase == trafficgen_upload_phase_t::done &&
-        (l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
+    if ((l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
         read(mmio_addrs.blocked_warp_upload_done)) {
 
       std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
@@ -1255,57 +1430,106 @@ void trafficgen_t::tick() {
         break;
       }
 
-      // decode issued accesses 
-      TrafficGenResultMessage message;
-      message.trafficGenResult.issuedAccesses.reserve(issued_access_writeback_entries.size());
+      // decode issued accesses from this target exit and accumulate them until
+      // the scheduling round really returns to the GPU model.
       for (const auto &access : issued_access_writeback_entries) {
-        IssuedAccessPoint issued_access_point{};
-        issued_access_point.requestUid = access.id;
+        trafficgen_issued_access_point_t issued_access_point{};
+        issued_access_point.request_uid = access.id;
         issued_access_point.address = access.address;
-        issued_access_point.cycleIssued = access.cycle_count;
+        issued_access_point.cycle_issued = access.cycle_count;
         const auto l1_to_l2_it = pending_access_l1_to_l2_by_id.find(access.id);
         if (l1_to_l2_it != pending_access_l1_to_l2_by_id.end()) {
-          issued_access_point.l1ToL2Cycle = l1_to_l2_it->second;
+          issued_access_point.l1_to_l2_cycle = l1_to_l2_it->second;
         }
         const auto elapsed_it = pending_access_elapsed_by_id.find(access.id);
         if (elapsed_it != pending_access_elapsed_by_id.end()) {
-          issued_access_point.elapsedCycle = elapsed_it->second;
+          issued_access_point.elapsed_cycle = elapsed_it->second;
         }
-        issued_access_point.smId = access.sm_id;
-        issued_access_point.schedulerId = access.scheduler_id;
-        issued_access_point.warpId = access.warp_id;
-        issued_access_point.isWrite = access.m_is_write;
-        message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
+        issued_access_point.sm_id = access.sm_id;
+        issued_access_point.scheduler_id = access.scheduler_id;
+        issued_access_point.warp_id = access.warp_id;
+        issued_access_point.is_write = access.m_is_write;
+        accumulated_issued_accesses.push_back(issued_access_point);
       }
 
-      // decode completed bundle IDs
-      message.trafficGenResult.completedBundleIds.clear();
+      // decode completed bundle IDs from this target exit
       const size_t completed_bundle_ids_to_send =
           std::min(static_cast<size_t>(completed_bundle_count),
                    COMPLETED_BUNDLE_ID_COUNT);
-      message.trafficGenResult.completedBundleIds.reserve(completed_bundle_ids_to_send);
       for (size_t i = 0; i < completed_bundle_ids_to_send; ++i) {
-        message.trafficGenResult.completedBundleIds.push_back(completed_bundle_ids[i]);
+        accumulated_completed_bundle_ids.push_back(completed_bundle_ids[i]);
       }
 
       // read current cycle after issue from MMIO
-      message.trafficGenResult.currentCycleAfterIssue =
+      const std::uint64_t current_cycle_after_issue =
           (static_cast<std::uint64_t>(
                read(mmio_addrs.current_cycle_after_issue_high))
            << 32) |
           static_cast<std::uint64_t>(
               read(mmio_addrs.current_cycle_after_issue_low));
-      depopulate_processed_accesses(
-          message.trafficGenResult.currentCycleAfterIssue);
+      const std::uint32_t round_exit_reason =
+          static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
+      if (round_exit_reason == kRoundExitCapacity) {
+        depopulate_uploaded_l2_access_chunk();
+      } else {
+        depopulate_processed_accesses(current_cycle_after_issue);
+      }
+
+      if (round_exit_reason == kRoundExitCapacity &&
+          !pending_accesses_by_cycle.empty()) {
+        std::cout << "[bridge driver] capacity exit at cycle="
+                  << current_cycle_after_issue
+                  << ", refilling accessStore from pending accesses="
+                  << pending_access_cycle_by_id.size() << std::endl;
+        build_next_l2_access_chunk();
+        upload_written_to_bram = false;
+        write(mmio_addrs.min_issue_cycle_low,
+              static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+        write(mmio_addrs.min_issue_cycle_high,
+              static_cast<uint32_t>(min_issue_cycle >> 32));
+        issued_access_writeback_entries.clear();
+        issued_access_writeback_stream_bytes.clear();
+        issued_access_writeback_count = 0;
+        issued_access_writeback_bytes_received = 0;
+        issued_access_writeback_read_issued = false;
+        completed_bundle_stream_bytes.fill(0);
+        completed_bundle_bytes_received = 0;
+        completed_bundle_read_issued = false;
+        state = trafficgen_state_t::UPLOAD_SCHEDULE;
+        break;
+      }
+
+      TrafficGenResultMessage message;
+      message.trafficGenResult.issuedAccesses.reserve(accumulated_issued_accesses.size());
+      for (const auto &accumulated : accumulated_issued_accesses) {
+        IssuedAccessPoint issued_access_point{};
+        issued_access_point.requestUid = accumulated.request_uid;
+        issued_access_point.address = accumulated.address;
+        issued_access_point.cycleIssued = accumulated.cycle_issued;
+        issued_access_point.l1ToL2Cycle = accumulated.l1_to_l2_cycle;
+        issued_access_point.elapsedCycle = accumulated.elapsed_cycle;
+        issued_access_point.smId = accumulated.sm_id;
+        issued_access_point.schedulerId = accumulated.scheduler_id;
+        issued_access_point.warpId = accumulated.warp_id;
+        issued_access_point.isWrite = accumulated.is_write;
+        message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
+      }
+      message.trafficGenResult.completedBundleIds = accumulated_completed_bundle_ids;
+      message.trafficGenResult.currentCycleAfterIssue = current_cycle_after_issue;
       message.hasPendingWork =
           (read(mmio_addrs.has_pending_work) != 0) ||
           !pending_accesses_by_cycle.empty();
+      log_logical_round_for_compare(accumulated_issued_accesses,
+                                    accumulated_completed_bundle_ids,
+                                    current_cycle_after_issue);
 
       if (!gpu_model_socket_client) {
         throw std::runtime_error(
             "gpu_model socket client is not initialized");
       }
       gpu_model_socket_client->send_frame(serialize_message(message));
+      accumulated_issued_accesses.clear();
+      accumulated_completed_bundle_ids.clear();
 
       if (receive_main_loop_complete_from_gpu_model()) {
         // Resume the target CPU only after exposing global completion to the
@@ -1322,14 +1546,7 @@ void trafficgen_t::tick() {
         completed_bundle_stream_bytes.fill(0);
         completed_bundle_bytes_received = 0;
         completed_bundle_read_issued = false;
-        reserved_subpartition_bytes_received = 0;
-        reserved_subpartitions_metadata_latched = false;
-        reserved_subpartitions_base_idx = 0;
-        reserved_subpartitions_base_cycle = 0;
-        reserved_subpartitions_words.fill(0);
-        reserved_subpartitions_by_cycle.clear();
-        reserved_subpartitions_read_issued = false;
-        state = trafficgen_state_t::READ_RESERVED_PARTITIONS;
+        state = trafficgen_state_t::SEND_RESERVED_PARTITIONS;
       }
     }
     break;
