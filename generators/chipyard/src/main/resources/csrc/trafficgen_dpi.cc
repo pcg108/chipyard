@@ -719,8 +719,7 @@ public:
 
   void step(
       svBit startRound,
-      svBit uploadDone,
-      svBit blockedWarpBitmapReady,
+      svBit uploadReady,
       std::uint32_t accessStoreCount,
       std::uint64_t accessStoreMaxCycle,
       svBit accessStoreHasEntries,
@@ -756,9 +755,7 @@ public:
       std::uint32_t *completedBundleCountWriteData,
       svBit *completedBundleIdWriteEn,
       std::uint32_t *completedBundleIdWriteIdx,
-      std::uint64_t *completedBundleIdWriteData,
-      svBit *reservationWindowAdvanceEn,
-      std::uint64_t *reservationWindowAdvanceCycle) {
+      std::uint64_t *completedBundleIdWriteData) {
     const auto &config = runtimeConfig();
     bool roundFinishedThisStep = false;
     *targetBusy = (mState != State::Idle) ? 1 : 0;
@@ -784,8 +781,6 @@ public:
     *completedBundleIdWriteEn = 0;
     *completedBundleIdWriteIdx = 0;
     *completedBundleIdWriteData = 0;
-    *reservationWindowAdvanceEn = 0;
-    *reservationWindowAdvanceCycle = 0;
 
     if (!config.valid) {
       *targetBusy = 0;
@@ -799,7 +794,7 @@ public:
     }
 
     if (mState == State::Idle) {
-      if (startRound && uploadDone && blockedWarpBitmapReady) {
+      if (startRound && uploadReady) {
         mLoadedAccesses.clear();
         mLoadedAccesses.reserve(accessStoreCount);
         mAccessLoadCycle = mCurrentCycle;
@@ -954,8 +949,6 @@ public:
       }
 
       if (!anyOutstanding) {
-        *reservationWindowAdvanceEn = 1;
-        *reservationWindowAdvanceCycle = mRoundCurrentCycle;
         *currentCycleAfterIssue = mRoundCurrentCycle;
         *hasPendingWork = mRoundHasPendingWork ? 1 : 0;
         *roundComplete = 1;
@@ -1346,8 +1339,7 @@ TrafficGenDPIModel &model() {
 extern "C" void trafficgen_dpi_step(
     svBit reset,
     svBit start_round,
-    svBit upload_done,
-    svBit blocked_warp_bitmap_ready,
+    svBit upload_ready,
     std::uint32_t access_store_count,
     std::uint64_t access_store_max_cycle,
     svBit access_store_has_entries,
@@ -1408,9 +1400,7 @@ extern "C" void trafficgen_dpi_step(
     std::uint32_t *completed_bundle_count_write_data,
     svBit *completed_bundle_id_write_en,
     std::uint32_t *completed_bundle_id_write_idx,
-    std::uint64_t *completed_bundle_id_write_data,
-    svBit *reservation_window_advance_en,
-    std::uint64_t *reservation_window_advance_cycle) {
+    std::uint64_t *completed_bundle_id_write_data) {
   if (reset) {
     model().reset();
   }
@@ -1436,8 +1426,7 @@ extern "C" void trafficgen_dpi_step(
 
   model().step(
       start_round,
-      upload_done,
-      blocked_warp_bitmap_ready,
+      upload_ready,
       access_store_count,
       access_store_max_cycle,
       access_store_has_entries,
@@ -1473,9 +1462,7 @@ extern "C" void trafficgen_dpi_step(
       completed_bundle_count_write_data,
       completed_bundle_id_write_en,
       completed_bundle_id_write_idx,
-      completed_bundle_id_write_data,
-      reservation_window_advance_en,
-      reservation_window_advance_cycle);
+      completed_bundle_id_write_data);
 
   *issued_access_writeback_id = issuedAccess.id;
   *issued_access_writeback_address = issuedAccess.address;

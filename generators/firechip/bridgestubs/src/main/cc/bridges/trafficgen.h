@@ -28,10 +28,9 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t upload_count;
   uint64_t access_store_max_cycle_low;
   uint64_t access_store_max_cycle_high;
-  uint64_t upload_start;
+  uint64_t commit_upload;
   uint64_t round_complete;
-  uint64_t upload_done;
-  uint64_t blocked_warp_upload_done;
+  uint64_t upload_ready;
   uint64_t min_issue_cycle_low;
   uint64_t min_issue_cycle_high;
   uint64_t current_cycle_after_issue_low;

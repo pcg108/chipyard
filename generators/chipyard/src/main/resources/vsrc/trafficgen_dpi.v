@@ -4,8 +4,7 @@ module TrafficGenDPIBlackBox #(
   input  logic        clock,
   input  logic        reset,
   input  logic        start_round,
-  input  logic        upload_done,
-  input  logic        blocked_warp_bitmap_ready,
+  input  logic        upload_ready,
   input  logic [31:0] access_store_count,
   input  logic [63:0] access_store_max_cycle,
   input  logic        access_store_has_entries,
@@ -66,9 +65,7 @@ module TrafficGenDPIBlackBox #(
   output logic [12:0] completed_bundle_count_write_data,
   output logic        completed_bundle_id_write_en,
   output logic [11:0] completed_bundle_id_write_idx,
-  output logic [63:0] completed_bundle_id_write_data,
-  output logic        reservation_window_advance_en,
-  output logic [63:0] reservation_window_advance_cycle
+  output logic [63:0] completed_bundle_id_write_data
 );
 
   if (NGENERATORS < 1) begin : gen_invalid_ngenerators
@@ -111,14 +108,11 @@ module TrafficGenDPIBlackBox #(
   logic        completed_bundle_id_write_en_dpi;
   logic [31:0] completed_bundle_id_write_idx_dpi;
   logic [63:0] completed_bundle_id_write_data_dpi;
-  logic        reservation_window_advance_en_dpi;
-  logic [63:0] reservation_window_advance_cycle_dpi;
 
   import "DPI-C" function void trafficgen_dpi_step(
     input  bit                reset,
     input  bit                start_round,
-    input  bit                upload_done,
-    input  bit                blocked_warp_bitmap_ready,
+    input  bit                upload_ready,
     input  int unsigned       access_store_count,
     input  longint unsigned   access_store_max_cycle,
     input  bit                access_store_has_entries,
@@ -179,17 +173,14 @@ module TrafficGenDPIBlackBox #(
     output int unsigned       completed_bundle_count_write_data,
     output bit                completed_bundle_id_write_en,
     output int unsigned       completed_bundle_id_write_idx,
-    output longint unsigned   completed_bundle_id_write_data,
-    output bit                reservation_window_advance_en,
-    output longint unsigned   reservation_window_advance_cycle
+    output longint unsigned   completed_bundle_id_write_data
   );
 
   always_ff @(posedge clock) begin
     trafficgen_dpi_step(
       reset,
       start_round,
-      upload_done,
-      blocked_warp_bitmap_ready,
+      upload_ready,
       access_store_count,
       access_store_max_cycle,
       access_store_has_entries,
@@ -250,9 +241,7 @@ module TrafficGenDPIBlackBox #(
       completed_bundle_count_write_data_dpi,
       completed_bundle_id_write_en_dpi,
       completed_bundle_id_write_idx_dpi,
-      completed_bundle_id_write_data_dpi,
-      reservation_window_advance_en_dpi,
-      reservation_window_advance_cycle_dpi
+      completed_bundle_id_write_data_dpi
     );
 
     target_busy <= target_busy_dpi;
@@ -291,8 +280,6 @@ module TrafficGenDPIBlackBox #(
     completed_bundle_id_write_en <= completed_bundle_id_write_en_dpi;
     completed_bundle_id_write_idx <= completed_bundle_id_write_idx_dpi[11:0];
     completed_bundle_id_write_data <= completed_bundle_id_write_data_dpi;
-    reservation_window_advance_en <= reservation_window_advance_en_dpi;
-    reservation_window_advance_cycle <= reservation_window_advance_cycle_dpi;
   end
 
 endmodule

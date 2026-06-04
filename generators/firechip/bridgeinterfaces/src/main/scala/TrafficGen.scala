@@ -121,7 +121,6 @@ class TrafficGenPortIO extends Bundle {
   val startRound = Input(Bool())
   val trafficGenDone = Input(Bool())
   val minIssueCycle = Input(UInt(64.W))
-  val blockedWarpBitmapReady = Input(Bool())
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())
   val blockedWarpQueryRespStored = Output(Bool())
@@ -139,9 +138,7 @@ class TrafficGenPortIO extends Bundle {
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
-  val reservationWindowAdvanceCycle = Output(UInt(64.W))
-  val reservationWindowAdvanceEn = Output(Bool())
-  val uploadDone = Input(Bool())
+  val uploadReady = Input(Bool())
 }
 
 case class TrafficGenBridgeKey(maxL2AccessEntries: Int)

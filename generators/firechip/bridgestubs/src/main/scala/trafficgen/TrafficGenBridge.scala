@@ -49,7 +49,6 @@ object TrafficGenBridge {
     trafficGenIO.startRound := ep.io.trafficgen.startRound
     trafficGenIO.trafficGenDone := ep.io.trafficgen.trafficGenDone
     trafficGenIO.minIssueCycle := ep.io.trafficgen.minIssueCycle
-    trafficGenIO.blockedWarpBitmapReady := ep.io.trafficgen.blockedWarpBitmapReady
     ep.io.trafficgen.blockedWarpQueryIdx := trafficGenIO.blockedWarpQueryIdx
     ep.io.trafficgen.blockedWarpQueryEn := trafficGenIO.blockedWarpQueryEn
     ep.io.trafficgen.blockedWarpQueryRespStored := trafficGenIO.blockedWarpQueryRespStored
@@ -67,9 +66,7 @@ object TrafficGenBridge {
     trafficGenIO.accessStoreCount := ep.io.trafficgen.accessStoreCount
     trafficGenIO.accessStoreMaxCycle := ep.io.trafficgen.accessStoreMaxCycle
     trafficGenIO.accessStoreHasEntries := ep.io.trafficgen.accessStoreHasEntries
-    ep.io.trafficgen.reservationWindowAdvanceCycle := trafficGenIO.reservationWindowAdvanceCycle
-    ep.io.trafficgen.reservationWindowAdvanceEn := trafficGenIO.reservationWindowAdvanceEn
-    trafficGenIO.uploadDone := ep.io.trafficgen.uploadDone
+    trafficGenIO.uploadReady := ep.io.trafficgen.uploadReady
     ep.io.clock := clock
     ep.io.reset := reset
     ep

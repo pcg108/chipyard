@@ -906,6 +906,11 @@ void trafficgen_t::send_reserved_subpartitions_snapshot(
 }
 
 void trafficgen_t::build_next_l2_access_chunk() {
+  /*
+    Build the set of accesses to upload to target for next scheduling round,
+    rounded down to the nearest cycle boundary taht fits in BRAM
+  */
+
   l2_accesses.clear();
   const size_t max_entries = access_window_bytes / L2_ACCESS_STREAM_BYTES;
   if (pending_accesses_by_cycle.empty()) {
@@ -942,6 +947,9 @@ void trafficgen_t::build_next_l2_access_chunk() {
 }
 
 L2SubpartitionReservationsByCycle trafficgen_t::build_reserved_subpartitions_from_pending() const {
+
+  // create the cycle : subpartition reservation map from the un-issued accesses to send to scheduler
+
   L2SubpartitionReservationsByCycle reservations;
   for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
     auto &reserved_subpartitions = reservations[cycle];
@@ -1070,6 +1078,9 @@ void trafficgen_t::log_logical_round_for_compare(
 }
 
 void trafficgen_t::receive_schedule_from_gpu_model() {
+  /*
+    Read the L2 access schedule and blocked warp IDs from GPU model socket
+  */
   if (!gpu_model_socket_client) {
     throw std::runtime_error(
         "gpu_model socket client is not initialized");
@@ -1160,6 +1171,10 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
 
+  /*
+    read completed bundle IDs from bridge module using XDMA
+  */
+
   // 64 bits per ID, so 8 IDs per 512-bit beat.
   const size_t total_bytes = COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES;
   if (completed_bundle_bytes_received >= total_bytes) {
@@ -1207,8 +1222,7 @@ size_t
 trafficgen_t::process_issued_access_writeback_stream() {
 
   /*
-    read issued access from bridge module 
-    same as sending L2 accesses, we read 1 access per beat
+    read issued access from bridge module using XDMA
   */
 
   if (issued_access_writeback_count == 0) {
@@ -1256,6 +1270,7 @@ void trafficgen_t::write_schedule_to_bram() {
     return;
   }
 
+  // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O
   auto &xdma = simif.get_cpu_managed_stream_io();
 
   const size_t access_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
@@ -1265,6 +1280,7 @@ void trafficgen_t::write_schedule_to_bram() {
   if (l2_accesses.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("TrafficGen L2 access upload count exceeds MMIO width");
   }
+  // Pack the L2 accesses into a byte buffer for XDMA writing
   if (access_bytes != 0) {
     auto packed_accesses = make_aligned_bytes(access_bytes);
     std::memset(packed_accesses.get(), 0, access_bytes);
@@ -1280,6 +1296,7 @@ void trafficgen_t::write_schedule_to_bram() {
         "XDMA write while uploading TrafficGen L2 accesses");
   }
 
+  // pack the blocked warp bitmap into a byte buffer for XDMA writing
   const size_t bitmap_bytes = BLOCKED_WARP_BITMAP_BEATS * STREAM_WIDTH_BYTES;
   if (bitmap_bytes > blocked_window_bytes) {
     throw std::runtime_error("TrafficGen blocked-warp upload exceeds BRAM bitmap window");
@@ -1293,6 +1310,7 @@ void trafficgen_t::write_schedule_to_bram() {
       bitmap_bytes,
       "XDMA write while uploading TrafficGen blocked-warp bitmap");
 
+  // write access meta data into MMIO registers
   const std::uint64_t max_cycle =
       l2_accesses.empty() ? 0 : l2_accesses.back().cycle_count;
   write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
@@ -1300,7 +1318,7 @@ void trafficgen_t::write_schedule_to_bram() {
         static_cast<uint32_t>(max_cycle & 0xffffffffULL));
   write(mmio_addrs.access_store_max_cycle_high,
         static_cast<uint32_t>(max_cycle >> 32));
-  write(mmio_addrs.upload_start, 1);
+  write(mmio_addrs.commit_upload, 1);
 
   upload_written_to_bram = true;
 }
@@ -1349,10 +1367,10 @@ void trafficgen_t::tick() {
 
       // Reset upload progress and kick off host->target BRAM upload.
       upload_written_to_bram = false;
-      write(mmio_addrs.min_issue_cycle_low,
-            static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
-      write(mmio_addrs.min_issue_cycle_high,
-            static_cast<uint32_t>(min_issue_cycle >> 32));
+
+      // write min issue cycle
+      write(mmio_addrs.min_issue_cycle_low, static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+      write(mmio_addrs.min_issue_cycle_high, static_cast<uint32_t>(min_issue_cycle >> 32));
 
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
 
@@ -1363,8 +1381,8 @@ void trafficgen_t::tick() {
     // write schedule and blocked warp bitmap to bridge module via XDMA
     push_upload_data();
 
-    if ((l2_accesses.empty() || read(mmio_addrs.upload_done)) &&
-        read(mmio_addrs.blocked_warp_upload_done)) {
+    // once the upload is complete, signal target to start round and unpause target clock
+    if (read(mmio_addrs.upload_ready)) {
 
       std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
 
@@ -1378,8 +1396,8 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::ISSUING_TRAFFIC:
     // Wait for the target to finish generating memory traffic for the current round.
 
+    // pause target while we read back the results from this round and prepare for the next round
     if (read(mmio_addrs.round_complete) && !round_completion_pause_issued) {
-      // Hold target fire low while bridge-side retire and reservation clear sweeps drain.
       write(mmio_addrs.pause_target, 1);
       round_completion_pause_issued = true;
     }
@@ -1388,6 +1406,8 @@ void trafficgen_t::tick() {
     if (round_completion_pause_issued &&
         !read(mmio_addrs.target_busy) &&
         read(mmio_addrs.round_complete)) {
+
+      // prepare to read back traffic generator outputs
       issued_access_writeback_entries.clear();
       issued_access_writeback_stream_bytes.clear();
       issued_access_writeback_count = 0;
@@ -1396,6 +1416,7 @@ void trafficgen_t::tick() {
       completed_bundle_stream_bytes.fill(0);
       completed_bundle_bytes_received = 0;
       completed_bundle_read_issued = false;
+
       state = trafficgen_state_t::READING_TRAFFICGEN_OUTPUT;
     }
     break;
@@ -1462,31 +1483,28 @@ void trafficgen_t::tick() {
 
       // read current cycle after issue from MMIO
       const std::uint64_t current_cycle_after_issue =
-          (static_cast<std::uint64_t>(
-               read(mmio_addrs.current_cycle_after_issue_high))
-           << 32) |
-          static_cast<std::uint64_t>(
-              read(mmio_addrs.current_cycle_after_issue_low));
-      const std::uint32_t round_exit_reason =
-          static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
+          (static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue_high)) << 32) |
+          static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue_low));
+
+      // read round exit reason
+      const std::uint32_t round_exit_reason = static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
+      // if it was a normal exit, we depopulate by cycle, otherwise, depopulate by ID (since cycle is not complete)
       if (round_exit_reason == kRoundExitCapacity) {
         depopulate_uploaded_l2_access_chunk();
       } else {
         depopulate_processed_accesses(current_cycle_after_issue);
       }
 
-      if (round_exit_reason == kRoundExitCapacity &&
-          !pending_accesses_by_cycle.empty()) {
+      // on a capacity exit (completed set in BRAM but not all accesses in round), do the next chunk
+      if (round_exit_reason == kRoundExitCapacity && !pending_accesses_by_cycle.empty()) {
         std::cout << "[bridge driver] capacity exit at cycle="
                   << current_cycle_after_issue
                   << ", refilling accessStore from pending accesses="
                   << pending_access_cycle_by_id.size() << std::endl;
         build_next_l2_access_chunk();
         upload_written_to_bram = false;
-        write(mmio_addrs.min_issue_cycle_low,
-              static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
-        write(mmio_addrs.min_issue_cycle_high,
-              static_cast<uint32_t>(min_issue_cycle >> 32));
+        write(mmio_addrs.min_issue_cycle_low, static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+        write(mmio_addrs.min_issue_cycle_high, static_cast<uint32_t>(min_issue_cycle >> 32));
         issued_access_writeback_entries.clear();
         issued_access_writeback_stream_bytes.clear();
         issued_access_writeback_count = 0;
@@ -1499,6 +1517,8 @@ void trafficgen_t::tick() {
         break;
       }
 
+      // once the entire round is complete, send accumulated issued accesses
+      // and completed bundle IDs to gpu_model via socket
       TrafficGenResultMessage message;
       message.trafficGenResult.issuedAccesses.reserve(accumulated_issued_accesses.size());
       for (const auto &accumulated : accumulated_issued_accesses) {
@@ -1516,9 +1536,7 @@ void trafficgen_t::tick() {
       }
       message.trafficGenResult.completedBundleIds = accumulated_completed_bundle_ids;
       message.trafficGenResult.currentCycleAfterIssue = current_cycle_after_issue;
-      message.hasPendingWork =
-          (read(mmio_addrs.has_pending_work) != 0) ||
-          !pending_accesses_by_cycle.empty();
+      message.hasPendingWork = (read(mmio_addrs.has_pending_work) != 0) || !pending_accesses_by_cycle.empty();
       log_logical_round_for_compare(accumulated_issued_accesses,
                                     accumulated_completed_bundle_ids,
                                     current_cycle_after_issue);
@@ -1532,8 +1550,7 @@ void trafficgen_t::tick() {
       accumulated_completed_bundle_ids.clear();
 
       if (receive_main_loop_complete_from_gpu_model()) {
-        // Resume the target CPU only after exposing global completion to the
-        // target-side trafficgen test.
+        // indicate to target that trafficgen is done and unpause target
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
         state = trafficgen_state_t::IDLE;

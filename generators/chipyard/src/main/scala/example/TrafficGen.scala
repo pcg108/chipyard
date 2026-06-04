@@ -58,10 +58,8 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
 
   //// Host -> Target control/status
 
-  // L2 accesses have been written to bridge module access store
-  val uploadDone = Input(Bool())
-  // blocked warp bitmap has been written to bridge module
-  val blockedWarpBitmapReady = Input(Bool())
+  // L2 accesses and blocked warp bitmap have been written to the bridge module.
+  val uploadReady = Input(Bool())
   // furthest the TG is allowed to issue
   val minIssueCycle = Input(UInt(64.W))
   // begin next round of issuing
@@ -110,9 +108,7 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
   val blockedWarpQueryReady = Input(Bool())
-  val reservationWindowAdvanceCycle = Output(UInt(64.W))
-  val reservationWindowAdvanceEn = Output(Bool())
-  
+
 
   val memActive = Input(Bool())
   val memInflightAccesses = Input(Vec(nGenerators, UInt(log2Ceil(memOutstanding + 1).W)))
@@ -133,8 +129,7 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val clock = Input(Clock())
     val reset = Input(Bool())
     val start_round = Input(Bool())
-    val upload_done = Input(Bool())
-    val blocked_warp_bitmap_ready = Input(Bool())
+    val upload_ready = Input(Bool())
     val access_store_count = Input(UInt(32.W))
     val access_store_max_cycle = Input(UInt(64.W))
     val access_store_has_entries = Input(Bool())
@@ -205,8 +200,6 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val completed_bundle_id_write_idx = Output(UInt(CompletedBundleIds.idxWidth.W))
     val completed_bundle_id_write_data = Output(UInt(64.W))
 
-    val reservation_window_advance_en = Output(Bool())
-    val reservation_window_advance_cycle = Output(UInt(64.W))
   })
 
   // pulls in SV wrapper resource  
@@ -230,8 +223,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   dpi.io.reset := reset.asBool
 
   dpi.io.start_round := io.startRound
-  dpi.io.upload_done := io.uploadDone
-  dpi.io.blocked_warp_bitmap_ready := io.blockedWarpBitmapReady
+  dpi.io.upload_ready := io.uploadReady
   dpi.io.access_store_count := io.accessStoreCount
   dpi.io.access_store_max_cycle := io.accessStoreMaxCycle
   dpi.io.access_store_has_entries := io.accessStoreHasEntries
@@ -291,8 +283,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   io.blockedWarpQueryIdx := dpi.io.blocked_warp_query_idx
   io.blockedWarpQueryEn := dpi.io.blocked_warp_query_en
   io.blockedWarpQueryRespStored := dpi.io.blocked_warp_query_resp_stored
-  io.reservationWindowAdvanceCycle := dpi.io.reservation_window_advance_cycle
-  io.reservationWindowAdvanceEn := dpi.io.reservation_window_advance_en
 
   io.hasPendingWork := dpi.io.has_pending_work
   roundStarted := dpi.io.round_started
@@ -569,10 +559,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.completedBundleCountWriteEn := false.B
   io.completedBundleCountWriteData := 0.U
 
-  // default reservation window advance interface values
-  io.reservationWindowAdvanceCycle := 0.U
-  io.reservationWindowAdvanceEn := false.B
-
   // drive the issue node with the pending issue when issueCanFire
   for (i <- 0 until params.numGenerators) {
     io.issue(i).valid := issueCanFire && issueLaneOH(i)
@@ -704,10 +690,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   switch(state) {
 
-    // start condition for a round to begin: host signals startRound, all accesses are uploaded to bridge module,
-    // blocked warp bitmap is uploaded, and access read interface is ready 
+    // start condition for a round to begin: host signals startRound, upload data is ready,
+    // and access read interface is ready
     is(sIdle) {
-      when(io.startRound && io.uploadDone && io.blockedWarpBitmapReady && io.accessReadReady) {
+      when(io.startRound && io.uploadReady && io.accessReadReady) {
         assert(!accessReadResponseQueue.io.deq.valid,
           "TrafficGenRTLEngine started a round with stale access read responses")
         bucketDoneSeen := false.B
@@ -749,9 +735,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         pendingAccessReadBucketDone := false.B
         readReqPending := false.B
         accessReadRequestActive := false.B
-        // advance the access window to retire the old bucket
-        io.reservationWindowAdvanceCycle := modelCycle
-        io.reservationWindowAdvanceEn := true.B
       }.elsewhen(readReqPending) { // if we have a pending read request, keep it asserted until the bridge returns a response
         when(accessReadRequestActive) {
           io.accessReadEn := true.B
@@ -916,8 +899,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         case TrafficGenRTLBackend => Module(new TrafficGenRTLEngine(params))
       }
 
-      engine.io.uploadDone := io.uploadDone
-      engine.io.blockedWarpBitmapReady := io.blockedWarpBitmapReady
+      engine.io.uploadReady := io.uploadReady
       engine.io.minIssueCycle := io.minIssueCycle
       engine.io.startRound := io.startRound
       engine.io.trafficGenDone := io.trafficGenDone
@@ -961,8 +943,6 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.accessReadEn := engine.io.accessReadEn
       io.accessReadDataReady := engine.io.accessReadDataReady
       io.accessReadBucketDoneReady := engine.io.accessReadBucketDoneReady
-      io.reservationWindowAdvanceCycle := engine.io.reservationWindowAdvanceCycle
-      io.reservationWindowAdvanceEn := engine.io.reservationWindowAdvanceEn
       trafficGenIdle := !engine.io.targetBusy
 
       for (i <- 0 until params.numGenerators) {
@@ -971,7 +951,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         engine.io.issue(i).ready := io.issue(i).ready
       }
 
-      when(io.uploadDone && io.blockedWarpBitmapReady) {
+      when(io.uploadReady) {
         patternReady := true.B
       }
 
@@ -979,12 +959,11 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x00 -> Seq(RegField.r(1, trafficGenIdle)),
         0x04 -> Seq(RegField.w(1, startTrafficGenPulse)),
         0x08 -> Seq(RegField.r(1, io.targetBusy)),
-        0x0C -> Seq(RegField.r(1, io.uploadDone)),
+        0x0C -> Seq(RegField.r(1, io.uploadReady)),
         0x10 -> Seq(RegField.r(1, io.trafficGenDone)),
         0x18 -> Seq(RegField.r(1, patternReady)),
         0x20 -> Seq(RegField.r(32, io.minIssueCycle(31, 0))),
         0x24 -> Seq(RegField.r(32, io.minIssueCycle(63, 32))),
-        0x28 -> Seq(RegField.r(1, io.blockedWarpBitmapReady)),
         0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue(31, 0))),
         0x3C -> Seq(RegField.r(32, io.currentCycleAfterIssue(63, 32))),
         0x40 -> Seq(RegField.r(32, io.dpiState)),
@@ -1177,7 +1156,6 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.startRound <> trafficGenTL.module.io.startRound
       outerIO.bits.trafficGenDone <> trafficGenTL.module.io.trafficGenDone
       outerIO.bits.minIssueCycle <> trafficGenTL.module.io.minIssueCycle
-      outerIO.bits.blockedWarpBitmapReady <> trafficGenTL.module.io.blockedWarpBitmapReady
       outerIO.bits.blockedWarpQueryIdx <> trafficGenTL.module.io.blockedWarpQueryIdx
       outerIO.bits.blockedWarpQueryEn <> trafficGenTL.module.io.blockedWarpQueryEn
       outerIO.bits.blockedWarpQueryRespStored <> trafficGenTL.module.io.blockedWarpQueryRespStored
@@ -1195,9 +1173,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.accessStoreCount <> trafficGenTL.module.io.accessStoreCount
       outerIO.bits.accessStoreMaxCycle <> trafficGenTL.module.io.accessStoreMaxCycle
       outerIO.bits.accessStoreHasEntries <> trafficGenTL.module.io.accessStoreHasEntries
-      outerIO.bits.reservationWindowAdvanceCycle <> trafficGenTL.module.io.reservationWindowAdvanceCycle
-      outerIO.bits.reservationWindowAdvanceEn <> trafficGenTL.module.io.reservationWindowAdvanceEn
-      outerIO.bits.uploadDone <> trafficGenTL.module.io.uploadDone
+      outerIO.bits.uploadReady <> trafficGenTL.module.io.uploadReady
 
       trafficGenTL.module.io.memActive := generators.map(_.module.io.active).foldLeft(false.B)(_ || _)
       trafficGenTL.module.io.memInflightAccesses := VecInit(generators.map(_.module.io.inflightAccessCount))
