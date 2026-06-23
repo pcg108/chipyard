@@ -29,7 +29,6 @@ module TrafficGenDPIBlackBox #(
   input  logic        blocked_warp_query_resp,
   input  logic        blocked_warp_query_ready,
   input  logic        issued_access_writeback_ready,
-  input  logic        reservation_clear_ready,
   output logic        target_busy,
   output logic        has_pending_work,
   output logic        round_started,
@@ -58,9 +57,6 @@ module TrafficGenDPIBlackBox #(
   output logic [63:0] issued_access_writeback_bundle_id,
   output logic        issued_access_writeback_wake_relevant_bundle,
   output logic        issued_access_writeback_is_write,
-  output logic        reservation_clear_valid,
-  output logic [63:0] reservation_clear_cycle,
-  output logic [31:0] reservation_clear_subpartition,
   output logic        completed_bundle_count_write_en,
   output logic [12:0] completed_bundle_count_write_data,
   output logic        completed_bundle_id_write_en,
@@ -100,9 +96,6 @@ module TrafficGenDPIBlackBox #(
   logic [63:0] issued_access_writeback_bundle_id_dpi;
   logic        issued_access_writeback_wake_relevant_bundle_dpi;
   logic        issued_access_writeback_is_write_dpi;
-  logic        reservation_clear_valid_dpi;
-  logic [63:0] reservation_clear_cycle_dpi;
-  logic [31:0] reservation_clear_subpartition_dpi;
   logic        completed_bundle_count_write_en_dpi;
   logic [31:0] completed_bundle_count_write_data_dpi;
   logic        completed_bundle_id_write_en_dpi;
@@ -137,7 +130,6 @@ module TrafficGenDPIBlackBox #(
     input  bit                blocked_warp_query_resp,
     input  bit                blocked_warp_query_ready,
     input  bit                issued_access_writeback_ready,
-    input  bit                reservation_clear_ready,
     output bit                target_busy,
     output bit                has_pending_work,
     output bit                round_started,
@@ -166,9 +158,6 @@ module TrafficGenDPIBlackBox #(
     output longint unsigned   issued_access_writeback_bundle_id,
     output bit                issued_access_writeback_wake_relevant_bundle,
     output bit                issued_access_writeback_is_write,
-    output bit                reservation_clear_valid,
-    output longint unsigned   reservation_clear_cycle,
-    output int unsigned       reservation_clear_subpartition,
     output bit                completed_bundle_count_write_en,
     output int unsigned       completed_bundle_count_write_data,
     output bit                completed_bundle_id_write_en,
@@ -205,7 +194,6 @@ module TrafficGenDPIBlackBox #(
       blocked_warp_query_resp,
       blocked_warp_query_ready,
       issued_access_writeback_ready,
-      reservation_clear_ready,
       target_busy_dpi,
       has_pending_work_dpi,
       round_started_dpi,
@@ -234,9 +222,6 @@ module TrafficGenDPIBlackBox #(
       issued_access_writeback_bundle_id_dpi,
       issued_access_writeback_wake_relevant_bundle_dpi,
       issued_access_writeback_is_write_dpi,
-      reservation_clear_valid_dpi,
-      reservation_clear_cycle_dpi,
-      reservation_clear_subpartition_dpi,
       completed_bundle_count_write_en_dpi,
       completed_bundle_count_write_data_dpi,
       completed_bundle_id_write_en_dpi,
@@ -272,9 +257,6 @@ module TrafficGenDPIBlackBox #(
     issued_access_writeback_bundle_id <= issued_access_writeback_bundle_id_dpi;
     issued_access_writeback_wake_relevant_bundle <= issued_access_writeback_wake_relevant_bundle_dpi;
     issued_access_writeback_is_write <= issued_access_writeback_is_write_dpi;
-    reservation_clear_valid <= reservation_clear_valid_dpi;
-    reservation_clear_cycle <= reservation_clear_cycle_dpi;
-    reservation_clear_subpartition <= reservation_clear_subpartition_dpi;
     completed_bundle_count_write_en <= completed_bundle_count_write_en_dpi;
     completed_bundle_count_write_data <= completed_bundle_count_write_data_dpi[12:0];
     completed_bundle_id_write_en <= completed_bundle_id_write_en_dpi;

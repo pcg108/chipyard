@@ -157,7 +157,6 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val blocked_warp_query_ready = Input(Bool())
 
     val issued_access_writeback_ready = Input(Bool())
-    val reservation_clear_ready = Input(Bool())
 
     val target_busy = Output(Bool())
     val has_pending_work = Output(Bool())
@@ -189,10 +188,6 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val issued_access_writeback_bundle_id = Output(UInt(64.W))
     val issued_access_writeback_wake_relevant_bundle = Output(Bool())
     val issued_access_writeback_is_write = Output(Bool())
-
-    val reservation_clear_valid = Output(Bool())
-    val reservation_clear_cycle = Output(UInt(64.W))
-    val reservation_clear_subpartition = Output(UInt(32.W))
 
     val completed_bundle_count_write_en = Output(Bool())
     val completed_bundle_count_write_data = Output(UInt(CompletedBundleIds.countWidth.W))
@@ -269,7 +264,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   issuedAccessWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
 
   dpi.io.issued_access_writeback_ready := issuedAccessWritebackLanes(0).ready
-  dpi.io.reservation_clear_ready := true.B
 
   io.currentCycleAfterIssue := currentCycleAfterIssue
   io.roundStarted := roundStarted

@@ -105,11 +105,6 @@ private:
   }
 };
 
-struct ReservationClear {
-  std::uint64_t cycle = 0;
-  std::uint32_t subpartition = 0;
-};
-
 struct PendingAccessInfo {
   std::uint64_t finishCycle = 0;
   WarpKey warpKey;
@@ -700,7 +695,6 @@ public:
     mBlockedWarpSet.clear();
     mIssuedQueue.clear();
     mIssuedAccessPoints.clear();
-    mReservationClearQueue.clear();
     mCompletedBundleQueue.clear();
     mPendingBundleIdIdx = 0;
     mRoundCurrentCycle = 0;
@@ -732,7 +726,6 @@ public:
       svBit blockedWarpQueryResp,
       svBit blockedWarpQueryReady,
       svBit issuedAccessReady,
-      svBit reservationClearReady,
       svBit *targetBusy,
       svBit *hasPendingWork,
       svBit *roundStarted,
@@ -749,8 +742,6 @@ public:
       svBit *blockedWarpQueryRespStored,
       svBit *issuedAccessValid,
       Access *issuedAccess,
-      svBit *reservationClearValid,
-      ReservationClear *reservationClear,
       svBit *completedBundleCountWriteEn,
       std::uint32_t *completedBundleCountWriteData,
       svBit *completedBundleIdWriteEn,
@@ -774,8 +765,6 @@ public:
     *blockedWarpQueryRespStored = 0;
     *issuedAccessValid = 0;
     *issuedAccess = Access{};
-    *reservationClearValid = 0;
-    *reservationClear = ReservationClear{};
     *completedBundleCountWriteEn = 0;
     *completedBundleCountWriteData = 0;
     *completedBundleIdWriteEn = 0;
@@ -808,7 +797,6 @@ public:
         mBlockedWarpSet.clear();
         mBlockedWarpQueryList.clear();
         mIssuedQueue.clear();
-        mReservationClearQueue.clear();
         mCompletedBundleQueue.clear();
         mPendingBundleIdIdx = 0;
         mRoundCurrentCycle = mCurrentCycle;
@@ -922,14 +910,6 @@ public:
         anyOutstanding = true;
         if (issuedAccessReady) {
           mIssuedQueue.erase(mIssuedQueue.begin());
-        }
-      }
-      if (!mReservationClearQueue.empty()) {
-        *reservationClearValid = 1;
-        *reservationClear = mReservationClearQueue.front();
-        anyOutstanding = true;
-        if (reservationClearReady) {
-          mReservationClearQueue.erase(mReservationClearQueue.begin());
         }
       }
       if (!mCompletedCountSent) {
@@ -1131,7 +1111,6 @@ private:
 
     mIssuedQueue.clear();
     mIssuedAccessPoints.clear();
-    mReservationClearQueue.clear();
     mCompletedBundleQueue.clear();
     mCompletedCountSent = false;
     mPendingBundleIdIdx = 0;
@@ -1315,7 +1294,6 @@ private:
 
   std::vector<Access> mIssuedQueue;
   std::vector<IssuedAccessPoint> mIssuedAccessPoints;
-  std::vector<ReservationClear> mReservationClearQueue;
   std::vector<std::uint64_t> mCompletedBundleQueue;
   bool mCompletedCountSent = false;
   std::size_t mPendingBundleIdIdx = 0;
@@ -1364,7 +1342,6 @@ extern "C" void trafficgen_dpi_step(
     svBit blocked_warp_query_resp,
     svBit blocked_warp_query_ready,
     svBit issued_access_writeback_ready,
-    svBit reservation_clear_ready,
     svBit *target_busy,
     svBit *has_pending_work,
     svBit *round_started,
@@ -1393,9 +1370,6 @@ extern "C" void trafficgen_dpi_step(
     std::uint64_t *issued_access_writeback_bundle_id,
     svBit *issued_access_writeback_wake_relevant_bundle,
     svBit *issued_access_writeback_is_write,
-    svBit *reservation_clear_valid,
-    std::uint64_t *reservation_clear_cycle,
-    std::uint32_t *reservation_clear_subpartition,
     svBit *completed_bundle_count_write_en,
     std::uint32_t *completed_bundle_count_write_data,
     svBit *completed_bundle_id_write_en,
@@ -1422,7 +1396,6 @@ extern "C" void trafficgen_dpi_step(
   };
 
   Access issuedAccess{};
-  ReservationClear reservationClear{};
 
   model().step(
       start_round,
@@ -1439,7 +1412,6 @@ extern "C" void trafficgen_dpi_step(
       blocked_warp_query_resp,
       blocked_warp_query_ready,
       issued_access_writeback_ready,
-      reservation_clear_ready,
       target_busy,
       has_pending_work,
       round_started,
@@ -1456,8 +1428,6 @@ extern "C" void trafficgen_dpi_step(
       blocked_warp_query_resp_stored,
       issued_access_writeback_valid,
       &issuedAccess,
-      reservation_clear_valid,
-      &reservationClear,
       completed_bundle_count_write_en,
       completed_bundle_count_write_data,
       completed_bundle_id_write_en,
@@ -1479,7 +1449,4 @@ extern "C" void trafficgen_dpi_step(
   *issued_access_writeback_wake_relevant_bundle =
       issuedAccess.wakeRelevantBundle ? 1 : 0;
   *issued_access_writeback_is_write = issuedAccess.isWrite ? 1 : 0;
-
-  *reservation_clear_cycle = reservationClear.cycle;
-  *reservation_clear_subpartition = reservationClear.subpartition;
 }
