@@ -1,5 +1,38 @@
+`define TG_ACCESS_READ_PORTS(idx) \
+  input  logic        access_read_data_valid_``idx, \
+  input  logic [63:0] access_read_id_``idx, \
+  input  logic [63:0] access_read_address_``idx, \
+  input  logic [63:0] access_read_cycle_count_``idx, \
+  input  logic [31:0] access_read_subpartition_``idx, \
+  input  logic [31:0] access_read_set_index_``idx, \
+  input  logic [63:0] access_read_tag_``idx, \
+  input  logic [31:0] access_read_mask_``idx, \
+  input  logic [31:0] access_read_sm_id_``idx, \
+  input  logic [7:0]  access_read_scheduler_id_``idx, \
+  input  logic [31:0] access_read_warp_id_``idx, \
+  input  logic [63:0] access_read_bundle_id_``idx, \
+  input  logic        access_read_wake_relevant_bundle_``idx, \
+  input  logic        access_read_is_write_``idx,
+
+`define TG_ACCESS_READ_ASSIGN(idx) \
+  assign access_read_data_valid_batch[idx] = access_read_data_valid_``idx; \
+  assign access_read_id_batch[idx] = access_read_id_``idx; \
+  assign access_read_address_batch[idx] = access_read_address_``idx; \
+  assign access_read_cycle_count_batch[idx] = access_read_cycle_count_``idx; \
+  assign access_read_subpartition_batch[idx] = access_read_subpartition_``idx; \
+  assign access_read_set_index_batch[idx] = access_read_set_index_``idx; \
+  assign access_read_tag_batch[idx] = access_read_tag_``idx; \
+  assign access_read_mask_batch[idx] = access_read_mask_``idx; \
+  assign access_read_sm_id_batch[idx] = access_read_sm_id_``idx; \
+  assign access_read_scheduler_id_batch[idx] = access_read_scheduler_id_``idx; \
+  assign access_read_warp_id_batch[idx] = access_read_warp_id_``idx; \
+  assign access_read_bundle_id_batch[idx] = access_read_bundle_id_``idx; \
+  assign access_read_wake_relevant_bundle_batch[idx] = access_read_wake_relevant_bundle_``idx; \
+  assign access_read_is_write_batch[idx] = access_read_is_write_``idx;
+
 module TrafficGenDPIBlackBox #(
-  parameter int NGENERATORS = 1
+  parameter int NGENERATORS = 1,
+  parameter int ACCESS_READ_BATCH_LANES = 16
 ) (
   input  logic        clock,
   input  logic        reset,
@@ -9,22 +42,26 @@ module TrafficGenDPIBlackBox #(
   input  logic [63:0] access_store_max_cycle,
   input  logic        access_store_has_entries,
   input  logic [63:0] min_issue_cycle,
-  input  logic        access_read_data_valid,
+  input  logic        access_read_resp_valid,
+  input  logic [31:0] access_read_resp_id,
   input  logic        access_read_bucket_done,
   input  logic        access_read_ready,
-  input  logic [63:0] access_read_id,
-  input  logic [63:0] access_read_address,
-  input  logic [63:0] access_read_cycle_count,
-  input  logic [31:0] access_read_subpartition,
-  input  logic [31:0] access_read_set_index,
-  input  logic [63:0] access_read_tag,
-  input  logic [31:0] access_read_mask,
-  input  logic [31:0] access_read_sm_id,
-  input  logic [7:0]  access_read_scheduler_id,
-  input  logic [31:0] access_read_warp_id,
-  input  logic [63:0] access_read_bundle_id,
-  input  logic        access_read_wake_relevant_bundle,
-  input  logic        access_read_is_write,
+  `TG_ACCESS_READ_PORTS(0)
+  `TG_ACCESS_READ_PORTS(1)
+  `TG_ACCESS_READ_PORTS(2)
+  `TG_ACCESS_READ_PORTS(3)
+  `TG_ACCESS_READ_PORTS(4)
+  `TG_ACCESS_READ_PORTS(5)
+  `TG_ACCESS_READ_PORTS(6)
+  `TG_ACCESS_READ_PORTS(7)
+  `TG_ACCESS_READ_PORTS(8)
+  `TG_ACCESS_READ_PORTS(9)
+  `TG_ACCESS_READ_PORTS(10)
+  `TG_ACCESS_READ_PORTS(11)
+  `TG_ACCESS_READ_PORTS(12)
+  `TG_ACCESS_READ_PORTS(13)
+  `TG_ACCESS_READ_PORTS(14)
+  `TG_ACCESS_READ_PORTS(15)
   input  logic        blocked_warp_query_resp_valid,
   input  logic        blocked_warp_query_resp,
   input  logic        blocked_warp_query_ready,
@@ -38,8 +75,7 @@ module TrafficGenDPIBlackBox #(
   output logic [31:0] dpi_state,
   output logic        access_read_en,
   output logic [63:0] access_read_cycle,
-  output logic        access_read_data_ready,
-  output logic        access_read_bucket_done_ready,
+  output logic        access_read_batch_ready,
   output logic        blocked_warp_query_en,
   output logic [18:0] blocked_warp_query_idx,
   output logic        blocked_warp_query_resp_stored,
@@ -61,7 +97,17 @@ module TrafficGenDPIBlackBox #(
   output logic [12:0] completed_bundle_count_write_data,
   output logic        completed_bundle_id_write_en,
   output logic [11:0] completed_bundle_id_write_idx,
-  output logic [63:0] completed_bundle_id_write_data
+  output logic [63:0] completed_bundle_id_write_data,
+  output logic        debug_completion_event_valid,
+  output logic        debug_completion_event_wake_exit,
+  output logic [63:0] debug_completion_event_bundle_id,
+  output logic        debug_completion_event_wake_relevant,
+  output logic        debug_completion_event_warp_blocked,
+  output logic        debug_completion_event_current_warp_blocked,
+  output logic [31:0] debug_completion_event_sm_id,
+  output logic [31:0] debug_completion_event_scheduler_id,
+  output logic [31:0] debug_completion_event_warp_id,
+  output logic [63:0] debug_completion_event_cycle
 );
 
   if (NGENERATORS < 1) begin : gen_invalid_ngenerators
@@ -77,8 +123,7 @@ module TrafficGenDPIBlackBox #(
   logic [31:0] dpi_state_dpi;
   logic        access_read_en_dpi;
   logic [63:0] access_read_cycle_dpi;
-  logic        access_read_data_ready_dpi;
-  logic        access_read_bucket_done_ready_dpi;
+  logic        access_read_batch_ready_dpi;
   logic        blocked_warp_query_en_dpi;
   logic [31:0] blocked_warp_query_idx_dpi;
   logic        blocked_warp_query_resp_stored_dpi;
@@ -101,6 +146,48 @@ module TrafficGenDPIBlackBox #(
   logic        completed_bundle_id_write_en_dpi;
   logic [31:0] completed_bundle_id_write_idx_dpi;
   logic [63:0] completed_bundle_id_write_data_dpi;
+  logic        debug_completion_event_valid_dpi;
+  logic        debug_completion_event_wake_exit_dpi;
+  logic [63:0] debug_completion_event_bundle_id_dpi;
+  logic        debug_completion_event_wake_relevant_dpi;
+  logic        debug_completion_event_warp_blocked_dpi;
+  logic        debug_completion_event_current_warp_blocked_dpi;
+  logic [31:0] debug_completion_event_sm_id_dpi;
+  logic [31:0] debug_completion_event_scheduler_id_dpi;
+  logic [31:0] debug_completion_event_warp_id_dpi;
+  logic [63:0] debug_completion_event_cycle_dpi;
+
+  bit              access_read_data_valid_batch [ACCESS_READ_BATCH_LANES];
+  longint unsigned access_read_id_batch [ACCESS_READ_BATCH_LANES];
+  longint unsigned access_read_address_batch [ACCESS_READ_BATCH_LANES];
+  longint unsigned access_read_cycle_count_batch [ACCESS_READ_BATCH_LANES];
+  int unsigned     access_read_subpartition_batch [ACCESS_READ_BATCH_LANES];
+  int unsigned     access_read_set_index_batch [ACCESS_READ_BATCH_LANES];
+  longint unsigned access_read_tag_batch [ACCESS_READ_BATCH_LANES];
+  int unsigned     access_read_mask_batch [ACCESS_READ_BATCH_LANES];
+  int unsigned     access_read_sm_id_batch [ACCESS_READ_BATCH_LANES];
+  byte unsigned    access_read_scheduler_id_batch [ACCESS_READ_BATCH_LANES];
+  int unsigned     access_read_warp_id_batch [ACCESS_READ_BATCH_LANES];
+  longint unsigned access_read_bundle_id_batch [ACCESS_READ_BATCH_LANES];
+  bit              access_read_wake_relevant_bundle_batch [ACCESS_READ_BATCH_LANES];
+  bit              access_read_is_write_batch [ACCESS_READ_BATCH_LANES];
+
+  `TG_ACCESS_READ_ASSIGN(0)
+  `TG_ACCESS_READ_ASSIGN(1)
+  `TG_ACCESS_READ_ASSIGN(2)
+  `TG_ACCESS_READ_ASSIGN(3)
+  `TG_ACCESS_READ_ASSIGN(4)
+  `TG_ACCESS_READ_ASSIGN(5)
+  `TG_ACCESS_READ_ASSIGN(6)
+  `TG_ACCESS_READ_ASSIGN(7)
+  `TG_ACCESS_READ_ASSIGN(8)
+  `TG_ACCESS_READ_ASSIGN(9)
+  `TG_ACCESS_READ_ASSIGN(10)
+  `TG_ACCESS_READ_ASSIGN(11)
+  `TG_ACCESS_READ_ASSIGN(12)
+  `TG_ACCESS_READ_ASSIGN(13)
+  `TG_ACCESS_READ_ASSIGN(14)
+  `TG_ACCESS_READ_ASSIGN(15)
 
   import "DPI-C" function void trafficgen_dpi_step(
     input  bit                reset,
@@ -110,22 +197,24 @@ module TrafficGenDPIBlackBox #(
     input  longint unsigned   access_store_max_cycle,
     input  bit                access_store_has_entries,
     input  longint unsigned   min_issue_cycle,
-    input  bit                access_read_data_valid,
+    input  bit                access_read_resp_valid,
+    input  int unsigned       access_read_resp_id,
+    input  bit                access_read_data_valid [ACCESS_READ_BATCH_LANES],
     input  bit                access_read_bucket_done,
     input  bit                access_read_ready,
-    input  longint unsigned   access_read_id,
-    input  longint unsigned   access_read_address,
-    input  longint unsigned   access_read_cycle_count,
-    input  int unsigned       access_read_subpartition,
-    input  int unsigned       access_read_set_index,
-    input  longint unsigned   access_read_tag,
-    input  int unsigned       access_read_mask,
-    input  int unsigned       access_read_sm_id,
-    input  byte unsigned      access_read_scheduler_id,
-    input  int unsigned       access_read_warp_id,
-    input  longint unsigned   access_read_bundle_id,
-    input  bit                access_read_wake_relevant_bundle,
-    input  bit                access_read_is_write,
+    input  longint unsigned   access_read_id [ACCESS_READ_BATCH_LANES],
+    input  longint unsigned   access_read_address [ACCESS_READ_BATCH_LANES],
+    input  longint unsigned   access_read_cycle_count [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_subpartition [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_set_index [ACCESS_READ_BATCH_LANES],
+    input  longint unsigned   access_read_tag [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_mask [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_sm_id [ACCESS_READ_BATCH_LANES],
+    input  byte unsigned      access_read_scheduler_id [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_warp_id [ACCESS_READ_BATCH_LANES],
+    input  longint unsigned   access_read_bundle_id [ACCESS_READ_BATCH_LANES],
+    input  bit                access_read_wake_relevant_bundle [ACCESS_READ_BATCH_LANES],
+    input  bit                access_read_is_write [ACCESS_READ_BATCH_LANES],
     input  bit                blocked_warp_query_resp_valid,
     input  bit                blocked_warp_query_resp,
     input  bit                blocked_warp_query_ready,
@@ -139,8 +228,7 @@ module TrafficGenDPIBlackBox #(
     output int unsigned       dpi_state,
     output bit                access_read_en,
     output longint unsigned   access_read_cycle,
-    output bit                access_read_data_ready,
-    output bit                access_read_bucket_done_ready,
+    output bit                access_read_batch_ready,
     output bit                blocked_warp_query_en,
     output int unsigned       blocked_warp_query_idx,
     output bit                blocked_warp_query_resp_stored,
@@ -162,7 +250,17 @@ module TrafficGenDPIBlackBox #(
     output int unsigned       completed_bundle_count_write_data,
     output bit                completed_bundle_id_write_en,
     output int unsigned       completed_bundle_id_write_idx,
-    output longint unsigned   completed_bundle_id_write_data
+    output longint unsigned   completed_bundle_id_write_data,
+    output bit                debug_completion_event_valid,
+    output bit                debug_completion_event_wake_exit,
+    output longint unsigned   debug_completion_event_bundle_id,
+    output bit                debug_completion_event_wake_relevant,
+    output bit                debug_completion_event_warp_blocked,
+    output bit                debug_completion_event_current_warp_blocked,
+    output int unsigned       debug_completion_event_sm_id,
+    output int unsigned       debug_completion_event_scheduler_id,
+    output int unsigned       debug_completion_event_warp_id,
+    output longint unsigned   debug_completion_event_cycle
   );
 
   always_ff @(posedge clock) begin
@@ -174,22 +272,24 @@ module TrafficGenDPIBlackBox #(
       access_store_max_cycle,
       access_store_has_entries,
       min_issue_cycle,
-      access_read_data_valid,
+      access_read_resp_valid,
+      access_read_resp_id,
+      access_read_data_valid_batch,
       access_read_bucket_done,
       access_read_ready,
-      access_read_id,
-      access_read_address,
-      access_read_cycle_count,
-      access_read_subpartition,
-      access_read_set_index,
-      access_read_tag,
-      access_read_mask,
-      access_read_sm_id,
-      access_read_scheduler_id,
-      access_read_warp_id,
-      access_read_bundle_id,
-      access_read_wake_relevant_bundle,
-      access_read_is_write,
+      access_read_id_batch,
+      access_read_address_batch,
+      access_read_cycle_count_batch,
+      access_read_subpartition_batch,
+      access_read_set_index_batch,
+      access_read_tag_batch,
+      access_read_mask_batch,
+      access_read_sm_id_batch,
+      access_read_scheduler_id_batch,
+      access_read_warp_id_batch,
+      access_read_bundle_id_batch,
+      access_read_wake_relevant_bundle_batch,
+      access_read_is_write_batch,
       blocked_warp_query_resp_valid,
       blocked_warp_query_resp,
       blocked_warp_query_ready,
@@ -203,8 +303,7 @@ module TrafficGenDPIBlackBox #(
       dpi_state_dpi,
       access_read_en_dpi,
       access_read_cycle_dpi,
-      access_read_data_ready_dpi,
-      access_read_bucket_done_ready_dpi,
+      access_read_batch_ready_dpi,
       blocked_warp_query_en_dpi,
       blocked_warp_query_idx_dpi,
       blocked_warp_query_resp_stored_dpi,
@@ -226,7 +325,17 @@ module TrafficGenDPIBlackBox #(
       completed_bundle_count_write_data_dpi,
       completed_bundle_id_write_en_dpi,
       completed_bundle_id_write_idx_dpi,
-      completed_bundle_id_write_data_dpi
+      completed_bundle_id_write_data_dpi,
+      debug_completion_event_valid_dpi,
+      debug_completion_event_wake_exit_dpi,
+      debug_completion_event_bundle_id_dpi,
+      debug_completion_event_wake_relevant_dpi,
+      debug_completion_event_warp_blocked_dpi,
+      debug_completion_event_current_warp_blocked_dpi,
+      debug_completion_event_sm_id_dpi,
+      debug_completion_event_scheduler_id_dpi,
+      debug_completion_event_warp_id_dpi,
+      debug_completion_event_cycle_dpi
     );
 
     target_busy <= target_busy_dpi;
@@ -238,8 +347,7 @@ module TrafficGenDPIBlackBox #(
     dpi_state <= dpi_state_dpi;
     access_read_en <= access_read_en_dpi;
     access_read_cycle <= access_read_cycle_dpi;
-    access_read_data_ready <= access_read_data_ready_dpi;
-    access_read_bucket_done_ready <= access_read_bucket_done_ready_dpi;
+    access_read_batch_ready <= access_read_batch_ready_dpi;
     blocked_warp_query_en <= blocked_warp_query_en_dpi;
     blocked_warp_query_idx <= blocked_warp_query_idx_dpi[18:0];
     blocked_warp_query_resp_stored <= blocked_warp_query_resp_stored_dpi;
@@ -262,6 +370,19 @@ module TrafficGenDPIBlackBox #(
     completed_bundle_id_write_en <= completed_bundle_id_write_en_dpi;
     completed_bundle_id_write_idx <= completed_bundle_id_write_idx_dpi[11:0];
     completed_bundle_id_write_data <= completed_bundle_id_write_data_dpi;
+    debug_completion_event_valid <= debug_completion_event_valid_dpi;
+    debug_completion_event_wake_exit <= debug_completion_event_wake_exit_dpi;
+    debug_completion_event_bundle_id <= debug_completion_event_bundle_id_dpi;
+    debug_completion_event_wake_relevant <= debug_completion_event_wake_relevant_dpi;
+    debug_completion_event_warp_blocked <= debug_completion_event_warp_blocked_dpi;
+    debug_completion_event_current_warp_blocked <= debug_completion_event_current_warp_blocked_dpi;
+    debug_completion_event_sm_id <= debug_completion_event_sm_id_dpi;
+    debug_completion_event_scheduler_id <= debug_completion_event_scheduler_id_dpi;
+    debug_completion_event_warp_id <= debug_completion_event_warp_id_dpi;
+    debug_completion_event_cycle <= debug_completion_event_cycle_dpi;
   end
 
 endmodule
+
+`undef TG_ACCESS_READ_PORTS
+`undef TG_ACCESS_READ_ASSIGN

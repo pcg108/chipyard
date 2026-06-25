@@ -20,10 +20,11 @@ class L2Access extends Bundle {
   val mBundleId = UInt(64.W)
   val mWakeRelevantBundle = Bool()
   val mIsWrite = Bool()
+  val mWarpBlocked = Bool()
 }
 
 object L2Access {
-  val packedWidth = 490
+  val packedWidth = 491
   val streamWidthBits = 512
   private val paddingWidth = streamWidthBits - packedWidth
 
@@ -31,6 +32,7 @@ object L2Access {
   def pack(access: L2Access): UInt = {
     Cat(
       0.U(paddingWidth.W),
+      access.mWarpBlocked,
       access.mIsWrite,
       access.mWakeRelevantBundle,
       access.mBundleId,
@@ -63,8 +65,13 @@ object L2Access {
     access.mBundleId := bits(487, 424)
     access.mWakeRelevantBundle := bits(488)
     access.mIsWrite := bits(489)
+    access.mWarpBlocked := bits(490)
     access
   }
+}
+
+object TrafficGenAccessBatch {
+  val lanes = 16
 }
 
 object BlockedWarpBitmap {
@@ -121,20 +128,21 @@ class TrafficGenPortIO extends Bundle {
   val startRound = Input(Bool())
   val trafficGenDone = Input(Bool())
   val minIssueCycle = Input(UInt(64.W))
+  val accessReadCycle = Output(UInt(64.W))
+  val accessReadEn = Output(Bool())
+  val accessReadBatchReady = Output(Bool())
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())
   val blockedWarpQueryRespStored = Output(Bool())
+  val accessReadRespValid = Input(Bool())
+  val accessReadRespId = Input(UInt(32.W))
+  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
+  val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
+  val accessReadBucketDone = Input(Bool())
+  val accessReadReady = Input(Bool())
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
   val blockedWarpQueryReady = Input(Bool())
-  val accessReadCycle = Output(UInt(64.W))
-  val accessReadEn = Output(Bool())
-  val accessReadDataReady = Output(Bool())
-  val accessReadBucketDoneReady = Output(Bool())
-  val accessReadData = Input(new L2Access)
-  val accessReadDataValid = Input(Bool())
-  val accessReadBucketDone = Input(Bool())
-  val accessReadReady = Input(Bool())
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())

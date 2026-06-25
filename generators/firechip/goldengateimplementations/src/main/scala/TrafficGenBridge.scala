@@ -255,16 +255,28 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // flat accessStore sorted by cycleCount and returns each matching entry,
     // followed by an explicit bucket-done. A one-entry peek buffer preserves
     // the first future-cycle access for the next request.
-    val accessReadDataReg = Reg(new L2Access)
-    val accessReadDataValidReg = RegInit(false.B)
+
+    // expanded from 1 L2Access register and 1 valid bit, to 16 access lanes with batch valid bits, to support streaming parallel accesses to target
+    // target sees:
+    // - 1 response valid bit+ID
+    // - N access lanes
+    // - N lane-valid bits
+    // - 1 bucket-done bit
+    // - 1 batch-ready input from target
+    val accessReadDataRegs = Reg(Vec(TrafficGenAccessBatch.lanes, new L2Access))
+    val accessReadDataValidRegs = RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(false.B)))
+    val accessReadRespValidReg = RegInit(false.B) // indicates that whole batch response is valid
+    val accessReadRespIdReg = RegInit(0.U(32.W))
+    val accessReadNextRespId = RegInit(0.U(32.W))
     val accessReadBucketDoneReg = RegInit(false.B)
     val accessReadReadyReg = RegInit(true.B)
     val accessReadServingReg = RegInit(false.B)
     val accessReadReqCycleReg = Reg(UInt(64.W))
     val accessReadCursor = RegInit(0.U(accessIdxWidth.W))
+    val accessReadBatchCount = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes + 1).W))
 
-    // one entry look-ahead. Stores next access read from memory while next access is procesed by target.
-    val accessReadPeekBitsReg = Reg(UInt(L2Access.streamWidthBits.W))
+    // one entry look-ahead. Stores next access read from memory while next access is processed by target.
+    val accessReadPeekAccessReg = Reg(new L2Access)
     val accessReadPeekValidReg = RegInit(false.B)
 
     val accessReadFetchPending = RegInit(false.B)
@@ -274,109 +286,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessReadEntryIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessReadEntryEn = WireDefault(false.B)
 
-    // AXI read path unused but present for completeness
-    val axiRawAccessReadIdx = WireDefault(0.U(accessIdxWidth.W))
-    val axiRawAccessReadEn = WireDefault(false.B)
-
-    val accessReadDataBits = accessStore.read(
-      Mux(axiRawAccessReadEn, axiRawAccessReadIdx, accessReadEntryIdx),
-      accessReadEntryEn || axiRawAccessReadEn,
-    )
-    val accessReadPeekData = L2Access.unpack(accessReadPeekBitsReg)
-    val accessReadCanAccept = accessReadReadyReg &&
-                              !accessReadServingReg &&
-                              !accessReadFetchPending &&
-                              !accessReadDataValidReg &&
-                              !accessReadBucketDoneReg &&
-                              !accessReadWaitForEnLow
-    val accessReadReq = fire && target.accessReadEn && accessReadCanAccept
-    val accessReadDataFire = fire && accessReadDataValidReg && target.accessReadDataReady
-    val accessReadBucketDoneFire = fire && accessReadBucketDoneReg && target.accessReadBucketDoneReady
-
-    // begin serving a target access read request
-    when(accessReadReq) {
-      accessReadReadyReg := false.B
-      accessReadServingReg := true.B
-      accessReadReqCycleReg := target.accessReadCycle
-      accessReadDataValidReg := false.B
-      accessReadBucketDoneReg := false.B
-      accessReadWaitForEnLow := true.B
-    }
-
-    when(fire && !target.accessReadEn) {
-      accessReadWaitForEnLow := false.B
-    }
-
-    when(accessReadServingReg && !accessReadFetchPending && !accessReadDataValidReg && !accessReadBucketDoneReg) {
-      // if there is a valid peek entry
-      when(accessReadPeekValidReg) {
-        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
-          "TrafficGen flat accessStore returned stale/unsorted access")
-        // if it is for the requested cycle, emit to target and consume it
-        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
-          accessReadDataReg := accessReadPeekData
-          accessReadDataValidReg := true.B
-          accessReadPeekValidReg := false.B
-          accessReadCursor := accessReadCursor + 1.U
-        }.otherwise {
-          // if it is for future cycle, do not consume and mark cycle bucket done
-          accessReadBucketDoneReg := true.B
-        }
-      }.elsewhen(accessReadCursor < accessStoreCount) {
-        // if there is no peek entry but more uploaded accesses exist, issue memory read
-        accessReadEntryIdx := accessReadCursor
-        accessReadEntryEn := true.B
-        accessReadFetchPending := true.B
-      }.otherwise {
-        // if no accesses at all, bucket is done
-        accessReadBucketDoneReg := true.B
-      }
-    }
-
-    // read issued in previous cycle returns here
-    when(accessReadFetchPending) {
-      accessReadPeekBitsReg := accessReadDataBits
-      accessReadPeekValidReg := true.B
-      accessReadFetchPending := false.B
-    }
-
-    // when target accepts read data, clear valid
-    when(accessReadDataFire) {
-      accessReadDataValidReg := false.B
-    }
-
-    // when target accepts bucket done, clear that and mark ready for next request
-    when(accessReadBucketDoneFire) {
-      accessReadBucketDoneReg := false.B
-      accessReadServingReg := false.B
-      accessReadReadyReg := true.B
-    }
-
-    // reset signals
-    when(accessReadReset) {
-      accessReadReadyReg := true.B
-      accessReadServingReg := false.B
-      accessReadCursor := 0.U
-      accessReadPeekValidReg := false.B
-      accessReadFetchPending := false.B
-      accessReadWaitForEnLow := false.B
-      accessReadDataValidReg := false.B
-      accessReadBucketDoneReg := false.B
-    }
-
-    target.accessReadData := accessReadDataReg
-    target.accessReadDataValid := accessReadDataValidReg
-    target.accessReadBucketDone := accessReadBucketDoneReg
-    target.accessReadReady := accessReadCanAccept
-
-    /*
-     * Respond to traffic-generator queries for blocked warps
-
-    */
-
-    // respond to target query as to whether warp is blocked by accessing blocked warp bitmap
-    val blockedWarpQueryWordIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.indexBits - 1, BlockedWarpBitmap.streamBeatOffsetBits)
-    val blockedWarpQueryBitIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
     val blockedWarpQueryReadIdx = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
     val blockedWarpQueryReadEn = WireDefault(false.B)
 
@@ -388,6 +297,131 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       Mux(axiRawBlockedReadEn, axiRawBlockedReadIdx, blockedWarpQueryReadIdx),
       blockedWarpQueryReadEn || axiRawBlockedReadEn,
     )
+
+    // AXI read path unused but present for completeness
+    val axiRawAccessReadIdx = WireDefault(0.U(accessIdxWidth.W))
+    val axiRawAccessReadEn = WireDefault(false.B)
+
+    val accessReadDataBits = accessStore.read(
+      Mux(axiRawAccessReadEn, axiRawAccessReadIdx, accessReadEntryIdx),
+      accessReadEntryEn || axiRawAccessReadEn,
+    )
+    val accessReadFetchedData = L2Access.unpack(accessReadDataBits)
+    val accessReadPeekData = accessReadPeekAccessReg
+    // accept new target read request when not serving a request, not waiting on memory fetch, not holding unconsumed response packet
+    val accessReadCanAccept = accessReadReadyReg &&
+                              !accessReadServingReg &&
+                              !accessReadFetchPending &&
+                              !accessReadRespValidReg &&
+                              !accessReadBucketDoneReg &&
+                              !accessReadWaitForEnLow
+    val accessReadReq = fire && target.accessReadEn && accessReadCanAccept
+    val accessReadRespFire = fire && accessReadRespValidReg && target.accessReadBatchReady
+
+    // includes a unique response ID to allow target to distinguish consecutive response packets
+    def publishAccessReadResp(): Unit = {
+      accessReadRespValidReg := true.B
+      accessReadRespIdReg := accessReadNextRespId
+      accessReadNextRespId := accessReadNextRespId + 1.U
+    }
+
+    // begin serving a target access read request
+    when(accessReadReq) {
+      accessReadReadyReg := false.B
+      accessReadServingReg := true.B
+      accessReadReqCycleReg := target.accessReadCycle
+      accessReadDataValidRegs.foreach(_ := false.B)
+      accessReadRespValidReg := false.B
+      accessReadBucketDoneReg := false.B
+      accessReadBatchCount := 0.U
+      accessReadWaitForEnLow := true.B
+    }
+
+    when(fire && !target.accessReadEn) {
+      accessReadWaitForEnLow := false.B
+    }
+
+    // clear valid lanes when target accepts response
+    when(accessReadRespFire) {
+      accessReadDataValidRegs.foreach(_ := false.B)
+      accessReadRespValidReg := false.B
+      accessReadBatchCount := 0.U
+      when(accessReadBucketDoneReg) {
+        accessReadBucketDoneReg := false.B
+        accessReadServingReg := false.B
+        accessReadReadyReg := true.B
+      }
+    }
+
+    when(accessReadServingReg && !accessReadFetchPending && !accessReadRespValidReg && !accessReadBucketDoneReg) {
+      // if there is a valid peek entry
+      when(accessReadPeekValidReg) {
+        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
+          "TrafficGen flat accessStore returned stale/unsorted access")
+        // if it is for the requested cycle, put it in the next free lane
+        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
+          accessReadDataRegs(accessReadBatchCount) := accessReadPeekData
+          accessReadDataValidRegs(accessReadBatchCount) := true.B
+          accessReadPeekValidReg := false.B
+          accessReadCursor := accessReadCursor + 1.U
+          accessReadBatchCount := accessReadBatchCount + 1.U
+          // if it fills last lane, publish batch immediately
+          when(accessReadBatchCount === (TrafficGenAccessBatch.lanes - 1).U) {
+            publishAccessReadResp()
+          }
+        }.otherwise {
+          // if it is for future cycle, do not consume and mark cycle bucket done
+          accessReadBucketDoneReg := true.B
+          publishAccessReadResp()
+        }
+      }.elsewhen(accessReadCursor < accessStoreCount) {
+        // if there is no peek entry but more uploaded accesses exist, issue memory read
+        accessReadEntryIdx := accessReadCursor
+        accessReadEntryEn := true.B
+        accessReadFetchPending := true.B
+      }.otherwise {
+        // if no accesses at all, bucket is done
+        accessReadBucketDoneReg := true.B
+        publishAccessReadResp()
+      }
+    }
+
+    // read issued in previous cycle returns here as peek entry
+    when(accessReadFetchPending) {
+      accessReadPeekAccessReg := accessReadFetchedData
+      accessReadPeekValidReg := true.B
+      accessReadFetchPending := false.B
+    }
+
+    // reset signals
+    when(accessReadReset) {
+      accessReadReadyReg := true.B
+      accessReadServingReg := false.B
+      accessReadCursor := 0.U
+      accessReadPeekValidReg := false.B
+      accessReadFetchPending := false.B
+      accessReadWaitForEnLow := false.B
+      accessReadDataValidRegs.foreach(_ := false.B)
+      accessReadRespValidReg := false.B
+      accessReadRespIdReg := 0.U
+      accessReadNextRespId := 0.U
+      accessReadBucketDoneReg := false.B
+      accessReadBatchCount := 0.U
+    }
+
+    target.accessReadRespValid := accessReadRespValidReg
+    target.accessReadRespId := accessReadRespIdReg
+    target.accessReadData := accessReadDataRegs
+    target.accessReadDataValid := accessReadDataValidRegs
+    target.accessReadBucketDone := accessReadBucketDoneReg
+    target.accessReadReady := accessReadCanAccept
+
+    /*
+     * Respond to traffic-generator queries for blocked warps.
+    */
+
+    val blockedWarpQueryWordIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.indexBits - 1, BlockedWarpBitmap.streamBeatOffsetBits)
+    val blockedWarpQueryBitIdx = target.blockedWarpQueryIdx(BlockedWarpBitmap.streamBeatOffsetBits - 1, 0)
     val blockedWarpQueryBitIdxReg = Reg(UInt(BlockedWarpBitmap.streamBeatOffsetBits.W))
     val blockedWarpQueryRespReg = RegInit(false.B)
     val blockedWarpQueryRespValidReg = RegInit(false.B)
@@ -396,7 +430,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val blockedWarpQueryReadPending = RegInit(false.B)
     val blockedWarpQueryReq = fire && target.blockedWarpQueryEn && blockedWarpQueryReadyReg
 
-    // respond to blocked warp query by looking up the corresponding bit in the blocked warp bitmap,
     when(blockedWarpQueryReq) {
       blockedWarpQueryReadyReg := false.B
       blockedWarpQueryPending := true.B
@@ -406,24 +439,26 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       blockedWarpQueryReadIdx := blockedWarpQueryWordIdx
       blockedWarpQueryReadEn := true.B
     }
-    // The bitmap is a SyncReadMem, so the accepted query returns one cycle after the read is issued.
+
     when(blockedWarpQueryReadPending) {
       blockedWarpQueryRespReg := blockedWarpQueryReadBits(blockedWarpQueryBitIdxReg)
       blockedWarpQueryPending := false.B
       blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := true.B
     }
-    // once the target stores the blocked warp query, we can clear the valid and mark ready for the next query
+
     when(target.blockedWarpQueryRespStored && blockedWarpQueryRespValidReg) {
       blockedWarpQueryRespValidReg := false.B
       blockedWarpQueryReadyReg := true.B
     }
+
     when(accessReadReset) {
       blockedWarpQueryReadyReg := true.B
       blockedWarpQueryPending := false.B
       blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := false.B
     }
+
     target.blockedWarpQueryResp := blockedWarpQueryRespReg
     target.blockedWarpQueryRespValid := blockedWarpQueryRespValidReg
     target.blockedWarpQueryReady := blockedWarpQueryReadyReg && !blockedWarpQueryPending && !blockedWarpQueryReadPending
@@ -700,12 +735,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadCursor := 0.U
       accessReadPeekValidReg := false.B
       accessReadFetchPending := false.B
-      accessReadDataValidReg := false.B
+      accessReadDataValidRegs.foreach(_ := false.B)
+      accessReadRespValidReg := false.B
+      accessReadRespIdReg := 0.U
+      accessReadNextRespId := 0.U
       accessReadBucketDoneReg := false.B
-      blockedWarpQueryReadyReg := true.B
-      blockedWarpQueryPending := false.B
-      blockedWarpQueryReadPending := false.B
-      blockedWarpQueryRespValidReg := false.B
+      accessReadBatchCount := 0.U
       issuedAccessWritebackIdx := 0.U
       issuedAccessWritebackCount := 0.U
       accessStoreCount := 0.U
@@ -715,6 +750,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       uploadMaxCycleLow := 0.U
       uploadMaxCycleHigh := 0.U
       completedBundleCount := 0.U
+      blockedWarpQueryReadyReg := true.B
+      blockedWarpQueryPending := false.B
+      blockedWarpQueryReadPending := false.B
+      blockedWarpQueryRespValidReg := false.B
       startRoundPending := false.B
       startTrafficGenLatched := false.B
       roundCompleteLatched := false.B

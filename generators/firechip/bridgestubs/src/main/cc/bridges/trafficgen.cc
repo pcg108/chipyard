@@ -769,7 +769,8 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
   words[6] = (access.m_bundle_id & 0xffffffULL) << 40 |
              (static_cast<uint64_t>(access.warp_id) << 8) |
              static_cast<uint64_t>(access.scheduler_id);
-  words[7] = (access.m_is_write ? 1ULL : 0ULL) << 41 |
+  words[7] = (access.m_warp_blocked ? 1ULL : 0ULL) << 42 |
+             (access.m_is_write ? 1ULL : 0ULL) << 41 |
              (access.m_wake_relevant_bundle ? 1ULL : 0ULL) << 40 |
              (access.m_bundle_id >> 24);
 }
@@ -790,6 +791,7 @@ static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
       ((words[7] & 0xffffffffffULL) << 24) | ((words[6] >> 40) & 0xffffffULL);
   access.m_wake_relevant_bundle = ((words[7] >> 40) & 0x1ULL) != 0;
   access.m_is_write = ((words[7] >> 41) & 0x1ULL) != 0;
+  access.m_warp_blocked = ((words[7] >> 42) & 0x1ULL) != 0;
   return access;
 }
 

@@ -62,6 +62,7 @@ struct trafficgen_l2_access_t {
   uint64_t m_bundle_id;
   bool m_wake_relevant_bundle;
   bool m_is_write;
+  bool m_warp_blocked;
 };
 
 struct trafficgen_issued_access_point_t {
