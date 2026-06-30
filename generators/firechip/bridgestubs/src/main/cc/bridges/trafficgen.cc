@@ -762,7 +762,10 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
   words[0] = access.id;
   words[1] = access.address;
   words[2] = access.cycle_count;
-  words[3] = (static_cast<uint64_t>(access.m_set_index) << 32) |
+  // The RTL traffic generator does not use set_index to form TL requests.
+  // Reuse this 32-bit metadata lane to carry the modeled completion latency.
+  words[3] = (static_cast<uint64_t>(checked_u32(access.elapsed_cycle,
+                                                "l2 access elapsed cycle")) << 32) |
              access.m_subpartition;
   words[4] = access.m_tag;
   words[5] = (static_cast<uint64_t>(access.sm_id) << 32) | access.m_mask;
@@ -977,6 +980,67 @@ void trafficgen_t::depopulate_processed_accesses(
     }
     bucket_it = pending_accesses_by_cycle.erase(bucket_it);
   }
+}
+
+void trafficgen_t::depopulate_issued_accesses(
+    const std::vector<trafficgen_l2_access_t> &issued_accesses) {
+  std::unordered_set<std::uint64_t> issued_ids;
+  issued_ids.reserve(issued_accesses.size());
+  for (const auto &access : issued_accesses) {
+    issued_ids.insert(access.id);
+  }
+
+  for (auto bucket_it = pending_accesses_by_cycle.begin();
+       bucket_it != pending_accesses_by_cycle.end();) {
+    auto &accesses = bucket_it->second;
+    accesses.erase(
+        std::remove_if(accesses.begin(),
+                       accesses.end(),
+                       [this, &issued_ids](const trafficgen_l2_access_t &access) {
+                         if (issued_ids.find(access.id) == issued_ids.end()) {
+                           return false;
+                         }
+                         pending_access_cycle_by_id.erase(access.id);
+                         pending_access_l1_to_l2_by_id.erase(access.id);
+                         pending_access_elapsed_by_id.erase(access.id);
+                         return true;
+                       }),
+        accesses.end());
+    if (accesses.empty()) {
+      bucket_it = pending_accesses_by_cycle.erase(bucket_it);
+    } else {
+      ++bucket_it;
+    }
+  }
+}
+
+void trafficgen_t::requeue_overdue_pending_accesses(
+    std::uint64_t current_cycle_after_issue) {
+  std::vector<trafficgen_l2_access_t> overdue_accesses;
+
+  for (auto bucket_it = pending_accesses_by_cycle.begin();
+       bucket_it != pending_accesses_by_cycle.end() &&
+       bucket_it->first <= current_cycle_after_issue;) {
+    overdue_accesses.insert(overdue_accesses.end(),
+                            bucket_it->second.begin(),
+                            bucket_it->second.end());
+    bucket_it = pending_accesses_by_cycle.erase(bucket_it);
+  }
+
+  if (overdue_accesses.empty()) {
+    return;
+  }
+
+  auto &rebased_bucket = pending_accesses_by_cycle[current_cycle_after_issue];
+  for (auto &access : overdue_accesses) {
+    access.cycle_count = current_cycle_after_issue;
+    pending_access_cycle_by_id[access.id] = current_cycle_after_issue;
+    rebased_bucket.push_back(access);
+  }
+
+  std::cout << "[bridge driver] requeued overdue pending accesses at cycle="
+            << current_cycle_after_issue
+            << " count=" << overdue_accesses.size() << std::endl;
 }
 
 void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
@@ -1490,12 +1554,12 @@ void trafficgen_t::tick() {
 
       // read round exit reason
       const std::uint32_t round_exit_reason = static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
-      // if it was a normal exit, we depopulate by cycle, otherwise, depopulate by ID (since cycle is not complete)
-      if (round_exit_reason == kRoundExitCapacity) {
-        depopulate_uploaded_l2_access_chunk();
-      } else {
-        depopulate_processed_accesses(current_cycle_after_issue);
-      }
+      // Only remove accesses that the target explicitly reported as issued.
+      // A capacity exit can occur after an uploaded chunk has been accepted but
+      // before every entry in that chunk reaches an issue node, so deleting the
+      // whole uploaded chunk can silently drop late accesses.
+      depopulate_issued_accesses(issued_access_writeback_entries);
+      requeue_overdue_pending_accesses(current_cycle_after_issue);
 
       // on a capacity exit (completed set in BRAM but not all accesses in round), do the next chunk
       if (round_exit_reason == kRoundExitCapacity && !pending_accesses_by_cycle.empty()) {

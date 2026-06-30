@@ -199,6 +199,9 @@ private:
   void build_next_l2_access_chunk();
   L2SubpartitionReservationsByCycle build_reserved_subpartitions_from_pending() const;
   void depopulate_processed_accesses(std::uint64_t current_cycle_after_issue);
+  void depopulate_issued_accesses(
+      const std::vector<trafficgen_l2_access_t> &issued_accesses);
+  void requeue_overdue_pending_accesses(std::uint64_t current_cycle_after_issue);
   void depopulate_uploaded_l2_access_chunk();
   void log_logical_round_for_compare(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses,

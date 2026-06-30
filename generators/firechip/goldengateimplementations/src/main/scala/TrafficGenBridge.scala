@@ -93,9 +93,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     target.trafficGenDone := trafficGenDone
 
+    val accessReadBatchAssemblyPause = WireDefault(false.B)
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
-      !targetPaused
+      !targetPaused &&
+      !accessReadBatchAssemblyPause
 
     // completedBundleIds will be streamed back from traffic generator to bridge driver.
     // Each 512-bit beat carries eight 64-bit bundle IDs.
@@ -266,6 +268,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessReadDataRegs = Reg(Vec(TrafficGenAccessBatch.lanes, new L2Access))
     val accessReadDataValidRegs = RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(false.B)))
     val accessReadRespValidReg = RegInit(false.B) // indicates that whole batch response is valid
+    val accessReadRespRetireHoldoff = RegInit(0.U(3.W))
     val accessReadRespIdReg = RegInit(0.U(32.W))
     val accessReadNextRespId = RegInit(0.U(32.W))
     val accessReadBucketDoneReg = RegInit(false.B)
@@ -283,6 +286,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // prevent re-accepting same request if read en stays high after bridge finishes bucket
     val accessReadWaitForEnLow = RegInit(false.B)
+    val accessReadRespRetireHoldoffCycles = 4.U(3.W)
     val accessReadEntryIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessReadEntryEn = WireDefault(false.B)
 
@@ -308,6 +312,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     )
     val accessReadFetchedData = L2Access.unpack(accessReadDataBits)
     val accessReadPeekData = accessReadPeekAccessReg
+    accessReadBatchAssemblyPause := accessReadServingReg &&
+                                    target.accessReadBatchReady &&
+                                    !accessReadRespValidReg
     // accept new target read request when not serving a request, not waiting on memory fetch, not holding unconsumed response packet
     val accessReadCanAccept = accessReadReadyReg &&
                               !accessReadServingReg &&
@@ -316,11 +323,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
                               !accessReadBucketDoneReg &&
                               !accessReadWaitForEnLow
     val accessReadReq = fire && target.accessReadEn && accessReadCanAccept
-    val accessReadRespFire = fire && accessReadRespValidReg && target.accessReadBatchReady
+    val accessReadRespCanRetire = accessReadRespValidReg && accessReadRespRetireHoldoff === 0.U
+    val accessReadRespFire = fire && accessReadRespCanRetire && !target.accessReadBatchReady
 
     // includes a unique response ID to allow target to distinguish consecutive response packets
     def publishAccessReadResp(): Unit = {
       accessReadRespValidReg := true.B
+      accessReadRespRetireHoldoff := accessReadRespRetireHoldoffCycles
       accessReadRespIdReg := accessReadNextRespId
       accessReadNextRespId := accessReadNextRespId + 1.U
     }
@@ -332,6 +341,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadReqCycleReg := target.accessReadCycle
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
+      accessReadRespRetireHoldoff := 0.U
       accessReadBucketDoneReg := false.B
       accessReadBatchCount := 0.U
       accessReadWaitForEnLow := true.B
@@ -341,10 +351,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadWaitForEnLow := false.B
     }
 
-    // clear valid lanes when target accepts response
+    // The response and the target's ready signal travel through independent
+    // token pipes. Keep each response visible for a few target tokens before
+    // allowing ready to retire it, so stale ready cannot eat a response before
+    // the RTL engine observes the valid/data side.
+    when(fire && accessReadRespValidReg && accessReadRespRetireHoldoff =/= 0.U) {
+      accessReadRespRetireHoldoff := accessReadRespRetireHoldoff - 1.U
+    }
+
+    // clear valid lanes after the target has observed and left the response wait state
     when(accessReadRespFire) {
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
+      accessReadRespRetireHoldoff := 0.U
       accessReadBatchCount := 0.U
       when(accessReadBucketDoneReg) {
         accessReadBucketDoneReg := false.B
@@ -356,10 +375,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(accessReadServingReg && !accessReadFetchPending && !accessReadRespValidReg && !accessReadBucketDoneReg) {
       // if there is a valid peek entry
       when(accessReadPeekValidReg) {
-        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
-          "TrafficGen flat accessStore returned stale/unsorted access")
-        // if it is for the requested cycle, put it in the next free lane
-        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
+        // A prior scheduling exit can stop mid-cycle, leaving retained accesses
+        // older than the target's current modelCycle in the next upload window.
+        // Drain those with the current request instead of requiring rewind.
+        when(accessReadPeekData.cycleCount <= accessReadReqCycleReg) {
           accessReadDataRegs(accessReadBatchCount) := accessReadPeekData
           accessReadDataValidRegs(accessReadBatchCount) := true.B
           accessReadPeekValidReg := false.B
@@ -403,6 +422,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadWaitForEnLow := false.B
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
+      accessReadRespRetireHoldoff := 0.U
       accessReadRespIdReg := 0.U
       accessReadNextRespId := 0.U
       accessReadBucketDoneReg := false.B
@@ -737,6 +757,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadFetchPending := false.B
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
+      accessReadRespRetireHoldoff := 0.U
       accessReadRespIdReg := 0.U
       accessReadNextRespId := 0.U
       accessReadBucketDoneReg := false.B
