@@ -204,6 +204,7 @@ class FireSimRocketWithTrafficGenConfig extends Config(
   new chipyard.example.WithTrafficGen ++
   new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
   new WithTrafficGenBridge ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache ++
   new FireSimRocketConfig)
 
 class FireSimRocketWithRTLTrafficGenConfig extends Config(
@@ -211,6 +212,7 @@ class FireSimRocketWithRTLTrafficGenConfig extends Config(
   new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
   new WithTrafficGenBridge ++
   new freechips.rocketchip.subsystem.WithExtMemSize((1L << 30) * 8) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache ++
   new FireSimRocketConfig)
 
 class FireSimRocket1GiBDRAMConfig extends Config(

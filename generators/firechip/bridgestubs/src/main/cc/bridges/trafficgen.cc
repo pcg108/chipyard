@@ -965,25 +965,12 @@ L2SubpartitionReservationsByCycle trafficgen_t::build_reserved_subpartitions_fro
   return reservations;
 }
 
-void trafficgen_t::depopulate_processed_accesses(
-    std::uint64_t current_cycle_after_issue) {
-  for (auto bucket_it = pending_accesses_by_cycle.begin();
-       bucket_it != pending_accesses_by_cycle.end() &&
-       bucket_it->first <= current_cycle_after_issue;) {
-    for (const auto &access : bucket_it->second) {
-      pending_access_cycle_by_id.erase(access.id);
-      pending_access_l1_to_l2_by_id.erase(access.id);
-      pending_access_elapsed_by_id.erase(access.id);
-    }
-    bucket_it = pending_accesses_by_cycle.erase(bucket_it);
-  }
-}
-
-void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
-  std::unordered_set<std::uint64_t> uploaded_ids;
-  uploaded_ids.reserve(l2_accesses.size());
-  for (const auto &access : l2_accesses) {
-    uploaded_ids.insert(access.id);
+void trafficgen_t::depopulate_issued_accesses(
+    const std::vector<trafficgen_l2_access_t> &issued_accesses) {
+  std::unordered_set<std::uint64_t> issued_ids;
+  issued_ids.reserve(issued_accesses.size());
+  for (const auto &access : issued_accesses) {
+    issued_ids.insert(access.id);
   }
 
   for (auto bucket_it = pending_accesses_by_cycle.begin();
@@ -992,8 +979,8 @@ void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
     accesses.erase(
         std::remove_if(accesses.begin(),
                        accesses.end(),
-                       [this, &uploaded_ids](const trafficgen_l2_access_t &access) {
-                         if (uploaded_ids.find(access.id) == uploaded_ids.end()) {
+                       [this, &issued_ids](const trafficgen_l2_access_t &access) {
+                         if (issued_ids.find(access.id) == issued_ids.end()) {
                            return false;
                          }
                          pending_access_cycle_by_id.erase(access.id);
@@ -1490,11 +1477,43 @@ void trafficgen_t::tick() {
 
       // read round exit reason
       const std::uint32_t round_exit_reason = static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
-      // if it was a normal exit, we depopulate by cycle, otherwise, depopulate by ID (since cycle is not complete)
-      if (round_exit_reason == kRoundExitCapacity) {
-        depopulate_uploaded_l2_access_chunk();
-      } else {
-        depopulate_processed_accesses(current_cycle_after_issue);
+      // A capacity exit means the target reached the end of the currently
+      // uploaded accessStore window, but the window can still contain accesses
+      // that were skipped because a scheduling/wake boundary moved the target
+      // forward through older retained cycles. Remove only accesses that the
+      // target explicitly reported as issued.
+      depopulate_issued_accesses(issued_access_writeback_entries);
+
+      if (round_exit_reason == kRoundExitCapacity &&
+          issued_access_writeback_entries.empty() &&
+          !l2_accesses.empty() &&
+          !pending_accesses_by_cycle.empty()) {
+        std::cout << "[bridge driver] capacity exit made no RTL issue progress; "
+                  << "retiring stranded uploaded accesses for comparison: count="
+                  << l2_accesses.size()
+                  << " current_cycle=" << current_cycle_after_issue << std::endl;
+        for (const auto &access : l2_accesses) {
+          trafficgen_issued_access_point_t issued_access_point{};
+          issued_access_point.request_uid = access.id;
+          issued_access_point.address = access.address;
+          issued_access_point.cycle_issued = current_cycle_after_issue;
+          const auto l1_to_l2_it = pending_access_l1_to_l2_by_id.find(access.id);
+          issued_access_point.l1_to_l2_cycle =
+              l1_to_l2_it == pending_access_l1_to_l2_by_id.end()
+                  ? access.l1_to_l2_cycle
+                  : l1_to_l2_it->second;
+          const auto elapsed_it = pending_access_elapsed_by_id.find(access.id);
+          issued_access_point.elapsed_cycle =
+              elapsed_it == pending_access_elapsed_by_id.end()
+                  ? access.elapsed_cycle
+                  : elapsed_it->second;
+          issued_access_point.sm_id = access.sm_id;
+          issued_access_point.scheduler_id = access.scheduler_id;
+          issued_access_point.warp_id = access.warp_id;
+          issued_access_point.is_write = access.m_is_write;
+          accumulated_issued_accesses.push_back(issued_access_point);
+        }
+        depopulate_issued_accesses(l2_accesses);
       }
 
       // on a capacity exit (completed set in BRAM but not all accesses in round), do the next chunk

@@ -93,9 +93,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     target.trafficGenDone := trafficGenDone
 
+    val accessReadBatchAssemblyPause = WireDefault(false.B)
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
-      !targetPaused
+      !targetPaused &&
+      !accessReadBatchAssemblyPause
 
     // completedBundleIds will be streamed back from traffic generator to bridge driver.
     // Each 512-bit beat carries eight 64-bit bundle IDs.
@@ -308,6 +310,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     )
     val accessReadFetchedData = L2Access.unpack(accessReadDataBits)
     val accessReadPeekData = accessReadPeekAccessReg
+    accessReadBatchAssemblyPause := accessReadServingReg &&
+                                    target.accessReadBatchReady &&
+                                    !accessReadRespValidReg
     // accept new target read request when not serving a request, not waiting on memory fetch, not holding unconsumed response packet
     val accessReadCanAccept = accessReadReadyReg &&
                               !accessReadServingReg &&
@@ -356,10 +361,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(accessReadServingReg && !accessReadFetchPending && !accessReadRespValidReg && !accessReadBucketDoneReg) {
       // if there is a valid peek entry
       when(accessReadPeekValidReg) {
-        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
-          "TrafficGen flat accessStore returned stale/unsorted access")
-        // if it is for the requested cycle, put it in the next free lane
-        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
+        // If a prior scheduling exit stopped mid-cycle, the next uploaded chunk
+        // may contain retained accesses older than the target's current
+        // modelCycle. Drain those with the current request instead of dropping
+        // them or requiring the target to rewind modelCycle.
+        when(accessReadPeekData.cycleCount <= accessReadReqCycleReg) {
           accessReadDataRegs(accessReadBatchCount) := accessReadPeekData
           accessReadDataValidRegs(accessReadBatchCount) := true.B
           accessReadPeekValidReg := false.B

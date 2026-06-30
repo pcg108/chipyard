@@ -120,6 +120,12 @@ trait HasTrafficGenTopIO {
   def io: TrafficGenTopIO
 }
 
+class TrafficGenWakeQuery extends Bundle {
+  val smId = UInt(32.W)
+  val schedulerId = UInt(8.W)
+  val warpId = UInt(32.W)
+}
+
 class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERATORS" -> IntParam(nGenerators)))
     with HasBlackBoxResource {
 
@@ -365,38 +371,61 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   val io = IO(new TrafficGenTopIO(params.width, params.numGenerators, params.memOutstanding))
 
-  val rtlStates = Enum(7)
+  val rtlStates = Enum(10)
+   // no active work
   val sIdle = rtlStates(0)
-  val sDrainCompletions = rtlStates(1)
+  // accept completed memory accesses, process bundle completions
+  val sDrainCompletions = rtlStates(1) 
+  // ask bridge for accesses at modelCycle
   val sRequestAccess = rtlStates(2)
+  // hold request until bridge accepts
   val sWaitAccessAccepted = rtlStates(3)
+  // wait for access batch data to return from bridge
   val sWaitAccess = rtlStates(4)
+  // send fetched accesses into issue nodes
   val sIssueBatch = rtlStates(5)
+  // wait for writeback/completed-bundle queues to empty, then complete round
   val sDrainOutputs = rtlStates(6)
+  // query blocked warp bitmap for wake-relevant completed bundles 
+  val sRequestBlockedWarp = rtlStates(7)
+  val sWaitBlockedWarp = rtlStates(8)
+  val sAckBlockedWarp = rtlStates(9)
 
   val state = RegInit(sIdle)
+  // modelCycle is trace bucket, targetCycle is elapsed SoC cycles
   val modelCycle = RegInit(0.U(64.W))
   val targetCycle = RegInit(0.U(64.W))
+  // last modelCycle this round should load 
   val roundLoadEndCycle = RegInit(0.U(64.W))
   val roundHasFutureIssueWork = RegInit(false.B)
+  // indicates round stopped because bridge module capacity reached
   val roundCapacityBounded = RegInit(false.B)
+  // indicate round should stop because completed bundle wakes blocked warp
   val wakeExitPending = RegInit(false.B)
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
   val lastHasPendingWork = RegInit(false.B)
 
+  // bridge read returns batch of accesses
   val batchAccesses = Reg(Vec(TrafficGenAccessBatch.lanes, new L2Access))
   val batchValid = RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(false.B)))
   val batchBucketDone = RegInit(false.B)
+  // walk through batch in chunks of numGenerators, issuing each chunk to the generators
   val batchIssueCursor = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes + params.numGenerators + 1).W))
 
+  // bundle tracking table: each entry tracks a bundle ID
   val bundleTableEntries = params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes
   val bundleCountWidth = log2Ceil(params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes + 1)
   val bundleValid = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
   val bundleIds = Reg(Vec(bundleTableEntries, UInt(64.W)))
+  // number of issued accesses for that bundle that have not completed yet 
   val bundleOutstanding = RegInit(VecInit(Seq.fill(bundleTableEntries)(0.U(bundleCountWidth.W))))
+  // remember if bundle is wake-relevant, so we can query blocked warp bitmap when it completes
   val bundleWakeRelevant = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
-  val bundleWarpBlocked = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
+  val bundleSmIds = Reg(Vec(bundleTableEntries, UInt(32.W)))
+  val bundleSchedulerIds = Reg(Vec(bundleTableEntries, UInt(8.W)))
+  val bundleWarpIds = Reg(Vec(bundleTableEntries, UInt(32.W)))
 
+  // output queues and round-robin arbiters 
   val issuedWritebackQueues = Seq.fill(params.numGenerators) {
     Module(new Queue(new L2Access, params.memOutstanding * 2 + TrafficGenAccessBatch.lanes))
   }
@@ -405,8 +434,18 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     Module(new Queue(UInt(64.W), params.memOutstanding * 2 + TrafficGenAccessBatch.lanes))
   }
   val completedBundleArb = Module(new RRArbiter(UInt(64.W), params.numGenerators))
+  val wakeQueryQueues = Seq.fill(params.numGenerators) {
+    Module(new Queue(new TrafficGenWakeQuery, bundleTableEntries))
+  }
+  val wakeQueryArb = Module(new RRArbiter(new TrafficGenWakeQuery, params.numGenerators))
   val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
+  val activeWakeQuery = Reg(new TrafficGenWakeQuery)
+  val blockedWarpQueryRespReg = RegInit(false.B)
+  val resumeAfterBlockedQuery = RegInit(sDrainCompletions)
+  // flag to allow Idle to drain leftover completions without falsely completing new round
+  val backgroundDrainActive = RegInit(false.B)
 
+  // dynamic helpers to read one access or valid bit from fetched batch
   def batchAccessAt(idx: UInt): L2Access = {
     val zero = 0.U.asTypeOf(new L2Access)
     PriorityMux((0 until TrafficGenAccessBatch.lanes).map { i =>
@@ -419,6 +458,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       (idx === i.U) -> batchValid(i)
     } :+ (true.B -> false.B))
 
+  // default top-level outputs 
   io.startTrafficGen := false.B
   io.targetBusy := state =/= sIdle
   io.roundStarted := false.B
@@ -426,6 +466,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.roundExitReason := roundExitReasonReg
   io.dpiState := state
 
+  // connect per-lane queues to round-robin arbiters
   for (i <- 0 until params.numGenerators) {
     issuedWritebackQueues(i).io.enq.valid := false.B
     issuedWritebackQueues(i).io.enq.bits := 0.U.asTypeOf(new L2Access)
@@ -433,12 +474,18 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     completedBundleQueues(i).io.enq.valid := false.B
     completedBundleQueues(i).io.enq.bits := 0.U
     completedBundleArb.io.in(i) <> completedBundleQueues(i).io.deq
+    wakeQueryQueues(i).io.enq.valid := false.B
+    wakeQueryQueues(i).io.enq.bits := 0.U.asTypeOf(new TrafficGenWakeQuery)
+    wakeQueryArb.io.in(i) <> wakeQueryQueues(i).io.deq
   }
+  wakeQueryArb.io.out.ready := false.B
 
+  // expose issued accesses to bridge-side (pops when receiver ready)
   io.issuedAccessWriteback.valid := issuedWritebackArb.io.out.valid
   io.issuedAccessWriteback.bits := issuedWritebackArb.io.out.bits
   issuedWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
 
+  // default access-read and blocked-warp query interfaces 
   io.accessReadCycle := 0.U
   io.accessReadEn := false.B
   io.accessReadBatchReady := false.B
@@ -446,6 +493,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.blockedWarpQueryEn := false.B
   io.blockedWarpQueryRespStored := false.B
 
+  // continuously drain completed bundle IDs into bridge module
   io.completedBundleIdWriteEn := completedBundleArb.io.out.valid
   io.completedBundleIdWriteIdx := 0.U
   io.completedBundleIdWriteData := completedBundleArb.io.out.bits
@@ -453,6 +501,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.completedBundleCountWriteData := 0.U
   completedBundleArb.io.out.ready := true.B
 
+  // bookkeeping for completed bundle IDs
   when(completedBundleArb.io.out.fire) {
     assert(completedBundleCount =/= CompletedBundleIds.capacity.U,
       "TrafficGenRTLEngine completed bundle ID capacity exceeded")
@@ -460,18 +509,27 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     completedBundleCount := completedBundleCount + 1.U
   }
 
+  // report current model cycle
   io.currentCycleAfterIssue := modelCycle
 
+  // determine whether cleanup or live work remains 
   val bundleTableHasOutstanding = bundleValid.asUInt.orR
+  val wakeQueryQueuesHaveWork = wakeQueryArb.io.out.valid
   val outputQueuesHaveWork =
     issuedWritebackArb.io.out.valid || completedBundleArb.io.out.valid
+  val cleanupWorkPending =
+    io.memActive ||
+    bundleTableHasOutstanding ||
+    wakeQueryQueuesHaveWork ||
+    outputQueuesHaveWork
   val livePendingWork =
     state =/= sIdle ||
     io.memActive ||
     bundleTableHasOutstanding ||
+    wakeQueryQueuesHaveWork ||
     outputQueuesHaveWork ||
     roundHasFutureIssueWork
-  io.hasPendingWork := Mux(state === sIdle, lastHasPendingWork, livePendingWork)
+  io.hasPendingWork := livePendingWork
 
   for (i <- 0 until params.numGenerators) {
     io.issue(i).valid := false.B
@@ -479,70 +537,83 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     io.completion(i).ready := false.B
   }
 
+  // can completions be accepted this cycle (require output queues and wake-query queues to have space)
   val completedQueuesCanAccept = completedBundleQueues.map(_.io.enq.ready).reduce(_ && _)
+  val wakeQueryQueuesCanAccept = wakeQueryQueues.map(_.io.enq.ready).reduce(_ && _)
   val completionAnyValid = VecInit((0 until params.numGenerators).map(i => io.completion(i).valid)).asUInt.orR
   val drainCompletionsThisCycle = Wire(Bool())
-  val completionCanFire = drainCompletionsThisCycle && completionAnyValid && completedQueuesCanAccept
+  val completionCanFire = drainCompletionsThisCycle && completionAnyValid && completedQueuesCanAccept && wakeQueryQueuesCanAccept
   val completionFires = Wire(Vec(params.numGenerators, Bool()))
   for (i <- 0 until params.numGenerators) {
     io.completion(i).ready := completionCanFire
     completionFires(i) := io.completion(i).valid && io.completion(i).ready
   }
 
+  // match each completion against bundle table, counts completions per bundle, detect which bundles fully complete this cycle
   val completeEventValid = Wire(Vec(params.numGenerators, Bool()))
   val completeEventId = Wire(Vec(params.numGenerators, UInt(64.W)))
   val completeEventWakeExit = Wire(Vec(params.numGenerators, Bool()))
+  val completeEventNeedsWakeQuery = Wire(Vec(params.numGenerators, Bool()))
   val completeEventWakeRelevant = Wire(Vec(params.numGenerators, Bool()))
   val completeEventWarpBlocked = Wire(Vec(params.numGenerators, Bool()))
   val completeEventSmId = Wire(Vec(params.numGenerators, UInt(32.W)))
   val completeEventSchedulerId = Wire(Vec(params.numGenerators, UInt(32.W)))
   val completeEventWarpId = Wire(Vec(params.numGenerators, UInt(32.W)))
 
-  var completionValidExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleValid(_))
-  var completionCountExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleOutstanding(_))
-  var completionIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIds(_))
-  var completionWakeExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWakeRelevant(_))
-  var completionBlockedExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWarpBlocked(_))
+  val completionEntryMatches = Seq.tabulate(bundleTableEntries, params.numGenerators) { (e, lane) =>
+    completionFires(lane) &&
+      bundleValid(e) &&
+      bundleIds(e) === io.completion(lane).bits.mBundleId
+  }
+  val completionEntryCounts = Seq.tabulate(bundleTableEntries) { e =>
+    PopCount(VecInit((0 until params.numGenerators).map(lane => completionEntryMatches(e)(lane))).asUInt)
+  }
+  val completionEntryWillComplete = Seq.tabulate(bundleTableEntries) { e =>
+    bundleValid(e) &&
+      completionEntryCounts(e) =/= 0.U &&
+      completionEntryCounts(e) === bundleOutstanding(e)
+  }
 
+  // one representative completion event per completed bundle
   for (lane <- 0 until params.numGenerators) {
-    val active = completionFires(lane)
-    val bundleId = io.completion(lane).bits.mBundleId
-    val matchVec = (0 until bundleTableEntries).map { e =>
-      completionValidExpr(e) && completionIdExpr(e) === bundleId
+    val matchAny = VecInit((0 until bundleTableEntries).map(e => completionEntryMatches(e)(lane))).asUInt.orR
+    val representativeCompleteVec = (0 until bundleTableEntries).map { e =>
+      val earlierLaneSameEntry = if (lane == 0) {
+        false.B
+      } else {
+        VecInit((0 until lane).map(earlier => completionEntryMatches(e)(earlier))).asUInt.orR
+      }
+      completionEntryMatches(e)(lane) && !earlierLaneSameEntry && completionEntryWillComplete(e)
     }
-    val matchAny = VecInit(matchVec).asUInt.orR
-    val oldCount = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionCountExpr(e)
-    } :+ (true.B -> 0.U(bundleCountWidth.W)))
-    val oldWakeRelevant = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionWakeExpr(e)
+    val representativeComplete = VecInit(representativeCompleteVec).asUInt.orR
+
+    completeEventValid(lane) := representativeComplete
+    completeEventId(lane) := PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleIds(e)
+    } :+ (true.B -> 0.U(64.W)))
+    completeEventWakeExit(lane) := false.B
+    completeEventNeedsWakeQuery(lane) := representativeComplete && PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleWakeRelevant(e)
     } :+ (true.B -> false.B))
-    val oldWarpBlocked = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionBlockedExpr(e)
+    completeEventWakeRelevant(lane) := PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleWakeRelevant(e)
     } :+ (true.B -> false.B))
-    val willComplete = active && matchAny && oldCount === 1.U
+    completeEventWarpBlocked(lane) := false.B
+    completeEventSmId(lane) := PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleSmIds(e)
+    } :+ (true.B -> 0.U(32.W)))
+    completeEventSchedulerId(lane) := Cat(0.U(24.W), PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleSchedulerIds(e)
+    } :+ (true.B -> 0.U(8.W))))
+    completeEventWarpId(lane) := PriorityMux((0 until bundleTableEntries).map { e =>
+      representativeCompleteVec(e) -> bundleWarpIds(e)
+    } :+ (true.B -> 0.U(32.W)))
 
-    completeEventValid(lane) := willComplete
-    completeEventId(lane) := bundleId
-    completeEventWakeExit(lane) := willComplete && oldWakeRelevant && oldWarpBlocked
-    completeEventWakeRelevant(lane) := oldWakeRelevant
-    completeEventWarpBlocked(lane) := oldWarpBlocked
-    completeEventSmId(lane) := io.completion(lane).bits.smId
-    completeEventSchedulerId(lane) := Cat(0.U(24.W), io.completion(lane).bits.schedulerId)
-    completeEventWarpId(lane) := io.completion(lane).bits.warpId
-
-    completionCountExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && matchVec(e), oldCount - 1.U, completionCountExpr(e))
-    }
-    completionValidExpr = (0 until bundleTableEntries).map { e =>
-      Mux(willComplete && matchVec(e), false.B, completionValidExpr(e))
-    }
-
-    when(active) {
+    when(completionFires(lane)) {
       assert(matchAny, "TrafficGenRTLEngine completed an access for an unknown bundle")
     }
   }
-
+  // debug signals
   val debugRtlCompletionEventValid = Wire(Bool())
   val debugRtlCompletionEventWakeExit = Wire(Bool())
   val debugRtlCompletionEventBundleId = Wire(UInt(64.W))
@@ -583,18 +654,30 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   dontTouch(debugRtlCompletionEventWarpId)
   dontTouch(debugRtlCompletionEventCycle)
 
+  // compute bundle table after accepting completions: decrement outstanding counts or invalidate fully-completed entries 
   val completionBundleValidNext = Wire(Vec(bundleTableEntries, Bool()))
   val completionBundleCountNext = Wire(Vec(bundleTableEntries, UInt(bundleCountWidth.W)))
   for (e <- 0 until bundleTableEntries) {
-    completionBundleValidNext(e) := completionValidExpr(e)
-    completionBundleCountNext(e) := completionCountExpr(e)
+    val hasCompletions = completionEntryCounts(e) =/= 0.U
+    when(hasCompletions) {
+      assert(completionEntryCounts(e) <= bundleOutstanding(e),
+        "TrafficGenRTLEngine completed more accesses for a bundle than were outstanding")
+    }
+    completionBundleValidNext(e) := Mux(completionEntryWillComplete(e), false.B, bundleValid(e))
+    completionBundleCountNext(e) := Mux(hasCompletions, bundleOutstanding(e) - completionEntryCounts(e), bundleOutstanding(e))
   }
 
+  // enqueue completed bundle IDs and wake queries generated by completed bundles
   for (lane <- 0 until params.numGenerators) {
     completedBundleQueues(lane).io.enq.valid := completeEventValid(lane)
     completedBundleQueues(lane).io.enq.bits := completeEventId(lane)
+    wakeQueryQueues(lane).io.enq.valid := completeEventNeedsWakeQuery(lane)
+    wakeQueryQueues(lane).io.enq.bits.smId := completeEventSmId(lane)
+    wakeQueryQueues(lane).io.enq.bits.schedulerId := completeEventSchedulerId(lane)(7, 0)
+    wakeQueryQueues(lane).io.enq.bits.warpId := completeEventWarpId(lane)
   }
 
+  // build current issue chunk from fetched batch and stamp with target cycle
   val currentIssueAccess = Wire(Vec(params.numGenerators, new L2Access))
   val currentIssueValid = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
@@ -606,6 +689,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     currentIssueValid(lane) := batchIdx < TrafficGenAccessBatch.lanes.U && batchValidAt(batchIdx)
   }
 
+  // determine whether each issued access needs a new bundle table entry or belongs to existing
   val issueExistingMatches = Wire(Vec(params.numGenerators, Bool()))
   val issueFirstNewBundles = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
@@ -625,20 +709,27 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       !issueExistingMatches(lane) &&
       !earlierLaneHasSameBundle
   }
+
+  // computes issueCanFire (issue requires valid work, all destination lanes ready, enough bundle table space, no completion/wake-control work taking priority)
   val freeBundleEntries = PopCount(VecInit(bundleValid.map(v => !v)).asUInt)
   val neededNewBundleEntries = PopCount(issueFirstNewBundles)
   val issueReady = VecInit((0 until params.numGenerators).map { lane =>
     !currentIssueValid(lane) || (io.issue(lane).ready && issuedWritebackQueues(lane).io.enq.ready)
   }).asUInt.andR
   val chunkHasValid = currentIssueValid.asUInt.orR
+  val issueBlockedByControl =
+    completionAnyValid ||
+    wakeQueryQueuesHaveWork
   val issueCanFire =
     state === sIssueBatch &&
     chunkHasValid &&
     issueReady &&
-    freeBundleEntries >= neededNewBundleEntries
+    freeBundleEntries >= neededNewBundleEntries &&
+    !issueBlockedByControl
   drainCompletionsThisCycle := state === sDrainCompletions ||
-    (state === sIssueBatch && !issueCanFire)
+    (state === sIssueBatch && completionAnyValid)
 
+  // drives issue ports and records every issued access into writeback queues
   val issueFires = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
     io.issue(lane).valid := issueCanFire && currentIssueValid(lane)
@@ -648,11 +739,45 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     issuedWritebackQueues(lane).io.enq.bits := currentIssueAccess(lane)
   }
 
+  val debugRtlBatchValidBits = Wire(UInt(TrafficGenAccessBatch.lanes.W))
+  val debugRtlCurrentIssueValidBits = Wire(UInt(params.numGenerators.W))
+  val debugRtlIssueReadyBits = Wire(UInt(params.numGenerators.W))
+  val debugRtlIssueFireBits = Wire(UInt(params.numGenerators.W))
+  val debugRtlIssueCanFire = Wire(Bool())
+  val debugRtlIssueReady = Wire(Bool())
+  val debugRtlChunkHasValid = Wire(Bool())
+  val debugRtlFreeBundleEntries = Wire(UInt(log2Ceil(bundleTableEntries + 1).W))
+  val debugRtlNeededNewBundleEntries = Wire(UInt(log2Ceil(params.numGenerators + 1).W))
+  val debugRtlBatchIssueCursor = Wire(UInt(batchIssueCursor.getWidth.W))
+  debugRtlBatchValidBits := batchValid.asUInt
+  debugRtlCurrentIssueValidBits := currentIssueValid.asUInt
+  debugRtlIssueReadyBits := VecInit((0 until params.numGenerators).map(io.issue(_).ready)).asUInt
+  debugRtlIssueFireBits := issueFires.asUInt
+  debugRtlIssueCanFire := issueCanFire
+  debugRtlIssueReady := issueReady
+  debugRtlChunkHasValid := chunkHasValid
+  debugRtlFreeBundleEntries := freeBundleEntries
+  debugRtlNeededNewBundleEntries := neededNewBundleEntries
+  debugRtlBatchIssueCursor := batchIssueCursor
+  dontTouch(debugRtlBatchValidBits)
+  dontTouch(debugRtlCurrentIssueValidBits)
+  dontTouch(debugRtlIssueReadyBits)
+  dontTouch(debugRtlIssueFireBits)
+  dontTouch(debugRtlIssueCanFire)
+  dontTouch(debugRtlIssueReady)
+  dontTouch(debugRtlChunkHasValid)
+  dontTouch(debugRtlFreeBundleEntries)
+  dontTouch(debugRtlNeededNewBundleEntries)
+  dontTouch(debugRtlBatchIssueCursor)
+
+  // compute next bundle table after issued accesses fire 
   var issueValidExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleValid(_))
   var issueCountExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleOutstanding(_))
   var issueIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIds(_))
   var issueWakeExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWakeRelevant(_))
-  var issueBlockedExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWarpBlocked(_))
+  var issueSmIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleSmIds(_))
+  var issueSchedulerIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleSchedulerIds(_))
+  var issueWarpIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleWarpIds(_))
 
   for (lane <- 0 until params.numGenerators) {
     val active = issueFires(lane)
@@ -680,9 +805,14 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       val priorWake = Mux(matchVec(e), issueWakeExpr(e), false.B)
       Mux(active && (matchVec(e) || allocOH(e)), priorWake || access.mWakeRelevantBundle, issueWakeExpr(e))
     }
-    issueBlockedExpr = (0 until bundleTableEntries).map { e =>
-      val priorBlocked = Mux(matchVec(e), issueBlockedExpr(e), false.B)
-      Mux(active && (matchVec(e) || allocOH(e)), priorBlocked || access.mWarpBlocked, issueBlockedExpr(e))
+    issueSmIdExpr = (0 until bundleTableEntries).map { e =>
+      Mux(active && (matchVec(e) || allocOH(e)), access.smId, issueSmIdExpr(e))
+    }
+    issueSchedulerIdExpr = (0 until bundleTableEntries).map { e =>
+      Mux(active && (matchVec(e) || allocOH(e)), access.schedulerId, issueSchedulerIdExpr(e))
+    }
+    issueWarpIdExpr = (0 until bundleTableEntries).map { e =>
+      Mux(active && (matchVec(e) || allocOH(e)), access.warpId, issueWarpIdExpr(e))
     }
   }
 
@@ -690,15 +820,21 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issueBundleCountNext = Wire(Vec(bundleTableEntries, UInt(bundleCountWidth.W)))
   val issueBundleIdNext = Wire(Vec(bundleTableEntries, UInt(64.W)))
   val issueBundleWakeNext = Wire(Vec(bundleTableEntries, Bool()))
-  val issueBundleBlockedNext = Wire(Vec(bundleTableEntries, Bool()))
+  val issueBundleSmIdNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
+  val issueBundleSchedulerIdNext = Wire(Vec(bundleTableEntries, UInt(8.W)))
+  val issueBundleWarpIdNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
   for (e <- 0 until bundleTableEntries) {
     issueBundleValidNext(e) := issueValidExpr(e)
     issueBundleCountNext(e) := issueCountExpr(e)
     issueBundleIdNext(e) := issueIdExpr(e)
     issueBundleWakeNext(e) := issueWakeExpr(e)
-    issueBundleBlockedNext(e) := issueBlockedExpr(e)
+    issueBundleSmIdNext(e) := issueSmIdExpr(e)
+    issueBundleSchedulerIdNext(e) := issueSchedulerIdExpr(e)
+    issueBundleWarpIdNext(e) := issueWarpIdExpr(e)
   }
 
+  // whether batch chunk is finished, whether another model cycle should be fetched, 
+  // whether outputs are empty, whether completions generated wake queries
   val nextBatchIssueCursor = batchIssueCursor + params.numGenerators.U
   val batchFinishedAfterCurrentChunk = nextBatchIssueCursor >= TrafficGenAccessBatch.lanes.U
   val maxUInt64 = Fill(64, true.B)
@@ -709,13 +845,34 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val outputQueuesEmpty =
     !issuedWritebackArb.io.out.valid &&
     !completedBundleArb.io.out.valid
+  val anyWakeQueryEnqueued = completeEventNeedsWakeQuery.asUInt.orR
 
+  // copy bridge-returned access data into batch registers, reset cursor, start issuing batch
+  def latchAccessReadResponse(): Unit = {
+    for (i <- 0 until TrafficGenAccessBatch.lanes) {
+      batchAccesses(i) := io.accessReadData(i)
+      batchValid(i) := io.accessReadDataValid(i)
+    }
+    batchBucketDone := io.accessReadBucketDone
+    batchIssueCursor := 0.U
+    state := sIssueBatch
+  }
+
+  // convert smId, schedulerId, warpId into blocked-warp bitmap index
+  def blockedWarpQueryIndex(query: TrafficGenWakeQuery): UInt =
+    BlockedWarpBitmap.indexFromFields(query.smId, query.schedulerId, query.warpId)
+
+  // count target cycles 
   when(state =/= sIdle) {
     targetCycle := targetCycle + 1.U
   }
 
+  // on start conditions, initialize round metadata and enter completion drain before fetching
   when(state === sIdle) {
-    when(io.startRound && io.uploadReady) {
+    when(completionAnyValid || cleanupWorkPending) {
+      backgroundDrainActive := true.B
+      state := sDrainCompletions
+    }.elsewhen(io.startRound && io.uploadReady) {
       val loadToMaxResidentCycle = io.minIssueCycle === maxUInt64
       val loadEndCycle = Mux(loadToMaxResidentCycle,
         io.accessStoreMaxCycle,
@@ -726,6 +883,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       roundCapacityBounded := io.accessStoreHasEntries && io.accessStoreMaxCycle < io.minIssueCycle
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
+      backgroundDrainActive := false.B
       completedBundleCount := 0.U
       batchValid.foreach(_ := false.B)
       batchBucketDone := false.B
@@ -734,6 +892,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       io.roundStarted := true.B
       state := sDrainCompletions
     }
+  // accept completions, update bundle table, handle wake queries, honor wake exit
+  // background cleanup, fetch next model cycle, or proceed to output drain
   }.elsewhen(state === sDrainCompletions) {
     when(completionAnyValid) {
       when(completionCanFire) {
@@ -741,16 +901,32 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
           bundleValid(e) := completionBundleValidNext(e)
           bundleOutstanding(e) := completionBundleCountNext(e)
         }
-        when(completeEventWakeExit.asUInt.orR) {
-          wakeExitPending := true.B
+        when(anyWakeQueryEnqueued) {
+          resumeAfterBlockedQuery := sDrainCompletions
+          state := sRequestBlockedWarp
         }
       }
     }.otherwise {
-      when(wakeExitPending) {
-        roundExitReasonReg := TrafficGenRoundExitReason.scheduling
-        state := sDrainOutputs
+      when(wakeQueryQueuesHaveWork) {
+        resumeAfterBlockedQuery := sDrainCompletions
+        state := sRequestBlockedWarp
+      }.elsewhen(wakeExitPending) {
+        when(cleanupWorkPending) {
+          state := sDrainCompletions
+        }.otherwise {
+          roundExitReasonReg := TrafficGenRoundExitReason.scheduling
+          state := sDrainOutputs
+        }
+      }.elsewhen(backgroundDrainActive) {
+        when(cleanupWorkPending) {
+          state := sDrainCompletions
+        }.otherwise {
+          state := sDrainOutputs
+        }
       }.elsewhen(shouldFetchModelCycle) {
         state := sRequestAccess
+      }.elsewhen(cleanupWorkPending) {
+        state := sDrainCompletions
       }.otherwise {
         roundExitReasonReg := Mux(roundCapacityBounded && !roundHasFutureIssueWork,
           TrafficGenRoundExitReason.capacity,
@@ -759,6 +935,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         state := sDrainOutputs
       }
     }
+  // request current modelCycle, wait for bridge to accept, wait for batch response
   }.elsewhen(state === sRequestAccess) {
     io.accessReadCycle := modelCycle
     when(io.accessReadReady) {
@@ -774,23 +951,25 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   }.elsewhen(state === sWaitAccess) {
     io.accessReadBatchReady := true.B
     when(io.accessReadRespValid) {
-      for (i <- 0 until TrafficGenAccessBatch.lanes) {
-        batchAccesses(i) := io.accessReadData(i)
-        batchValid(i) := io.accessReadDataValid(i)
-      }
-      batchBucketDone := io.accessReadBucketDone
-      batchIssueCursor := 0.U
-      state := sIssueBatch
+      latchAccessReadResponse()
+    }.elsewhen(io.accessReadReady) {
+      state := sRequestAccess
     }
+  // prioritize completions, wake queries, wake exits 
+  // if none apply, skip empty chunks or issue current chunk and advance batch/model state
   }.elsewhen(state === sIssueBatch) {
     when(completionCanFire) {
       for (e <- 0 until bundleTableEntries) {
         bundleValid(e) := completionBundleValidNext(e)
         bundleOutstanding(e) := completionBundleCountNext(e)
       }
-      when(completeEventWakeExit.asUInt.orR) {
-        wakeExitPending := true.B
+      when(anyWakeQueryEnqueued) {
+        resumeAfterBlockedQuery := sIssueBatch
+        state := sRequestBlockedWarp
       }
+    }.elsewhen(wakeQueryQueuesHaveWork) {
+      resumeAfterBlockedQuery := sIssueBatch
+      state := sRequestBlockedWarp
     }.elsewhen(!chunkHasValid) {
       when(batchFinishedAfterCurrentChunk) {
         batchValid.foreach(_ := false.B)
@@ -809,7 +988,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         bundleOutstanding(e) := issueBundleCountNext(e)
         bundleIds(e) := issueBundleIdNext(e)
         bundleWakeRelevant(e) := issueBundleWakeNext(e)
-        bundleWarpBlocked(e) := issueBundleBlockedNext(e)
+        bundleSmIds(e) := issueBundleSmIdNext(e)
+        bundleSchedulerIds(e) := issueBundleSchedulerIdNext(e)
+        bundleWarpIds(e) := issueBundleWarpIdNext(e)
       }
       when(batchFinishedAfterCurrentChunk) {
         batchValid.foreach(_ := false.B)
@@ -823,11 +1004,38 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         batchIssueCursor := nextBatchIssueCursor
       }
     }
+  // blocked warp bitmap request and response handling
+  }.elsewhen(state === sRequestBlockedWarp) {
+    when(wakeQueryArb.io.out.valid) {
+      io.blockedWarpQueryIdx := blockedWarpQueryIndex(wakeQueryArb.io.out.bits)
+      when(io.blockedWarpQueryReady) {
+        io.blockedWarpQueryEn := true.B
+        activeWakeQuery := wakeQueryArb.io.out.bits
+        wakeQueryArb.io.out.ready := true.B
+        state := sWaitBlockedWarp
+      }
+    }.otherwise {
+      state := resumeAfterBlockedQuery
+    }
+  }.elsewhen(state === sWaitBlockedWarp) {
+    io.blockedWarpQueryIdx := blockedWarpQueryIndex(activeWakeQuery)
+    when(io.blockedWarpQueryRespValid) {
+      blockedWarpQueryRespReg := io.blockedWarpQueryResp
+      state := sAckBlockedWarp
+    }
+  }.elsewhen(state === sAckBlockedWarp) {
+    io.blockedWarpQueryRespStored := true.B
+    when(blockedWarpQueryRespReg && !backgroundDrainActive) {
+      wakeExitPending := true.B
+    }
+    state := Mux(wakeQueryQueuesHaveWork, sRequestBlockedWarp, resumeAfterBlockedQuery)
+  // write completed bundle count, pulse roundComplete
   }.elsewhen(state === sDrainOutputs) {
     when(outputQueuesEmpty) {
       io.completedBundleCountWriteEn := true.B
       io.completedBundleCountWriteData := completedBundleCount
-      io.roundComplete := true.B
+      io.roundComplete := !backgroundDrainActive
+      backgroundDrainActive := false.B
       state := sIdle
     }
   }
@@ -955,9 +1163,12 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
     clients = Seq(TLMasterParameters.v2(
       name = s"trafficgenmem$id",
       sourceId = IdRange(0, params.memOutstanding),
+      supports = TLSlaveToMasterTransferSizes(
+        probe = TransferSizes(64, 64)
+      ),
       emits = TLMasterToSlaveTransferSizes(
-        get = TransferSizes(64, 64),
-        putFull = TransferSizes(64, 64)
+        acquireT = TransferSizes(64, 64),
+        acquireB = TransferSizes(64, 64)
       )
     ))
   )))
@@ -1017,54 +1228,51 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
         inflightAccesses(allocatedSource) := issueQueue.io.deq.bits
       }
 
-      val (putLegal, putBits) = edge.Put(senderSource, addr, size, 0.U((beatBytes * 8).W))
-      val (getLegal, getBits) = edge.Get(senderSource, addr, size)
+      val acquireParam = Mux(activeAccess.mIsWrite, TLPermissions.NtoT, TLPermissions.NtoB)
+      val (acquireLegal, acquireBits) = edge.AcquireBlock(senderSource, addr, size, acquireParam)
+      val probeAckValid = RegInit(false.B)
+      val probeAckBits = Reg(new TLBundleC(edge.bundle))
+      val grantAckValid = RegInit(false.B)
+      val grantAckBits = Reg(new TLBundleE(edge.bundle))
+      val grantAckSource = Reg(UInt(sourceIdxWidth.W))
 
       mem.a.valid := senderValid
-      mem.a.bits := Mux(activeAccess.mIsWrite, putBits, getBits)
-      val (_, aLast, aDone, aBeat) = edge.count(mem.a)
-
-      val beatIndex = Wire(UInt(64.W))
-      beatIndex := aBeat
-      val writePatternSeed = activeAccess.id ^
-        activeAccess.mBundleId ^
-        id.U(64.W) ^
-        beatIndex ^
-        "h9e3779b97f4a7c15".U(64.W)
-      val writePattern = if (beatBytes * 8 <= 64) {
-        writePatternSeed((beatBytes * 8) - 1, 0)
-      } else {
-        Cat(Seq.tabulate((beatBytes * 8 + 63) / 64) { i =>
-          writePatternSeed ^ i.U(64.W)
-        }.reverse)(beatBytes * 8 - 1, 0)
-      }
-      when(activeAccess.mIsWrite) {
-        mem.a.bits.data := writePattern
-      }
+      mem.a.bits := acquireBits
+      val (_, aLast, _, _) = edge.count(mem.a)
 
       val dLast = edge.last(mem.d.bits, mem.d.fire)
       val dSourceInRange = mem.d.bits.source < params.memOutstanding.U
       val dSource = mem.d.bits.source(sourceIdxWidth - 1, 0)
       val dSourceValid = dSourceInRange && inflightValid(dSource)
 
-      mem.b.ready := false.B
-      mem.c.valid := false.B
-      mem.c.bits := DontCare
-      mem.d.ready := dSourceValid && (!dLast || completionQueue.io.enq.ready)
-      mem.e.valid := false.B
-      mem.e.bits := DontCare
+      mem.b.ready := !probeAckValid
+      mem.c.valid := probeAckValid
+      mem.c.bits := probeAckBits
+      mem.d.ready := !grantAckValid && dSourceValid && (!dLast || completionQueue.io.enq.ready)
+      mem.e.valid := grantAckValid
+      mem.e.bits := grantAckBits
 
-      completionQueue.io.enq.valid := mem.d.valid && dSourceValid && dLast
+      when(mem.b.fire) {
+        probeAckValid := true.B
+        probeAckBits := edge.ProbeAck(mem.b.bits, TLPermissions.toN)
+      }
+      when(mem.c.fire) {
+        probeAckValid := false.B
+      }
+
+      completionQueue.io.enq.valid := mem.d.fire && dLast
       completionQueue.io.enq.bits := inflightAccesses(dSource)
       io.completion <> completionQueue.io.deq
       io.active := senderValid ||
         issueQueue.io.deq.valid ||
         inflightValid.asUInt.orR ||
-        completionQueue.io.deq.valid
+        completionQueue.io.deq.valid ||
+        probeAckValid ||
+        grantAckValid
       io.inflightAccessCount := PopCount(inflightValid)
 
       when(mem.a.fire) {
-        assert(Mux(activeAccess.mIsWrite, putLegal, getLegal), "TrafficGenMem issued illegal TL access")
+        assert(acquireLegal, "TrafficGenMem issued illegal TL-C acquire")
       }
 
       when(mem.a.fire && aLast) {
@@ -1075,7 +1283,13 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
         assert(dSourceValid, "TrafficGenMem received a D response for an invalid source slot")
       }
       when(mem.d.fire && dLast) {
-        inflightValid(dSource) := false.B
+        grantAckValid := true.B
+        grantAckBits := edge.GrantAck(mem.d.bits)
+        grantAckSource := dSource
+      }
+      when(mem.e.fire) {
+        grantAckValid := false.B
+        inflightValid(grantAckSource) := false.B
       }
     }
   }
@@ -1161,7 +1375,7 @@ class WithTrafficGen extends Config((site, here, up) => {
 
 class WithRTLTrafficGen extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams(
-    numGenerators = 4,
+    numGenerators = 16,
     memOutstanding = 4,
     backend = TrafficGenRTLBackend,
     remapTraceAddresses = true,
