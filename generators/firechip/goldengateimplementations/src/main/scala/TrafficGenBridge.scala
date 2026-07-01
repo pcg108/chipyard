@@ -25,6 +25,7 @@ object TrafficGenBRAMAddressMap {
   val rawIssuedAccessWritebackStoreOffset: BigInt = BigInt("03000000", 16)
   val rawBlockedWarpBitmapOffset: BigInt        = BigInt("04080000", 16)
   val rawCompletedBundleIdsOffset: BigInt       = BigInt("04090000", 16)
+  val rawBlockedWarpBloomFilterOffset: BigInt   = BigInt("040D0000", 16)
 }
 
 class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
@@ -69,6 +70,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
      */
     val pauseTarget = RegInit(false.B)
     val targetPaused = RegInit(false.B)
+    val accessReadTargetPaused = RegInit(false.B)
     val trafficGenDone = RegInit(false.B)
     val trafficGenDonePulse = Wire(Bool())
     trafficGenDonePulse := false.B
@@ -95,7 +97,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
-      !targetPaused
+      !targetPaused &&
+      !accessReadTargetPaused
 
     // completedBundleIds will be streamed back from traffic generator to bridge driver.
     // Each 512-bit beat carries eight 64-bit bundle IDs.
@@ -202,6 +205,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val blockedWarpBitmapWriteEn = WireDefault(false.B)
     val blockedWarpBitmapWriteAddr = WireDefault(0.U(BlockedWarpBitmap.streamBeatIdxBits.W))
     val blockedWarpBitmapWriteData = WireDefault(0.U(L2Access.streamWidthBits.W))
+    val blockedWarpBloomFilter = RegInit(VecInit(Seq.fill(BlockedWarpBloomFilter.streamBeatCount)(0.U(L2Access.streamWidthBits.W))))
+    val blockedWarpBloomFilterWriteEn = WireDefault(false.B)
+    val blockedWarpBloomFilterWriteAddr = WireDefault(0.U(BlockedWarpBloomFilter.streamBeatIdxBits.W))
+    val blockedWarpBloomFilterWriteData = WireDefault(0.U(L2Access.streamWidthBits.W))
 
     // Bridge driver pulses this after XDMA writes have populated the uploaded round data.
     val commitUpload = Wire(Bool())
@@ -283,6 +290,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // prevent re-accepting same request if read en stays high after bridge finishes bucket
     val accessReadWaitForEnLow = RegInit(false.B)
+    val accessReadRespWaitForReadyLow = RegInit(false.B)
+    val accessReadPausePending = RegInit(false.B)
     val accessReadEntryIdx = WireDefault(0.U(accessIdxWidth.W))
     val accessReadEntryEn = WireDefault(false.B)
 
@@ -323,10 +332,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadRespValidReg := true.B
       accessReadRespIdReg := accessReadNextRespId
       accessReadNextRespId := accessReadNextRespId + 1.U
+      accessReadTargetPaused := false.B
+    }
+
+    when(accessReadRespValidReg) {
+      accessReadTargetPaused := false.B
     }
 
     // begin serving a target access read request
     when(accessReadReq) {
+      accessReadPausePending := true.B
       accessReadReadyReg := false.B
       accessReadServingReg := true.B
       accessReadReqCycleReg := target.accessReadCycle
@@ -337,8 +352,17 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadWaitForEnLow := true.B
     }
 
+    when(accessReadPausePending && fire) {
+      accessReadPausePending := false.B
+      accessReadTargetPaused := true.B
+    }
+
     when(fire && !target.accessReadEn) {
       accessReadWaitForEnLow := false.B
+    }
+
+    when(fire && !target.accessReadBatchReady) {
+      accessReadRespWaitForReadyLow := false.B
     }
 
     // clear valid lanes when target accepts response
@@ -346,6 +370,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
       accessReadBatchCount := 0.U
+      accessReadRespWaitForReadyLow := true.B
       when(accessReadBucketDoneReg) {
         accessReadBucketDoneReg := false.B
         accessReadServingReg := false.B
@@ -353,7 +378,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
 
-    when(accessReadServingReg && !accessReadFetchPending && !accessReadRespValidReg && !accessReadBucketDoneReg) {
+    when(accessReadServingReg &&
+         !accessReadFetchPending &&
+         !accessReadRespValidReg &&
+         !accessReadBucketDoneReg &&
+         !accessReadRespWaitForReadyLow) {
       // if there is a valid peek entry
       when(accessReadPeekValidReg) {
         assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
@@ -401,6 +430,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadPeekValidReg := false.B
       accessReadFetchPending := false.B
       accessReadWaitForEnLow := false.B
+      accessReadRespWaitForReadyLow := false.B
+      accessReadPausePending := false.B
+      accessReadTargetPaused := false.B
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
       accessReadRespIdReg := 0.U
@@ -463,6 +495,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.blockedWarpQueryRespValid := blockedWarpQueryRespValidReg
     target.blockedWarpQueryReady := blockedWarpQueryReadyReg && !blockedWarpQueryPending && !blockedWarpQueryReadPending
 
+    for (lane <- 0 until BlockedWarpBloomFilter.lookupLanes) {
+      val queryIdx = target.blockedWarpBloomQueryIdx(lane)
+      val hashHits = BlockedWarpBloomFilter.hashesForIndex(queryIdx).map { hash =>
+        val beat = blockedWarpBloomFilter(hash(BlockedWarpBloomFilter.hashBits - 1, BlockedWarpBloomFilter.streamBeatOffsetBits))
+        (beat >> hash(BlockedWarpBloomFilter.streamBeatOffsetBits - 1, 0))(0)
+      }
+      target.blockedWarpBloomQueryResp(lane) := target.blockedWarpBloomQueryEn(lane) && hashHits.reduce(_ && _)
+    }
+
     /*
      * Direct CPU-managed XDMA access to TrafficGen BRAM-backed stores.
      * Upload writes directly access the physical SyncReadMems.
@@ -486,6 +527,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessWindowBytes = BigInt(key.maxL2AccessEntries) * bramBeatBytes
     val blockedWindowBytes = BigInt(BlockedWarpBitmap.streamBeatCount) * bramBeatBytes
     val completedWindowBytes = BigInt(completedBundleIdBeats) * bramBeatBytes
+    val blockedBloomWindowBytes = BigInt(BlockedWarpBloomFilter.streamBeatCount) * bramBeatBytes
 
     val axiWriteActive = RegInit(false.B)
     val axiWriteAddr = Reg(UInt(bramAddrBits.W))
@@ -519,6 +561,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val writeRawIssued = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
     val writeRawBlocked = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset, blockedWindowBytes)
     val writeRawCompleted = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
+    val writeRawBloom = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBloomFilterOffset, blockedBloomWindowBytes)
 
     bramAxi.w.ready := axiWriteActive && !axiWriteRespValid
 
@@ -547,6 +590,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         completedBundleIdsWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset)(completedBundleBeatIdxWidth - 1, 0)
         completedBundleIdsWriteData := bramAxi.w.bits.data.asTypeOf(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
         completedBundleIdsWriteMask.foreach(_ := true.B)
+      }
+      when(writeRawBloom) {
+        blockedWarpBloomFilterWriteEn := true.B
+        blockedWarpBloomFilterWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawBlockedWarpBloomFilterOffset)(BlockedWarpBloomFilter.streamBeatIdxBits - 1, 0)
+        blockedWarpBloomFilterWriteData := bramAxi.w.bits.data
       }
       ////
 
@@ -684,6 +732,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(blockedWarpBitmapWriteEn) {
       blockedWarpBitmap.write(blockedWarpBitmapWriteAddr, blockedWarpBitmapWriteData)
     }
+    when(blockedWarpBloomFilterWriteEn) {
+      blockedWarpBloomFilter(blockedWarpBloomFilterWriteAddr) := blockedWarpBloomFilterWriteData
+    }
     // issuedAccess and completedBundleIds written from target -> bridge module
     when(issuedAccessWritebackStoreWriteEn) {
       issuedAccessWritebackStore.write(issuedAccessWritebackStoreWriteAddr, issuedAccessWritebackStoreWriteData)
@@ -735,6 +786,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadCursor := 0.U
       accessReadPeekValidReg := false.B
       accessReadFetchPending := false.B
+      accessReadWaitForEnLow := false.B
+      accessReadRespWaitForReadyLow := false.B
+      accessReadPausePending := false.B
+      accessReadTargetPaused := false.B
       accessReadDataValidRegs.foreach(_ := false.B)
       accessReadRespValidReg := false.B
       accessReadRespIdReg := 0.U
@@ -754,6 +809,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       blockedWarpQueryPending := false.B
       blockedWarpQueryReadPending := false.B
       blockedWarpQueryRespValidReg := false.B
+      blockedWarpBloomFilter.foreach(_ := 0.U)
       startRoundPending := false.B
       startTrafficGenLatched := false.B
       roundCompleteLatched := false.B
@@ -820,9 +876,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           UInt64(TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset),
           UInt64(TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset),
           UInt64(TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset),
+          UInt64(TrafficGenBRAMAddressMap.rawBlockedWarpBloomFilterOffset),
           UInt64(accessWindowBytes),
           UInt64(blockedWindowBytes),
           UInt64(completedWindowBytes),
+          UInt64(blockedBloomWindowBytes),
         ),
       )
     }

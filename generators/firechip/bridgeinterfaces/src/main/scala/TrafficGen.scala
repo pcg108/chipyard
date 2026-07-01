@@ -95,8 +95,30 @@ object BlockedWarpBitmap {
     )
 }
 
+object BlockedWarpBloomFilter {
+  val bits = 16 * 1024
+  val hashBits = log2Ceil(bits)
+  val hashes = 3
+  val lookupLanes = TrafficGenAccessBatch.lanes
+  val streamBeatBits = L2Access.streamWidthBits
+  val streamBeatCount = bits / streamBeatBits
+  val streamBeatIdxBits = log2Ceil(streamBeatCount)
+  val streamBeatOffsetBits = log2Ceil(streamBeatBits)
+
+  require(bits % streamBeatBits == 0, "Blocked warp Bloom filter must be stream-beat aligned")
+
+  def hashesForIndex(idx: UInt): Seq[UInt] = {
+    val h0 = ((idx & "h3fff".U) ^ ((idx >> 14) & "h1f".U))(hashBits - 1, 0)
+    val h1 = (((idx >> 5) & "h3fff".U) ^
+      (((idx & "h1f".U) << 9) | ((idx >> 10) & "h1ff".U)))(hashBits - 1, 0)
+    val h2 = ((((idx & "h1ff".U) << 5) | ((idx >> 14) & "h1f".U)) ^
+      ((idx >> 3) & "h3fff".U))(hashBits - 1, 0)
+    Seq(h0, h1, h2)
+  }
+}
+
 object CompletedBundleIds {
-  val capacity = 4096
+  val capacity = 32768
   val idsPerBeat = 8
   val beats = capacity / idsPerBeat
   val idxWidth = log2Ceil(capacity)
@@ -134,6 +156,8 @@ class TrafficGenPortIO extends Bundle {
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())
   val blockedWarpQueryRespStored = Output(Bool())
+  val blockedWarpBloomQueryIdx = Output(Vec(BlockedWarpBloomFilter.lookupLanes, UInt(BlockedWarpBitmap.indexBits.W)))
+  val blockedWarpBloomQueryEn = Output(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
   val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
@@ -143,6 +167,7 @@ class TrafficGenPortIO extends Bundle {
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
   val blockedWarpQueryReady = Input(Bool())
+  val blockedWarpBloomQueryResp = Input(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
