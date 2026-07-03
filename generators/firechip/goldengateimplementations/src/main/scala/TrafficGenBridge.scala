@@ -24,8 +24,8 @@ object TrafficGenBRAMAddressMap {
   val rawAccessStoreOffset: BigInt              = BigInt("02000000", 16)
   val rawIssuedAccessWritebackStoreOffset: BigInt = BigInt("03000000", 16)
   val rawBlockedWarpBitmapOffset: BigInt        = BigInt("04080000", 16)
-  val rawCompletedBundleIdsOffset: BigInt       = BigInt("04090000", 16)
-  val rawBlockedWarpBloomFilterOffset: BigInt   = BigInt("040D0000", 16)
+  val rawCompletedBundleIdsOffset: BigInt       = BigInt("04480000", 16)
+  val rawBlockedWarpBloomFilterOffset: BigInt   = BigInt("044C0000", 16)
 }
 
 class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
@@ -528,6 +528,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val blockedWindowBytes = BigInt(BlockedWarpBitmap.streamBeatCount) * bramBeatBytes
     val completedWindowBytes = BigInt(completedBundleIdBeats) * bramBeatBytes
     val blockedBloomWindowBytes = BigInt(BlockedWarpBloomFilter.streamBeatCount) * bramBeatBytes
+    require(TrafficGenBRAMAddressMap.rawBlockedWarpBitmapOffset + blockedWindowBytes <=
+            TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset,
+            "TrafficGen blocked-warp bitmap overlaps completed-bundle ID window")
+    require(TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset + completedWindowBytes <=
+            TrafficGenBRAMAddressMap.rawBlockedWarpBloomFilterOffset,
+            "TrafficGen completed-bundle ID window overlaps blocked-warp Bloom filter window")
+    require(TrafficGenBRAMAddressMap.rawBlockedWarpBloomFilterOffset + blockedBloomWindowBytes <=
+            TrafficGenBRAMAddressMap.size,
+            "TrafficGen blocked-warp Bloom filter exceeds BRAM window")
 
     val axiWriteActive = RegInit(false.B)
     val axiWriteAddr = Reg(UInt(bramAddrBits.W))

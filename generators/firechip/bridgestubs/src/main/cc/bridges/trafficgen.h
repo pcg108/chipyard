@@ -101,10 +101,10 @@ public:
   // Given that each warp is identified by (sm, scheduler, warp), encode the
   // blocked warp set into a bitmap where each bit corresponds to a unique warp.
   // Accel-Sim dynamic_warp IDs can be much larger than the resident warp count.
-  // 9 bits covers IDs 0-511 seen in the render traces.
+  // 15 bits covers IDs 0-32767 for 4096 CTAs with 8 warps per CTA.
   static constexpr size_t BLOCKED_WARP_SM_BITS = 8;
   static constexpr size_t BLOCKED_WARP_SCHEDULER_BITS = 2;
-  static constexpr size_t BLOCKED_WARP_WARP_BITS = 9;
+  static constexpr size_t BLOCKED_WARP_WARP_BITS = 15;
   static constexpr size_t BLOCKED_WARP_INDEX_BITS =
                                                 BLOCKED_WARP_SM_BITS + 
                                                 BLOCKED_WARP_SCHEDULER_BITS +

@@ -77,7 +77,7 @@ object TrafficGenAccessBatch {
 object BlockedWarpBitmap {
   val smBits = 8
   val schedulerBits = 2
-  val warpBits = 9
+  val warpBits = 15
   val indexBits = smBits + schedulerBits + warpBits
   val totalBits = 1 << indexBits
   val streamBeatBits = L2Access.streamWidthBits
@@ -108,11 +108,10 @@ object BlockedWarpBloomFilter {
   require(bits % streamBeatBits == 0, "Blocked warp Bloom filter must be stream-beat aligned")
 
   def hashesForIndex(idx: UInt): Seq[UInt] = {
-    val h0 = ((idx & "h3fff".U) ^ ((idx >> 14) & "h1f".U))(hashBits - 1, 0)
-    val h1 = (((idx >> 5) & "h3fff".U) ^
-      (((idx & "h1f".U) << 9) | ((idx >> 10) & "h1ff".U)))(hashBits - 1, 0)
-    val h2 = ((((idx & "h1ff".U) << 5) | ((idx >> 14) & "h1f".U)) ^
-      ((idx >> 3) & "h3fff".U))(hashBits - 1, 0)
+    val idx32 = idx.pad(32)
+    val h0 = ((idx32 * "h9e3779b1".U(32.W)) ^ (idx32 >> 16))(hashBits - 1, 0)
+    val h1 = ((idx32 * "h85ebca6b".U(32.W)) ^ (idx32 >> 13))(hashBits - 1, 0)
+    val h2 = ((idx32 * "hc2b2ae35".U(32.W)) ^ (idx32 >> 15))(hashBits - 1, 0)
     Seq(h0, h1, h2)
   }
 }

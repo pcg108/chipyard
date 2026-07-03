@@ -759,13 +759,9 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
 
 static std::array<std::uint32_t, 3> blocked_warp_bloom_hashes(std::uint32_t idx) {
   constexpr std::uint32_t mask = (1u << trafficgen_t::BLOCKED_WARP_BLOOM_HASH_BITS) - 1u;
-  const std::uint32_t h0 = ((idx & 0x3fffu) ^ ((idx >> 14) & 0x1fu)) & mask;
-  const std::uint32_t h1 =
-      (((idx >> 5) & 0x3fffu) ^
-       (((idx & 0x1fu) << 9) | ((idx >> 10) & 0x1ffu))) & mask;
-  const std::uint32_t h2 =
-      ((((idx & 0x1ffu) << 5) | ((idx >> 14) & 0x1fu)) ^
-       ((idx >> 3) & 0x3fffu)) & mask;
+  const std::uint32_t h0 = ((idx * 0x9e3779b1u) ^ (idx >> 16)) & mask;
+  const std::uint32_t h1 = ((idx * 0x85ebca6bu) ^ (idx >> 13)) & mask;
+  const std::uint32_t h2 = ((idx * 0xc2b2ae35u) ^ (idx >> 15)) & mask;
   return {h0, h1, h2};
 }
 
