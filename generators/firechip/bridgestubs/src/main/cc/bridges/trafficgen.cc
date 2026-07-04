@@ -757,14 +757,6 @@ static uint32_t blocked_warp_index(uint32_t sm_id,
          (scheduler_id << trafficgen_t::BLOCKED_WARP_WARP_BITS) | warp_id;
 }
 
-static std::array<std::uint32_t, 3> blocked_warp_bloom_hashes(std::uint32_t idx) {
-  constexpr std::uint32_t mask = (1u << trafficgen_t::BLOCKED_WARP_BLOOM_HASH_BITS) - 1u;
-  const std::uint32_t h0 = ((idx * 0x9e3779b1u) ^ (idx >> 16)) & mask;
-  const std::uint32_t h1 = ((idx * 0x85ebca6bu) ^ (idx >> 13)) & mask;
-  const std::uint32_t h2 = ((idx * 0xc2b2ae35u) ^ (idx >> 15)) & mask;
-  return {h0, h1, h2};
-}
-
 static void pack_l2_access(const trafficgen_l2_access_t &access,
                            uint64_t *words) {
   words[0] = access.id;
@@ -812,11 +804,9 @@ trafficgen_t::trafficgen_t(simif_t &simif,
                            uint64_t raw_issued_access_writeback_store_offset,
                            uint64_t raw_blocked_warp_bitmap_offset,
                            uint64_t raw_completed_bundle_ids_offset,
-                           uint64_t raw_blocked_warp_bloom_filter_offset,
                            uint64_t access_window_bytes,
                            uint64_t blocked_window_bytes,
-                           uint64_t completed_window_bytes,
-                           uint64_t blocked_bloom_window_bytes)
+                           uint64_t completed_window_bytes)
     : bridge_driver_t(simif, &KIND),
       mmio_addrs(mmio_addrs),
       bram_base(bram_base),
@@ -824,15 +814,11 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       raw_issued_access_writeback_store_offset(raw_issued_access_writeback_store_offset),
       raw_blocked_warp_bitmap_offset(raw_blocked_warp_bitmap_offset),
       raw_completed_bundle_ids_offset(raw_completed_bundle_ids_offset),
-      raw_blocked_warp_bloom_filter_offset(raw_blocked_warp_bloom_filter_offset),
       access_window_bytes(access_window_bytes),
       blocked_window_bytes(blocked_window_bytes),
-      completed_window_bytes(completed_window_bytes),
-      blocked_bloom_window_bytes(blocked_bloom_window_bytes) {
+      completed_window_bytes(completed_window_bytes) {
   static_assert(BLOCKED_WARP_BITMAP_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
                 "Blocked warp bitmap must align to stream beats");
-  static_assert(BLOCKED_WARP_BLOOM_BITS % (STREAM_WIDTH_BYTES * 8) == 0,
-                "Blocked warp Bloom filter must align to stream beats");
   const std::string stretch_scale =
       plusarg_value(args, "trafficgen-memory-issue-stretch-scale");
   if (!stretch_scale.empty()) {
@@ -866,7 +852,6 @@ void trafficgen_t::init() {
   accumulated_completed_bundle_ids.clear();
   deferred_completed_bundle_ids.clear();
   deferred_completed_bundle_id_set.clear();
-  reported_completed_bundle_id_set.clear();
   logical_round_number = 0;
   current_round_all_l2_trace_steps.clear();
   current_round_blocked_warp_ids.clear();
@@ -879,7 +864,6 @@ void trafficgen_t::init() {
   pending_access_l1_to_l2_by_id.clear();
   pending_access_elapsed_by_id.clear();
   blocked_warp_bitmap.fill(0);
-  blocked_warp_bloom_filter.fill(0);
   upload_written_to_bram = false;
   round_completion_pause_issued = false;
   round_input_reserved_subpartitions.clear();
@@ -925,6 +909,33 @@ void trafficgen_t::send_reserved_subpartitions_snapshot(
             << reservations.size() << " payload_bytes=" << payload.size() << std::endl;
 }
 
+static bool access_warp_is_blocked(
+    const trafficgen_l2_access_t &access,
+    const std::set<socket_warp_key_t> &blocked_warp_ids) {
+  const socket_warp_key_t key{
+      access.sm_id,
+      static_cast<unsigned>(access.scheduler_id),
+      access.warp_id};
+  return blocked_warp_ids.find(key) != blocked_warp_ids.end();
+}
+
+void trafficgen_t::refresh_pending_access_blocked_annotations() {
+  for (auto &[cycle, accesses] : pending_accesses_by_cycle) {
+    (void)cycle;
+    for (auto &access : accesses) {
+      access.m_warp_blocked =
+          access_warp_is_blocked(access, current_round_blocked_warp_ids);
+    }
+  }
+}
+
+void trafficgen_t::refresh_upload_access_blocked_annotations() {
+  for (auto &access : l2_accesses) {
+    access.m_warp_blocked =
+        access_warp_is_blocked(access, current_round_blocked_warp_ids);
+  }
+}
+
 void trafficgen_t::build_next_l2_access_chunk() {
   /*
     Build the set of accesses to upload to target for next scheduling round,
@@ -932,6 +943,7 @@ void trafficgen_t::build_next_l2_access_chunk() {
   */
 
   l2_accesses.clear();
+  refresh_pending_access_blocked_annotations();
   const size_t max_entries = access_window_bytes / L2_ACCESS_STREAM_BYTES;
   if (pending_accesses_by_cycle.empty()) {
     return;
@@ -1074,37 +1086,12 @@ bool trafficgen_t::has_pending_access_for_bundle(
 }
 
 void trafficgen_t::record_completed_bundle_id(std::uint64_t bundle_id) {
-  if (reported_completed_bundle_id_set.find(bundle_id) !=
-      reported_completed_bundle_id_set.end()) {
-    return;
-  }
-  if (has_pending_access_for_bundle(bundle_id)) {
-    if (deferred_completed_bundle_id_set.insert(bundle_id).second) {
-      deferred_completed_bundle_ids.push_back(bundle_id);
-    }
-    return;
-  }
-  reported_completed_bundle_id_set.insert(bundle_id);
-  deferred_completed_bundle_id_set.erase(bundle_id);
+  // Match SimpleTrafficGen semantics: completion is tied to target-issued
+  // outstanding requests, not to future accesses waiting in the host queue.
   accumulated_completed_bundle_ids.push_back(bundle_id);
 }
 
 void trafficgen_t::flush_deferred_completed_bundle_ids() {
-  std::vector<std::uint64_t> still_deferred;
-  still_deferred.reserve(deferred_completed_bundle_ids.size());
-  for (const auto bundle_id : deferred_completed_bundle_ids) {
-    if (reported_completed_bundle_id_set.find(bundle_id) !=
-        reported_completed_bundle_id_set.end()) {
-      deferred_completed_bundle_id_set.erase(bundle_id);
-    } else if (has_pending_access_for_bundle(bundle_id)) {
-      still_deferred.push_back(bundle_id);
-    } else {
-      reported_completed_bundle_id_set.insert(bundle_id);
-      deferred_completed_bundle_id_set.erase(bundle_id);
-      accumulated_completed_bundle_ids.push_back(bundle_id);
-    }
-  }
-  deferred_completed_bundle_ids.swap(still_deferred);
 }
 
 void trafficgen_t::log_logical_round_for_compare(
@@ -1250,18 +1237,15 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   }
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
-  build_next_l2_access_chunk();
 
   blocked_warp_bitmap.fill(0);
-  blocked_warp_bloom_filter.fill(0);
   for (const auto &warp_key : message.blockedWarpIds) {
     const auto index =
         blocked_warp_index(warp_key.smId, warp_key.schedulerId, warp_key.warpId);
     blocked_warp_bitmap[index / 64] |= (1ULL << (index % 64));
-    for (const auto hash : blocked_warp_bloom_hashes(index)) {
-      blocked_warp_bloom_filter[hash / 64] |= (1ULL << (hash % 64));
-    }
   }
+  refresh_pending_access_blocked_annotations();
+  build_next_l2_access_chunk();
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
@@ -1270,7 +1254,6 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
             << " blocked_warps=" << message.blockedWarpIds.size()
             << " min_issue_cycle=" << min_issue_cycle << std::endl;
 }
-
 
 size_t trafficgen_t::process_completed_bundle_ids_stream() {
 
@@ -1369,6 +1352,9 @@ void trafficgen_t::write_schedule_to_bram() {
     return;
   }
 
+  refresh_pending_access_blocked_annotations();
+  refresh_upload_access_blocked_annotations();
+
   // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O
   auto &xdma = simif.get_cpu_managed_stream_io();
 
@@ -1408,19 +1394,6 @@ void trafficgen_t::write_schedule_to_bram() {
       bitmap_upload.get(),
       bitmap_bytes,
       "XDMA write while uploading TrafficGen blocked-warp bitmap");
-
-  const size_t bloom_bytes = BLOCKED_WARP_BLOOM_BEATS * STREAM_WIDTH_BYTES;
-  if (bloom_bytes > blocked_bloom_window_bytes) {
-    throw std::runtime_error("TrafficGen blocked-warp Bloom upload exceeds BRAM Bloom window");
-  }
-  auto bloom_upload = make_aligned_bytes(bloom_bytes);
-  std::memcpy(bloom_upload.get(), blocked_warp_bloom_filter.data(), bloom_bytes);
-  xdma_write_exact(
-      xdma,
-      bram_base + raw_blocked_warp_bloom_filter_offset,
-      bloom_upload.get(),
-      bloom_bytes,
-      "XDMA write while uploading TrafficGen blocked-warp Bloom filter");
 
   // write access meta data into MMIO registers
   const std::uint64_t max_cycle =
@@ -1586,10 +1559,9 @@ void trafficgen_t::tick() {
         accumulated_issued_accesses.push_back(issued_access_point);
       }
 
-      // Capture completed bundle IDs from this target exit. Some of these can
-      // be early completions for a currently-issued subset of a bundle whose
-      // later accesses are still pending in the bridge, so defer filtering
-      // until after depopulating issued accesses below.
+      // Capture completed bundle IDs from this target exit. The target bundle
+      // table represents issued requests, so forward completions immediately
+      // even if same-bundle accesses remain in the host-side pending queue.
       std::vector<std::uint64_t> target_completed_bundle_ids;
       const size_t completed_bundle_ids_to_send =
           std::min(static_cast<size_t>(completed_bundle_count),

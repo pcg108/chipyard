@@ -20,7 +20,7 @@ import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, Slave
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
-import firechip.bridgeinterfaces.{BlockedWarpBitmap, BlockedWarpBloomFilter, CompletedBundleIds, L2Access, TrafficGenAccessBatch}
+import firechip.bridgeinterfaces.{BlockedWarpBitmap, CompletedBundleIds, L2Access, TrafficGenAccessBatch}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -145,8 +145,6 @@ class TrafficGenPortPeripheralIO extends Bundle {
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())
   val blockedWarpQueryRespStored = Output(Bool())
-  val blockedWarpBloomQueryIdx = Output(Vec(BlockedWarpBloomFilter.lookupLanes, UInt(BlockedWarpBitmap.indexBits.W)))
-  val blockedWarpBloomQueryEn = Output(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
   val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
@@ -156,7 +154,6 @@ class TrafficGenPortPeripheralIO extends Bundle {
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
   val blockedWarpQueryReady = Input(Bool())
-  val blockedWarpBloomQueryResp = Input(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())

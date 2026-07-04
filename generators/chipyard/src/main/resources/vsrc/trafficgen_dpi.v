@@ -12,7 +12,8 @@
   input  logic [31:0] access_read_warp_id_``idx, \
   input  logic [63:0] access_read_bundle_id_``idx, \
   input  logic        access_read_wake_relevant_bundle_``idx, \
-  input  logic        access_read_is_write_``idx,
+  input  logic        access_read_is_write_``idx, \
+  input  logic        access_read_warp_blocked_``idx,
 
 `define TG_ACCESS_READ_ASSIGN(idx) \
   assign access_read_data_valid_batch[idx] = access_read_data_valid_``idx; \
@@ -28,7 +29,8 @@
   assign access_read_warp_id_batch[idx] = access_read_warp_id_``idx; \
   assign access_read_bundle_id_batch[idx] = access_read_bundle_id_``idx; \
   assign access_read_wake_relevant_bundle_batch[idx] = access_read_wake_relevant_bundle_``idx; \
-  assign access_read_is_write_batch[idx] = access_read_is_write_``idx;
+  assign access_read_is_write_batch[idx] = access_read_is_write_``idx; \
+  assign access_read_warp_blocked_batch[idx] = access_read_warp_blocked_``idx;
 
 module TrafficGenDPIBlackBox #(
   parameter int NGENERATORS = 1,
@@ -77,7 +79,7 @@ module TrafficGenDPIBlackBox #(
   output logic [63:0] access_read_cycle,
   output logic        access_read_batch_ready,
   output logic        blocked_warp_query_en,
-  output logic [18:0] blocked_warp_query_idx,
+  output logic [24:0] blocked_warp_query_idx,
   output logic        blocked_warp_query_resp_stored,
   output logic        issued_access_writeback_valid,
   output logic [63:0] issued_access_writeback_id,
@@ -93,10 +95,11 @@ module TrafficGenDPIBlackBox #(
   output logic [63:0] issued_access_writeback_bundle_id,
   output logic        issued_access_writeback_wake_relevant_bundle,
   output logic        issued_access_writeback_is_write,
+  output logic        issued_access_writeback_warp_blocked,
   output logic        completed_bundle_count_write_en,
-  output logic [12:0] completed_bundle_count_write_data,
+  output logic [15:0] completed_bundle_count_write_data,
   output logic        completed_bundle_id_write_en,
-  output logic [11:0] completed_bundle_id_write_idx,
+  output logic [14:0] completed_bundle_id_write_idx,
   output logic [63:0] completed_bundle_id_write_data,
   output logic        debug_completion_event_valid,
   output logic        debug_completion_event_wake_exit,
@@ -141,6 +144,7 @@ module TrafficGenDPIBlackBox #(
   logic [63:0] issued_access_writeback_bundle_id_dpi;
   logic        issued_access_writeback_wake_relevant_bundle_dpi;
   logic        issued_access_writeback_is_write_dpi;
+  logic        issued_access_writeback_warp_blocked_dpi;
   logic        completed_bundle_count_write_en_dpi;
   logic [31:0] completed_bundle_count_write_data_dpi;
   logic        completed_bundle_id_write_en_dpi;
@@ -171,6 +175,7 @@ module TrafficGenDPIBlackBox #(
   longint unsigned access_read_bundle_id_batch [ACCESS_READ_BATCH_LANES];
   bit              access_read_wake_relevant_bundle_batch [ACCESS_READ_BATCH_LANES];
   bit              access_read_is_write_batch [ACCESS_READ_BATCH_LANES];
+  bit              access_read_warp_blocked_batch [ACCESS_READ_BATCH_LANES];
 
   `TG_ACCESS_READ_ASSIGN(0)
   `TG_ACCESS_READ_ASSIGN(1)
@@ -215,6 +220,7 @@ module TrafficGenDPIBlackBox #(
     input  longint unsigned   access_read_bundle_id [ACCESS_READ_BATCH_LANES],
     input  bit                access_read_wake_relevant_bundle [ACCESS_READ_BATCH_LANES],
     input  bit                access_read_is_write [ACCESS_READ_BATCH_LANES],
+    input  bit                access_read_warp_blocked [ACCESS_READ_BATCH_LANES],
     input  bit                blocked_warp_query_resp_valid,
     input  bit                blocked_warp_query_resp,
     input  bit                blocked_warp_query_ready,
@@ -246,6 +252,7 @@ module TrafficGenDPIBlackBox #(
     output longint unsigned   issued_access_writeback_bundle_id,
     output bit                issued_access_writeback_wake_relevant_bundle,
     output bit                issued_access_writeback_is_write,
+    output bit                issued_access_writeback_warp_blocked,
     output bit                completed_bundle_count_write_en,
     output int unsigned       completed_bundle_count_write_data,
     output bit                completed_bundle_id_write_en,
@@ -290,6 +297,7 @@ module TrafficGenDPIBlackBox #(
       access_read_bundle_id_batch,
       access_read_wake_relevant_bundle_batch,
       access_read_is_write_batch,
+      access_read_warp_blocked_batch,
       blocked_warp_query_resp_valid,
       blocked_warp_query_resp,
       blocked_warp_query_ready,
@@ -321,6 +329,7 @@ module TrafficGenDPIBlackBox #(
       issued_access_writeback_bundle_id_dpi,
       issued_access_writeback_wake_relevant_bundle_dpi,
       issued_access_writeback_is_write_dpi,
+      issued_access_writeback_warp_blocked_dpi,
       completed_bundle_count_write_en_dpi,
       completed_bundle_count_write_data_dpi,
       completed_bundle_id_write_en_dpi,
@@ -349,7 +358,7 @@ module TrafficGenDPIBlackBox #(
     access_read_cycle <= access_read_cycle_dpi;
     access_read_batch_ready <= access_read_batch_ready_dpi;
     blocked_warp_query_en <= blocked_warp_query_en_dpi;
-    blocked_warp_query_idx <= blocked_warp_query_idx_dpi[18:0];
+    blocked_warp_query_idx <= blocked_warp_query_idx_dpi[24:0];
     blocked_warp_query_resp_stored <= blocked_warp_query_resp_stored_dpi;
     issued_access_writeback_valid <= issued_access_writeback_valid_dpi;
     issued_access_writeback_id <= issued_access_writeback_id_dpi;
@@ -365,10 +374,11 @@ module TrafficGenDPIBlackBox #(
     issued_access_writeback_bundle_id <= issued_access_writeback_bundle_id_dpi;
     issued_access_writeback_wake_relevant_bundle <= issued_access_writeback_wake_relevant_bundle_dpi;
     issued_access_writeback_is_write <= issued_access_writeback_is_write_dpi;
+    issued_access_writeback_warp_blocked <= issued_access_writeback_warp_blocked_dpi;
     completed_bundle_count_write_en <= completed_bundle_count_write_en_dpi;
-    completed_bundle_count_write_data <= completed_bundle_count_write_data_dpi[12:0];
+    completed_bundle_count_write_data <= completed_bundle_count_write_data_dpi[15:0];
     completed_bundle_id_write_en <= completed_bundle_id_write_en_dpi;
-    completed_bundle_id_write_idx <= completed_bundle_id_write_idx_dpi[11:0];
+    completed_bundle_id_write_idx <= completed_bundle_id_write_idx_dpi[14:0];
     completed_bundle_id_write_data <= completed_bundle_id_write_data_dpi;
     debug_completion_event_valid <= debug_completion_event_valid_dpi;
     debug_completion_event_wake_exit <= debug_completion_event_wake_exit_dpi;

@@ -114,11 +114,7 @@ public:
   // assuming we send in 8 64-bit words per beat
   static constexpr size_t BLOCKED_WARP_BITMAP_BEATS = BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
   static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
-  static constexpr size_t BLOCKED_WARP_BLOOM_BITS = 16 * 1024;
-  static constexpr size_t BLOCKED_WARP_BLOOM_HASH_BITS = 14;
-  static constexpr size_t BLOCKED_WARP_BLOOM_BEATS = BLOCKED_WARP_BLOOM_BITS / (STREAM_WIDTH_BYTES * 8);
-  static constexpr size_t BLOCKED_WARP_BLOOM_WORDS = BLOCKED_WARP_BLOOM_BITS / 64;
-  
+
   static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 32768;
   static constexpr size_t COMPLETED_BUNDLE_ID_BEATS =
       COMPLETED_BUNDLE_ID_COUNT / STREAM_WORDS_PER_BEAT;
@@ -134,11 +130,9 @@ public:
                uint64_t raw_issued_access_writeback_store_offset,
                uint64_t raw_blocked_warp_bitmap_offset,
                uint64_t raw_completed_bundle_ids_offset,
-               uint64_t raw_blocked_warp_bloom_filter_offset,
                uint64_t access_window_bytes,
                uint64_t blocked_window_bytes,
-               uint64_t completed_window_bytes,
-               uint64_t blocked_bloom_window_bytes);
+               uint64_t completed_window_bytes);
 
   ~trafficgen_t() override;
 
@@ -155,11 +149,9 @@ private:
   const uint64_t raw_issued_access_writeback_store_offset;
   const uint64_t raw_blocked_warp_bitmap_offset;
   const uint64_t raw_completed_bundle_ids_offset;
-  const uint64_t raw_blocked_warp_bloom_filter_offset;
   const uint64_t access_window_bytes;
   const uint64_t blocked_window_bytes;
   const uint64_t completed_window_bytes;
-  const uint64_t blocked_bloom_window_bytes;
   std::uint64_t min_issue_cycle = 0;
   double memory_issue_stretch_scale = 1.0;
   bool has_first_issue_cycle = false;
@@ -175,7 +167,6 @@ private:
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_l1_to_l2_by_id;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_elapsed_by_id;
   std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
-  std::array<uint64_t, BLOCKED_WARP_BLOOM_WORDS> blocked_warp_bloom_filter{};
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -192,7 +183,6 @@ private:
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
   std::vector<std::uint64_t> deferred_completed_bundle_ids;
   std::unordered_set<std::uint64_t> deferred_completed_bundle_id_set;
-  std::unordered_set<std::uint64_t> reported_completed_bundle_id_set;
 
   bool upload_written_to_bram = false;
   bool round_completion_pause_issued = false;
@@ -208,6 +198,8 @@ private:
   void send_reserved_subpartitions_snapshot(
       const L2SubpartitionReservationsByCycle &reservations) const;
   void receive_schedule_from_gpu_model();
+  void refresh_pending_access_blocked_annotations();
+  void refresh_upload_access_blocked_annotations();
   void build_next_l2_access_chunk();
   L2SubpartitionReservationsByCycle build_reserved_subpartitions_from_pending() const;
   void depopulate_processed_accesses(std::uint64_t current_cycle_after_issue);

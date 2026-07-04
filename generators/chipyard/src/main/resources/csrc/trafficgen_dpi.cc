@@ -19,6 +19,7 @@ using svBit = unsigned char;
 #include <tuple>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/archive/binary_iarchive.hpp>
@@ -714,10 +715,14 @@ public:
     mCurrentCycle = 0;
     mInflight.clear();
     mOutstandingBundles.clear();
+    mPendingAccessesByCycle.clear();
+    mPendingAccessIds.clear();
+    mPendingAccessCycles.clear();
     mLoadedAccesses.clear();
     mReservedSubpartitionsByCycle.clear();
     mBlockedWarpSet.clear();
     mIssuedQueue.clear();
+    mIssuedRequestIds.clear();
     mIssuedAccessPoints.clear();
     mCompletedBundleQueue.clear();
     mPendingBundleIdIdx = 0;
@@ -785,7 +790,8 @@ public:
     bool roundFinishedThisStep = false;
     mDebugCompletionEvent = DebugCompletionEvent{};
     *targetBusy = (mState != State::Idle) ? 1 : 0;
-    *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
+    *hasPendingWork = (!mInflight.empty() || !mPendingAccessesByCycle.empty() ||
+                       accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
     *roundStarted = 0;
     *roundComplete = 0;
     *roundExitReason = mRoundExitReason;
@@ -855,9 +861,8 @@ public:
         const bool skipAccessLoad =
             (loadToMaxResidentCycle && !accessStoreHasEntries) ||
             mAccessLoadCycle > mAccessLoadEndCycle;
-        mState = skipAccessLoad
-                     ? State::PrepareBlockedQueries
-                     : State::RequestAccess;
+        mState = skipAccessLoad ? State::PrepareBlockedQueries
+                                : State::RequestAccess;
         *roundStarted = 1;
       }
       *dpiState = stateCode(mState);
@@ -906,24 +911,33 @@ public:
         }
         mAccessReadRespConsumed = true;
         mLastConsumedAccessReadRespId = accessReadRespId;
-        if (mAccessLoadCycle >= mAccessLoadEndCycle ||
-            mAccessLoadCycle == std::numeric_limits<std::uint64_t>::max()) {
-          if (accessReadBucketDone) {
+        if (accessReadBucketDone) {
+          if (mAccessLoadCycle >= mAccessLoadEndCycle ||
+              mAccessLoadCycle == std::numeric_limits<std::uint64_t>::max()) {
             resetAccessReadResponseConsumption();
             mState = State::PrepareBlockedQueries;
+          } else {
+            ++mAccessLoadCycle;
+            resetAccessReadResponseConsumption();
+            mState = State::RequestAccess;
           }
-        } else if (accessReadBucketDone) {
-          ++mAccessLoadCycle;
-          resetAccessReadResponseConsumption();
-          mState = State::RequestAccess;
+        } else {
+          mState = State::WaitAccessReadyLow;
         }
       }
       break;
     }
+    case State::WaitAccessReadyLow:
+      if (!accessReadRespValid) {
+        resetAccessReadResponseConsumption();
+        mState = State::WaitAccess;
+      }
+      break;
     case State::PrepareBlockedQueries:
       buildBlockedWarpQueryList();
       mBlockedWarpQueryIdx = 0;
-      mState = mBlockedWarpQueryList.empty() ? State::RunRound : State::RequestBlockedQuery;
+      logBlockedWarpQueryResult();
+      mState = State::RunRound;
       break;
     case State::RequestBlockedQuery:
       *blockedWarpQueryIdx = blockedWarpIndex(mBlockedWarpQueryList[mBlockedWarpQueryIdx]);
@@ -1002,7 +1016,8 @@ public:
       *roundExitReason = mRoundExitReason;
     } else {
       *targetBusy = (mState != State::Idle) ? 1 : 0;
-      *hasPendingWork = (!mInflight.empty() || accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
+      *hasPendingWork = (!mInflight.empty() || !mPendingAccessesByCycle.empty() ||
+                         accessStoreCount != 0 || mState != State::Idle) ? 1 : 0;
       *currentCycleAfterIssue = mCurrentCycle;
       *roundExitReason = mRoundExitReason;
     }
@@ -1025,6 +1040,7 @@ private:
     RequestAccess,
     WaitAccessAccepted,
     WaitAccess,
+    WaitAccessReadyLow,
     PrepareBlockedQueries,
     RequestBlockedQuery,
     WaitBlockedQueryAccepted,
@@ -1044,20 +1060,22 @@ private:
       return 2;
     case State::WaitAccess:
       return 3;
-    case State::PrepareBlockedQueries:
+    case State::WaitAccessReadyLow:
       return 4;
-    case State::RequestBlockedQuery:
+    case State::PrepareBlockedQueries:
       return 5;
-    case State::WaitBlockedQueryAccepted:
+    case State::RequestBlockedQuery:
       return 6;
-    case State::WaitBlockedQuery:
+    case State::WaitBlockedQueryAccepted:
       return 7;
-    case State::AcknowledgeBlockedQuery:
+    case State::WaitBlockedQuery:
       return 8;
-    case State::RunRound:
+    case State::AcknowledgeBlockedQuery:
       return 9;
-    case State::DrainOutputs:
+    case State::RunRound:
       return 10;
+    case State::DrainOutputs:
+      return 11;
     }
     return 0;
   }
@@ -1070,13 +1088,18 @@ private:
   void buildBlockedWarpQueryList() {
     std::set<WarpKey> uniqueWarps;
     for (const auto &access : mLoadedAccesses) {
-      uniqueWarps.insert(access.warpKey());
+      if (access.warpBlocked) {
+        uniqueWarps.insert(access.warpKey());
+      }
     }
     for (const auto &[bundleId, bundleInfo] : mOutstandingBundles) {
       (void)bundleId;
-      uniqueWarps.insert(bundleInfo.warpKey);
+      if (bundleInfo.warpBlocked) {
+        uniqueWarps.insert(bundleInfo.warpKey);
+      }
     }
-    mBlockedWarpQueryList.assign(uniqueWarps.begin(), uniqueWarps.end());
+    mBlockedWarpSet = std::move(uniqueWarps);
+    mBlockedWarpQueryList.assign(mBlockedWarpSet.begin(), mBlockedWarpSet.end());
     logBlockedWarpQueryList();
   }
 
@@ -1160,8 +1183,7 @@ private:
       return;
     }
 
-    const bool currentWarpBlocked =
-        mBlockedWarpSet.find(bundleInfo.warpKey) != mBlockedWarpSet.end();
+    const bool currentWarpBlocked = bundleInfo.warpBlocked;
     mDebugCompletionEvent = DebugCompletionEvent{
         true,
         wakeExit,
@@ -1218,10 +1240,49 @@ private:
       dpiLog().flush();
     }
 
-    std::map<std::uint64_t, std::vector<Access>> pendingByCycle;
     for (const auto &access : mLoadedAccesses) {
-      pendingByCycle[access.cycleCount].push_back(access);
+      if (mIssuedRequestIds.find(access.id) != mIssuedRequestIds.end()) {
+        continue;
+      }
+      const auto [cycleIt, insertedCycle] =
+          mPendingAccessCycles.emplace(access.id, access.cycleCount);
+      if (insertedCycle) {
+        mPendingAccessIds.insert(access.id);
+        mPendingAccessesByCycle[access.cycleCount].push_back(access);
+        continue;
+      }
+
+      auto bucketIt = mPendingAccessesByCycle.find(cycleIt->second);
+      if (bucketIt == mPendingAccessesByCycle.end()) {
+        cycleIt->second = access.cycleCount;
+        mPendingAccessesByCycle[access.cycleCount].push_back(access);
+        continue;
+      }
+
+      auto accessIt =
+          std::find_if(bucketIt->second.begin(),
+                       bucketIt->second.end(),
+                       [&access](const Access &pendingAccess) {
+                         return pendingAccess.id == access.id;
+                       });
+      if (accessIt == bucketIt->second.end()) {
+        cycleIt->second = access.cycleCount;
+        mPendingAccessesByCycle[access.cycleCount].push_back(access);
+        continue;
+      }
+
+      if (cycleIt->second == access.cycleCount) {
+        *accessIt = access;
+      } else {
+        bucketIt->second.erase(accessIt);
+        if (bucketIt->second.empty()) {
+          mPendingAccessesByCycle.erase(bucketIt);
+        }
+        cycleIt->second = access.cycleCount;
+        mPendingAccessesByCycle[access.cycleCount].push_back(access);
+      }
     }
+    auto &pendingByCycle = mPendingAccessesByCycle;
 
     mIssuedQueue.clear();
     mIssuedAccessPoints.clear();
@@ -1265,11 +1326,10 @@ private:
               --bundleIt->second.remainingRequestCount;
             }
             if (bundleIt->second.remainingRequestCount == 0) {
-              mCompletedBundleQueue.push_back(bundleId);
-              const bool currentWarpBlocked =
-                  mBlockedWarpSet.find(bundleIt->second.warpKey) != mBlockedWarpSet.end();
+              const bool currentWarpBlocked = bundleIt->second.warpBlocked;
               const bool wakeExit =
                   bundleIt->second.wakeRelevant && currentWarpBlocked;
+              mCompletedBundleQueue.push_back(bundleId);
               recordDebugCompletionEvent(bundleId, bundleIt->second, wakeExit);
               if (wakeExit) {
                 completedBlockedWarpBundle = true;
@@ -1340,6 +1400,9 @@ private:
       const auto pendingIt = pendingByCycle.find(mCurrentCycle);
       if (pendingIt != pendingByCycle.end()) {
         for (const auto &access : pendingIt->second) {
+          if (mIssuedRequestIds.find(access.id) != mIssuedRequestIds.end()) {
+            continue;
+          }
           int accessTime = 0;
           if (!findAccessTime(access, accessTime)) {
             dpiLog() << "[Warning] No timing data found for access with UID "
@@ -1351,6 +1414,9 @@ private:
 
           Access issuedAccess = access;
           issuedAccess.cycleCount = mCurrentCycle;
+          mIssuedRequestIds.insert(access.id);
+          mPendingAccessIds.erase(access.id);
+          mPendingAccessCycles.erase(access.id);
           mIssuedQueue.push_back(issuedAccess);
           mIssuedAccessPoints.push_back(IssuedAccessPoint{
               access.id,
@@ -1373,7 +1439,8 @@ private:
           auto &bundleInfo = mOutstandingBundles[access.bundleId];
           ++bundleInfo.remainingRequestCount;
           bundleInfo.warpKey = access.warpKey();
-          bundleInfo.wakeRelevant = bundleInfo.wakeRelevant || access.wakeRelevantBundle;
+          bundleInfo.wakeRelevant = access.wakeRelevantBundle;
+          bundleInfo.warpBlocked = bundleInfo.warpBlocked || access.warpBlocked;
         }
         mReservedSubpartitionsByCycle.erase(mCurrentCycle);
         pendingByCycle.erase(pendingIt);
@@ -1399,6 +1466,9 @@ private:
   std::uint64_t mCurrentCycle = 0;
   std::map<std::uint64_t, PendingAccessInfo> mInflight;
   std::unordered_map<std::uint64_t, OutstandingBundleInfo> mOutstandingBundles;
+  std::map<std::uint64_t, std::vector<Access>> mPendingAccessesByCycle;
+  std::unordered_set<std::uint64_t> mPendingAccessIds;
+  std::unordered_map<std::uint64_t, std::uint64_t> mPendingAccessCycles;
 
   std::vector<Access> mLoadedAccesses;
   std::uint64_t mAccessLoadCycle = 0;
@@ -1410,6 +1480,7 @@ private:
   std::set<WarpKey> mBlockedWarpSet;
 
   std::vector<Access> mIssuedQueue;
+  std::unordered_set<std::uint64_t> mIssuedRequestIds;
   std::vector<IssuedAccessPoint> mIssuedAccessPoints;
   std::vector<std::uint64_t> mCompletedBundleQueue;
   bool mCompletedCountSent = false;
@@ -1458,6 +1529,7 @@ extern "C" void trafficgen_dpi_step(
     const unsigned long long *access_read_bundle_id,
     const svBit *access_read_wake_relevant_bundle,
     const svBit *access_read_is_write,
+    const svBit *access_read_warp_blocked,
     svBit blocked_warp_query_resp_valid,
     svBit blocked_warp_query_resp,
     svBit blocked_warp_query_ready,
@@ -1489,6 +1561,7 @@ extern "C" void trafficgen_dpi_step(
     unsigned long long *issued_access_writeback_bundle_id,
     svBit *issued_access_writeback_wake_relevant_bundle,
     svBit *issued_access_writeback_is_write,
+    svBit *issued_access_writeback_warp_blocked,
     svBit *completed_bundle_count_write_en,
     unsigned int *completed_bundle_count_write_data,
     svBit *completed_bundle_id_write_en,
@@ -1529,6 +1602,7 @@ extern "C" void trafficgen_dpi_step(
           dpiArrayValue<std::uint64_t>(access_read_bundle_id, i),
           dpiArrayBit(access_read_wake_relevant_bundle, i),
           dpiArrayBit(access_read_is_write, i),
+          dpiArrayBit(access_read_warp_blocked, i),
       });
     }
   }
@@ -1604,6 +1678,7 @@ extern "C" void trafficgen_dpi_step(
   *issued_access_writeback_wake_relevant_bundle =
       issuedAccess.wakeRelevantBundle ? 1 : 0;
   *issued_access_writeback_is_write = issuedAccess.isWrite ? 1 : 0;
+  *issued_access_writeback_warp_blocked = issuedAccess.warpBlocked ? 1 : 0;
   *completed_bundle_id_write_data = completedBundleIdWriteDataDpi;
   *debug_completion_event_bundle_id = debugCompletionEventBundleIdDpi;
   *debug_completion_event_cycle = debugCompletionEventCycleDpi;

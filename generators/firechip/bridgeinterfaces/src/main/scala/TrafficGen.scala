@@ -95,27 +95,6 @@ object BlockedWarpBitmap {
     )
 }
 
-object BlockedWarpBloomFilter {
-  val bits = 16 * 1024
-  val hashBits = log2Ceil(bits)
-  val hashes = 3
-  val lookupLanes = TrafficGenAccessBatch.lanes
-  val streamBeatBits = L2Access.streamWidthBits
-  val streamBeatCount = bits / streamBeatBits
-  val streamBeatIdxBits = log2Ceil(streamBeatCount)
-  val streamBeatOffsetBits = log2Ceil(streamBeatBits)
-
-  require(bits % streamBeatBits == 0, "Blocked warp Bloom filter must be stream-beat aligned")
-
-  def hashesForIndex(idx: UInt): Seq[UInt] = {
-    val idx32 = idx.pad(32)
-    val h0 = ((idx32 * "h9e3779b1".U(32.W)) ^ (idx32 >> 16))(hashBits - 1, 0)
-    val h1 = ((idx32 * "h85ebca6b".U(32.W)) ^ (idx32 >> 13))(hashBits - 1, 0)
-    val h2 = ((idx32 * "hc2b2ae35".U(32.W)) ^ (idx32 >> 15))(hashBits - 1, 0)
-    Seq(h0, h1, h2)
-  }
-}
-
 object CompletedBundleIds {
   val capacity = 32768
   val idsPerBeat = 8
@@ -155,8 +134,6 @@ class TrafficGenPortIO extends Bundle {
   val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
   val blockedWarpQueryEn = Output(Bool())
   val blockedWarpQueryRespStored = Output(Bool())
-  val blockedWarpBloomQueryIdx = Output(Vec(BlockedWarpBloomFilter.lookupLanes, UInt(BlockedWarpBitmap.indexBits.W)))
-  val blockedWarpBloomQueryEn = Output(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
   val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
@@ -166,7 +143,6 @@ class TrafficGenPortIO extends Bundle {
   val blockedWarpQueryResp = Input(Bool())
   val blockedWarpQueryRespValid = Input(Bool())
   val blockedWarpQueryReady = Input(Bool())
-  val blockedWarpBloomQueryResp = Input(Vec(BlockedWarpBloomFilter.lookupLanes, Bool()))
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
