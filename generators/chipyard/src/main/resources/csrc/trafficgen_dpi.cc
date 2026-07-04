@@ -1175,7 +1175,8 @@ private:
 
   void recordDebugCompletionEvent(std::uint64_t bundleId,
                                   const OutstandingBundleInfo &bundleInfo,
-                                  bool wakeExit) {
+                                  bool wakeExit,
+                                  bool currentWarpBlocked) {
     if (mDebugCompletionEvent.valid && !wakeExit) {
       return;
     }
@@ -1183,7 +1184,6 @@ private:
       return;
     }
 
-    const bool currentWarpBlocked = bundleInfo.warpBlocked;
     mDebugCompletionEvent = DebugCompletionEvent{
         true,
         wakeExit,
@@ -1326,11 +1326,16 @@ private:
               --bundleIt->second.remainingRequestCount;
             }
             if (bundleIt->second.remainingRequestCount == 0) {
-              const bool currentWarpBlocked = bundleIt->second.warpBlocked;
+              const bool currentWarpBlocked =
+                  mBlockedWarpSet.find(bundleIt->second.warpKey) !=
+                  mBlockedWarpSet.end();
               const bool wakeExit =
                   bundleIt->second.wakeRelevant && currentWarpBlocked;
               mCompletedBundleQueue.push_back(bundleId);
-              recordDebugCompletionEvent(bundleId, bundleIt->second, wakeExit);
+              recordDebugCompletionEvent(bundleId,
+                                         bundleIt->second,
+                                         wakeExit,
+                                         currentWarpBlocked);
               if (wakeExit) {
                 completedBlockedWarpBundle = true;
               }

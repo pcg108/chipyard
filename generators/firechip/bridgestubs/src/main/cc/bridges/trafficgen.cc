@@ -850,6 +850,7 @@ void trafficgen_t::init() {
   issued_access_writeback_read_issued = false;
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
+  outstanding_bundle_info_by_id.clear();
   deferred_completed_bundle_ids.clear();
   deferred_completed_bundle_id_set.clear();
   logical_round_number = 0;
@@ -1083,6 +1084,37 @@ bool trafficgen_t::has_pending_access_for_bundle(
     }
   }
   return false;
+}
+
+void trafficgen_t::record_issued_bundle_metadata(
+    const trafficgen_l2_access_t &access) {
+  auto &info = outstanding_bundle_info_by_id[access.m_bundle_id];
+  info.wake_relevant = access.m_wake_relevant_bundle;
+  info.sm_id = access.sm_id;
+  info.scheduler_id = access.scheduler_id;
+  info.warp_id = access.warp_id;
+}
+
+bool trafficgen_t::complete_bundle_is_current_wake(
+    std::uint64_t bundle_id) {
+  const auto bundle_it = outstanding_bundle_info_by_id.find(bundle_id);
+  if (bundle_it == outstanding_bundle_info_by_id.end()) {
+    std::cout << "[bridge driver] completed bundle without host metadata: bundle_id="
+              << bundle_id << std::endl;
+    return true;
+  }
+
+  const socket_warp_key_t warp_key{
+      bundle_it->second.sm_id,
+      static_cast<unsigned>(bundle_it->second.scheduler_id),
+      bundle_it->second.warp_id};
+  const bool current_warp_blocked =
+      current_round_blocked_warp_ids.find(warp_key) !=
+      current_round_blocked_warp_ids.end();
+  const bool wake_exit =
+      bundle_it->second.wake_relevant && current_warp_blocked;
+  outstanding_bundle_info_by_id.erase(bundle_it);
+  return wake_exit;
 }
 
 void trafficgen_t::record_completed_bundle_id(std::uint64_t bundle_id) {
@@ -1540,6 +1572,7 @@ void trafficgen_t::tick() {
       // decode issued accesses from this target exit and accumulate them until
       // the scheduling round really returns to the GPU model.
       for (const auto &access : issued_access_writeback_entries) {
+        record_issued_bundle_metadata(access);
         trafficgen_issued_access_point_t issued_access_point{};
         issued_access_point.request_uid = access.id;
         issued_access_point.address = access.address;
@@ -1588,7 +1621,11 @@ void trafficgen_t::tick() {
       } else {
         depopulate_issued_accesses(accumulated_issued_accesses);
       }
+      bool current_round_wake_exit = false;
       for (const auto bundle_id : target_completed_bundle_ids) {
+        current_round_wake_exit =
+            complete_bundle_is_current_wake(bundle_id) ||
+            current_round_wake_exit;
         record_completed_bundle_id(bundle_id);
       }
       flush_deferred_completed_bundle_ids();
@@ -1599,6 +1636,38 @@ void trafficgen_t::tick() {
                   << current_cycle_after_issue
                   << ", refilling accessStore from pending accesses="
                   << pending_access_cycle_by_id.size() << std::endl;
+        build_next_l2_access_chunk();
+        upload_written_to_bram = false;
+        write(mmio_addrs.min_issue_cycle_low, static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+        write(mmio_addrs.min_issue_cycle_high, static_cast<uint32_t>(min_issue_cycle >> 32));
+        issued_access_writeback_entries.clear();
+        issued_access_writeback_stream_bytes.clear();
+        issued_access_writeback_count = 0;
+        issued_access_writeback_bytes_received = 0;
+        issued_access_writeback_read_issued = false;
+        completed_bundle_stream_bytes.fill(0);
+        completed_bundle_bytes_received = 0;
+        completed_bundle_read_issued = false;
+        state = trafficgen_state_t::UPLOAD_SCHEDULE;
+        break;
+      }
+
+      const bool target_has_pending_work =
+          (read(mmio_addrs.has_pending_work) != 0) ||
+          !pending_accesses_by_cycle.empty() ||
+          !outstanding_bundle_info_by_id.empty();
+      const bool reached_min_issue_cycle =
+          current_cycle_after_issue >= min_issue_cycle;
+      if (round_exit_reason != kRoundExitCapacity &&
+          !current_round_wake_exit &&
+          !reached_min_issue_cycle &&
+          target_has_pending_work) {
+        std::cout << "[bridge driver] continuing same scheduling round after "
+                  << "non-current wake exit at cycle="
+                  << current_cycle_after_issue
+                  << ", pending_accesses=" << pending_access_cycle_by_id.size()
+                  << ", outstanding_bundles="
+                  << outstanding_bundle_info_by_id.size() << std::endl;
         build_next_l2_access_chunk();
         upload_written_to_bram = false;
         write(mmio_addrs.min_issue_cycle_low, static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
@@ -1634,7 +1703,7 @@ void trafficgen_t::tick() {
       }
       message.trafficGenResult.completedBundleIds = accumulated_completed_bundle_ids;
       message.trafficGenResult.currentCycleAfterIssue = current_cycle_after_issue;
-      message.hasPendingWork = (read(mmio_addrs.has_pending_work) != 0) || !pending_accesses_by_cycle.empty();
+      message.hasPendingWork = target_has_pending_work;
       log_logical_round_for_compare(accumulated_issued_accesses,
                                     accumulated_completed_bundle_ids,
                                     current_cycle_after_issue);

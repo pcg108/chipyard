@@ -77,6 +77,13 @@ struct trafficgen_issued_access_point_t {
   bool is_write = false;
 };
 
+struct trafficgen_outstanding_bundle_info_t {
+  bool wake_relevant = false;
+  uint32_t sm_id = 0;
+  uint8_t scheduler_id = 0;
+  uint32_t warp_id = 0;
+};
+
 enum class trafficgen_state_t {
   IDLE,
   SEND_RESERVED_PARTITIONS,
@@ -181,6 +188,8 @@ private:
   bool issued_access_writeback_read_issued = false;
   std::vector<trafficgen_issued_access_point_t> accumulated_issued_accesses;
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
+  std::unordered_map<std::uint64_t, trafficgen_outstanding_bundle_info_t>
+      outstanding_bundle_info_by_id;
   std::vector<std::uint64_t> deferred_completed_bundle_ids;
   std::unordered_set<std::uint64_t> deferred_completed_bundle_id_set;
 
@@ -207,6 +216,8 @@ private:
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void depopulate_uploaded_l2_access_chunk();
   bool has_pending_access_for_bundle(std::uint64_t bundle_id) const;
+  void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);
+  bool complete_bundle_is_current_wake(std::uint64_t bundle_id);
   void record_completed_bundle_id(std::uint64_t bundle_id);
   void flush_deferred_completed_bundle_ids();
   void log_logical_round_for_compare(
