@@ -13,7 +13,7 @@ import freechips.rocketchip.tilelink._
 
 import chipyard.iobinders.TrafficGenPortPeripheralIO
 import testchipip.util.ClockedIO
-import firechip.bridgeinterfaces.{BlockedWarpBitmap, CompletedBundleIds, L2Access, TrafficGenAccessBatch, TrafficGenRoundExitReason}
+import firechip.bridgeinterfaces.{CompletedBundleIds, L2Access, TrafficGenAccessBatch, TrafficGenRoundExitReason}
 
 sealed trait TrafficGenBackend
 case object TrafficGenDPIBackend extends TrafficGenBackend
@@ -58,7 +58,7 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
 
   //// Host -> Target control/status
 
-  // L2 accesses and blocked warp bitmap have been written to the bridge module.
+  // L2 accesses have been written to the bridge module.
   val uploadReady = Input(Bool())
   // furthest the TG is allowed to issue
   val minIssueCycle = Input(UInt(64.W))
@@ -76,11 +76,6 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   val accessReadCycle = Output(UInt(64.W))
   val accessReadEn = Output(Bool())
   val accessReadBatchReady = Output(Bool())
-
-  // query the blocked warp bitmap for whether a warp is blocked
-  val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
-  val blockedWarpQueryEn = Output(Bool())
-  val blockedWarpQueryRespStored = Output(Bool())
 
   // write completed bundle IDs and counts to the bridge module as accesses return, to be used by future scheduling
   val completedBundleIdWriteEn = Output(Bool())
@@ -104,11 +99,6 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
-
-  // response to blocked warp bitmap query
-  val blockedWarpQueryResp = Input(Bool())
-  val blockedWarpQueryRespValid = Input(Bool())
-  val blockedWarpQueryReady = Input(Bool())
 
   val memActive = Input(Bool())
   val memInflightAccesses = Input(Vec(nGenerators, UInt(log2Ceil(memOutstanding + 1).W)))
@@ -155,10 +145,6 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val access_read_is_write = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
     val access_read_warp_blocked = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
 
-    val blocked_warp_query_resp_valid = Input(Bool())
-    val blocked_warp_query_resp = Input(Bool())
-    val blocked_warp_query_ready = Input(Bool())
-
     val issued_access_writeback_ready = Input(Bool())
 
     val target_busy = Output(Bool())
@@ -172,10 +158,6 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
     val access_read_en = Output(Bool())
     val access_read_cycle = Output(UInt(64.W))
     val access_read_batch_ready = Output(Bool())
-    val blocked_warp_query_en = Output(Bool())
-    val blocked_warp_query_idx = Output(UInt(BlockedWarpBitmap.indexBits.W))
-    val blocked_warp_query_resp_stored = Output(Bool())
-
     val issued_access_writeback_valid = Output(Bool())
     val issued_access_writeback_id = Output(UInt(64.W))
     val issued_access_writeback_address = Output(UInt(64.W))
@@ -258,10 +240,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     dpi.io.access_read_warp_blocked(i) := io.accessReadData(i).mWarpBlocked
   }
 
-  dpi.io.blocked_warp_query_resp_valid := io.blockedWarpQueryRespValid
-  dpi.io.blocked_warp_query_resp := io.blockedWarpQueryResp
-  dpi.io.blocked_warp_query_ready := io.blockedWarpQueryReady
-
   val issuedAccessWritebackLanes = Wire(Vec(params.numGenerators, Decoupled(new L2Access)))
 
   val issuedAccessWritebackQueues = Seq.fill(params.numGenerators) {
@@ -289,10 +267,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   io.accessReadCycle := dpi.io.access_read_cycle
   io.accessReadEn := dpi.io.access_read_en
   io.accessReadBatchReady := dpi.io.access_read_batch_ready
-  io.blockedWarpQueryIdx := dpi.io.blocked_warp_query_idx
-  io.blockedWarpQueryEn := dpi.io.blocked_warp_query_en
-  io.blockedWarpQueryRespStored := dpi.io.blocked_warp_query_resp_stored
-
   io.hasPendingWork := dpi.io.has_pending_work
   roundStarted := dpi.io.round_started
   currentCycleAfterIssue := dpi.io.current_cycle_after_issue
@@ -460,10 +434,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.accessReadCycle := 0.U
   io.accessReadEn := false.B
   io.accessReadBatchReady := false.B
-  io.blockedWarpQueryIdx := 0.U
-  io.blockedWarpQueryEn := false.B
-  io.blockedWarpQueryRespStored := false.B
-
   io.completedBundleIdWriteEn := completedBundleArb.io.out.valid
   io.completedBundleIdWriteIdx := 0.U
   io.completedBundleIdWriteData := completedBundleArb.io.out.bits
@@ -935,9 +905,6 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       engine.io.accessStoreCount := io.accessStoreCount
       engine.io.accessStoreMaxCycle := io.accessStoreMaxCycle
       engine.io.accessStoreHasEntries := io.accessStoreHasEntries
-      engine.io.blockedWarpQueryResp := io.blockedWarpQueryResp
-      engine.io.blockedWarpQueryRespValid := io.blockedWarpQueryRespValid
-      engine.io.blockedWarpQueryReady := io.blockedWarpQueryReady
       engine.io.memActive := io.memActive
       engine.io.memInflightAccesses := io.memInflightAccesses
       for (i <- 0 until params.numGenerators) {
@@ -964,9 +931,6 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.accessReadCycle := engine.io.accessReadCycle
       io.accessReadEn := engine.io.accessReadEn
       io.accessReadBatchReady := engine.io.accessReadBatchReady
-      io.blockedWarpQueryIdx := engine.io.blockedWarpQueryIdx
-      io.blockedWarpQueryEn := engine.io.blockedWarpQueryEn
-      io.blockedWarpQueryRespStored := engine.io.blockedWarpQueryRespStored
       trafficGenIdle := !engine.io.targetBusy
 
       for (i <- 0 until params.numGenerators) {
@@ -1183,18 +1147,12 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.accessReadCycle <> trafficGenTL.module.io.accessReadCycle
       outerIO.bits.accessReadEn <> trafficGenTL.module.io.accessReadEn
       outerIO.bits.accessReadBatchReady <> trafficGenTL.module.io.accessReadBatchReady
-      outerIO.bits.blockedWarpQueryIdx <> trafficGenTL.module.io.blockedWarpQueryIdx
-      outerIO.bits.blockedWarpQueryEn <> trafficGenTL.module.io.blockedWarpQueryEn
-      outerIO.bits.blockedWarpQueryRespStored <> trafficGenTL.module.io.blockedWarpQueryRespStored
       outerIO.bits.accessReadRespValid <> trafficGenTL.module.io.accessReadRespValid
       outerIO.bits.accessReadRespId <> trafficGenTL.module.io.accessReadRespId
       outerIO.bits.accessReadData <> trafficGenTL.module.io.accessReadData
       outerIO.bits.accessReadDataValid <> trafficGenTL.module.io.accessReadDataValid
       outerIO.bits.accessReadBucketDone <> trafficGenTL.module.io.accessReadBucketDone
       outerIO.bits.accessReadReady <> trafficGenTL.module.io.accessReadReady
-      outerIO.bits.blockedWarpQueryResp <> trafficGenTL.module.io.blockedWarpQueryResp
-      outerIO.bits.blockedWarpQueryRespValid <> trafficGenTL.module.io.blockedWarpQueryRespValid
-      outerIO.bits.blockedWarpQueryReady <> trafficGenTL.module.io.blockedWarpQueryReady
       outerIO.bits.accessStoreCount <> trafficGenTL.module.io.accessStoreCount
       outerIO.bits.accessStoreMaxCycle <> trafficGenTL.module.io.accessStoreMaxCycle
       outerIO.bits.accessStoreHasEntries <> trafficGenTL.module.io.accessStoreHasEntries

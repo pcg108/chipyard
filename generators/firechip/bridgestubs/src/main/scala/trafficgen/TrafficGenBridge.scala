@@ -49,12 +49,6 @@ object TrafficGenBridge {
     trafficGenIO.startRound := ep.io.trafficgen.startRound
     trafficGenIO.trafficGenDone := ep.io.trafficgen.trafficGenDone
     trafficGenIO.minIssueCycle := ep.io.trafficgen.minIssueCycle
-    ep.io.trafficgen.blockedWarpQueryIdx := trafficGenIO.blockedWarpQueryIdx
-    ep.io.trafficgen.blockedWarpQueryEn := trafficGenIO.blockedWarpQueryEn
-    ep.io.trafficgen.blockedWarpQueryRespStored := trafficGenIO.blockedWarpQueryRespStored
-    trafficGenIO.blockedWarpQueryResp := ep.io.trafficgen.blockedWarpQueryResp
-    trafficGenIO.blockedWarpQueryRespValid := ep.io.trafficgen.blockedWarpQueryRespValid
-    trafficGenIO.blockedWarpQueryReady := ep.io.trafficgen.blockedWarpQueryReady
     ep.io.trafficgen.accessReadCycle := trafficGenIO.accessReadCycle
     ep.io.trafficgen.accessReadEn := trafficGenIO.accessReadEn
     ep.io.trafficgen.accessReadBatchReady := trafficGenIO.accessReadBatchReady

@@ -64,9 +64,6 @@ module TrafficGenDPIBlackBox #(
   `TG_ACCESS_READ_PORTS(13)
   `TG_ACCESS_READ_PORTS(14)
   `TG_ACCESS_READ_PORTS(15)
-  input  logic        blocked_warp_query_resp_valid,
-  input  logic        blocked_warp_query_resp,
-  input  logic        blocked_warp_query_ready,
   input  logic        issued_access_writeback_ready,
   output logic        target_busy,
   output logic        has_pending_work,
@@ -78,9 +75,6 @@ module TrafficGenDPIBlackBox #(
   output logic        access_read_en,
   output logic [63:0] access_read_cycle,
   output logic        access_read_batch_ready,
-  output logic        blocked_warp_query_en,
-  output logic [24:0] blocked_warp_query_idx,
-  output logic        blocked_warp_query_resp_stored,
   output logic        issued_access_writeback_valid,
   output logic [63:0] issued_access_writeback_id,
   output logic [63:0] issued_access_writeback_address,
@@ -127,9 +121,6 @@ module TrafficGenDPIBlackBox #(
   logic        access_read_en_dpi;
   logic [63:0] access_read_cycle_dpi;
   logic        access_read_batch_ready_dpi;
-  logic        blocked_warp_query_en_dpi;
-  logic [31:0] blocked_warp_query_idx_dpi;
-  logic        blocked_warp_query_resp_stored_dpi;
   logic        issued_access_writeback_valid_dpi;
   logic [63:0] issued_access_writeback_id_dpi;
   logic [63:0] issued_access_writeback_address_dpi;
@@ -221,9 +212,6 @@ module TrafficGenDPIBlackBox #(
     input  bit                access_read_wake_relevant_bundle [ACCESS_READ_BATCH_LANES],
     input  bit                access_read_is_write [ACCESS_READ_BATCH_LANES],
     input  bit                access_read_warp_blocked [ACCESS_READ_BATCH_LANES],
-    input  bit                blocked_warp_query_resp_valid,
-    input  bit                blocked_warp_query_resp,
-    input  bit                blocked_warp_query_ready,
     input  bit                issued_access_writeback_ready,
     output bit                target_busy,
     output bit                has_pending_work,
@@ -235,9 +223,6 @@ module TrafficGenDPIBlackBox #(
     output bit                access_read_en,
     output longint unsigned   access_read_cycle,
     output bit                access_read_batch_ready,
-    output bit                blocked_warp_query_en,
-    output int unsigned       blocked_warp_query_idx,
-    output bit                blocked_warp_query_resp_stored,
     output bit                issued_access_writeback_valid,
     output longint unsigned   issued_access_writeback_id,
     output longint unsigned   issued_access_writeback_address,
@@ -298,9 +283,6 @@ module TrafficGenDPIBlackBox #(
       access_read_wake_relevant_bundle_batch,
       access_read_is_write_batch,
       access_read_warp_blocked_batch,
-      blocked_warp_query_resp_valid,
-      blocked_warp_query_resp,
-      blocked_warp_query_ready,
       issued_access_writeback_ready,
       target_busy_dpi,
       has_pending_work_dpi,
@@ -312,9 +294,6 @@ module TrafficGenDPIBlackBox #(
       access_read_en_dpi,
       access_read_cycle_dpi,
       access_read_batch_ready_dpi,
-      blocked_warp_query_en_dpi,
-      blocked_warp_query_idx_dpi,
-      blocked_warp_query_resp_stored_dpi,
       issued_access_writeback_valid_dpi,
       issued_access_writeback_id_dpi,
       issued_access_writeback_address_dpi,
@@ -357,9 +336,6 @@ module TrafficGenDPIBlackBox #(
     access_read_en <= access_read_en_dpi;
     access_read_cycle <= access_read_cycle_dpi;
     access_read_batch_ready <= access_read_batch_ready_dpi;
-    blocked_warp_query_en <= blocked_warp_query_en_dpi;
-    blocked_warp_query_idx <= blocked_warp_query_idx_dpi[24:0];
-    blocked_warp_query_resp_stored <= blocked_warp_query_resp_stored_dpi;
     issued_access_writeback_valid <= issued_access_writeback_valid_dpi;
     issued_access_writeback_id <= issued_access_writeback_id_dpi;
     issued_access_writeback_address <= issued_access_writeback_address_dpi;

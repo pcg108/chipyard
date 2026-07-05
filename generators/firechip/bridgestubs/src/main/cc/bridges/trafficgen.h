@@ -105,23 +105,6 @@ public:
 
   static constexpr size_t L2_ACCESS_STREAM_BYTES = STREAM_WIDTH_BYTES;
 
-  // Given that each warp is identified by (sm, scheduler, warp), encode the
-  // blocked warp set into a bitmap where each bit corresponds to a unique warp.
-  // Accel-Sim dynamic_warp IDs can be much larger than the resident warp count.
-  // 15 bits covers IDs 0-32767 for 4096 CTAs with 8 warps per CTA.
-  static constexpr size_t BLOCKED_WARP_SM_BITS = 8;
-  static constexpr size_t BLOCKED_WARP_SCHEDULER_BITS = 2;
-  static constexpr size_t BLOCKED_WARP_WARP_BITS = 15;
-  static constexpr size_t BLOCKED_WARP_INDEX_BITS =
-                                                BLOCKED_WARP_SM_BITS + 
-                                                BLOCKED_WARP_SCHEDULER_BITS +
-                                                BLOCKED_WARP_WARP_BITS;
-  // number of distinct warps we can represent in the bitmap
-  static constexpr size_t BLOCKED_WARP_BITMAP_BITS = 1 << BLOCKED_WARP_INDEX_BITS;
-  // assuming we send in 8 64-bit words per beat
-  static constexpr size_t BLOCKED_WARP_BITMAP_BEATS = BLOCKED_WARP_BITMAP_BITS / (STREAM_WIDTH_BYTES * 8);
-  static constexpr size_t BLOCKED_WARP_BITMAP_WORDS = BLOCKED_WARP_BITMAP_BITS / 64;
-
   static constexpr size_t COMPLETED_BUNDLE_ID_COUNT = 32768;
   static constexpr size_t COMPLETED_BUNDLE_ID_BEATS =
       COMPLETED_BUNDLE_ID_COUNT / STREAM_WORDS_PER_BEAT;
@@ -135,10 +118,8 @@ public:
                uint64_t bram_base,
                uint64_t raw_access_store_offset,
                uint64_t raw_issued_access_writeback_store_offset,
-               uint64_t raw_blocked_warp_bitmap_offset,
                uint64_t raw_completed_bundle_ids_offset,
                uint64_t access_window_bytes,
-               uint64_t blocked_window_bytes,
                uint64_t completed_window_bytes);
 
   ~trafficgen_t() override;
@@ -154,10 +135,8 @@ private:
   const uint64_t bram_base;
   const uint64_t raw_access_store_offset;
   const uint64_t raw_issued_access_writeback_store_offset;
-  const uint64_t raw_blocked_warp_bitmap_offset;
   const uint64_t raw_completed_bundle_ids_offset;
   const uint64_t access_window_bytes;
-  const uint64_t blocked_window_bytes;
   const uint64_t completed_window_bytes;
   std::uint64_t min_issue_cycle = 0;
   double memory_issue_stretch_scale = 1.0;
@@ -173,7 +152,6 @@ private:
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_l1_to_l2_by_id;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_elapsed_by_id;
-  std::array<uint64_t, BLOCKED_WARP_BITMAP_WORDS> blocked_warp_bitmap{};
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -211,15 +189,12 @@ private:
   void refresh_upload_access_blocked_annotations();
   void build_next_l2_access_chunk();
   L2SubpartitionReservationsByCycle build_reserved_subpartitions_from_pending() const;
-  void depopulate_processed_accesses(std::uint64_t current_cycle_after_issue);
   void depopulate_issued_accesses(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void depopulate_uploaded_l2_access_chunk();
-  bool has_pending_access_for_bundle(std::uint64_t bundle_id) const;
   void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);
   bool complete_bundle_is_current_wake(std::uint64_t bundle_id);
   void record_completed_bundle_id(std::uint64_t bundle_id);
-  void flush_deferred_completed_bundle_ids();
   void log_logical_round_for_compare(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
       const std::vector<std::uint64_t> &completed_bundle_ids,

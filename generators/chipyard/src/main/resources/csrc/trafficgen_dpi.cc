@@ -36,10 +36,8 @@ constexpr const char *kDefaultTraceFolder =
     "/home/prashanth/gpu_model/accel-sim-data-rodinia_nn";
 constexpr const char *kDefaultKernelName = "kernel_1__Z6euclidPcffPfiii";
 constexpr const char *kDpiLogPath = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0/dpi_log.txt";
-constexpr const char *kDefaultRoundLogDir = "rodinia_1_bridge";
+constexpr const char *kDefaultRoundLogDir = "trafficgen_dpi";
 constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0";
-constexpr std::uint32_t kBlockedWarpSchedulerBits = 2;
-constexpr std::uint32_t kBlockedWarpWarpBits = 15;
 constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
 constexpr std::uint32_t kRoundExitScheduling = 0;
 constexpr std::uint32_t kRoundExitCapacity = 1;
@@ -328,7 +326,8 @@ const RuntimeConfig &runtimeConfig() {
       kernelName = kDefaultKernelName;
     }
 
-    std::string roundLogDir = plusargValue(args, "trafficgen-round-log-dir");
+    std::string roundLogDir =
+        plusargValue(args, "trafficgen-dpi-round-log-dir");
     if (roundLogDir.empty()) {
       roundLogDir = kDefaultRoundLogDir;
     }
@@ -562,11 +561,6 @@ Access enrichAccessMetadata(Access access) {
   return access;
 }
 
-std::uint32_t blockedWarpIndex(const WarpKey &warpKey) {
-  return (warpKey.smId << (kBlockedWarpSchedulerBits + kBlockedWarpWarpBits)) |
-         (warpKey.schedulerId << kBlockedWarpWarpBits) | warpKey.warpId;
-}
-
 std::ofstream &dpiLog() {
   static const bool initialized = []() {
     std::error_code ec;
@@ -735,7 +729,6 @@ public:
     mAccessLoadEndCycle = 0;
     mAccessReadRespConsumed = false;
     mLastConsumedAccessReadRespId = 0;
-    mBlockedWarpQueryIdx = 0;
     mRoundNumber = 0;
     mDebugCompletionEvent = DebugCompletionEvent{};
   }
@@ -752,9 +745,6 @@ public:
       const std::vector<Access> &accessReadBatch,
       svBit accessReadBucketDone,
       svBit accessReadReady,
-      svBit blockedWarpQueryRespValid,
-      svBit blockedWarpQueryResp,
-      svBit blockedWarpQueryReady,
       svBit issuedAccessReady,
       svBit *targetBusy,
       svBit *hasPendingWork,
@@ -766,9 +756,6 @@ public:
       svBit *accessReadEn,
       std::uint64_t *accessReadCycle,
       svBit *accessReadBatchReady,
-      svBit *blockedWarpQueryEn,
-      std::uint32_t *blockedWarpQueryIdx,
-      svBit *blockedWarpQueryRespStored,
       svBit *issuedAccessValid,
       Access *issuedAccess,
       svBit *completedBundleCountWriteEn,
@@ -800,9 +787,6 @@ public:
     *accessReadEn = 0;
     *accessReadCycle = 0;
     *accessReadBatchReady = 0;
-    *blockedWarpQueryEn = 0;
-    *blockedWarpQueryIdx = 0;
-    *blockedWarpQueryRespStored = 0;
     *issuedAccessValid = 0;
     *issuedAccess = Access{};
     *completedBundleCountWriteEn = 0;
@@ -843,9 +827,7 @@ public:
             loadToMaxResidentCycle ? accessStoreMaxCycle
                                    : std::min(accessStoreMaxCycle, minIssueCycle);
         resetAccessReadResponseConsumption();
-        mBlockedWarpQueryIdx = 0;
         mBlockedWarpSet.clear();
-        mBlockedWarpQueryList.clear();
         mIssuedQueue.clear();
         mCompletedBundleQueue.clear();
         mPendingBundleIdIdx = 0;
@@ -934,36 +916,9 @@ public:
       }
       break;
     case State::PrepareBlockedQueries:
-      buildBlockedWarpQueryList();
-      mBlockedWarpQueryIdx = 0;
-      logBlockedWarpQueryResult();
+      buildBlockedWarpSet();
+      logBlockedWarpSet();
       mState = State::RunRound;
-      break;
-    case State::RequestBlockedQuery:
-      *blockedWarpQueryIdx = blockedWarpIndex(mBlockedWarpQueryList[mBlockedWarpQueryIdx]);
-      if (blockedWarpQueryReady) {
-        *blockedWarpQueryEn = 1;
-        mState = State::WaitBlockedQuery;
-      }
-      break;
-    case State::WaitBlockedQueryAccepted:
-      *blockedWarpQueryEn = 1;
-      *blockedWarpQueryIdx = blockedWarpIndex(mBlockedWarpQueryList[mBlockedWarpQueryIdx]);
-      if (!blockedWarpQueryReady) {
-        mState = State::WaitBlockedQuery;
-      }
-      break;
-    case State::WaitBlockedQuery:
-      if (blockedWarpQueryRespValid) {
-        if (blockedWarpQueryResp) {
-          mBlockedWarpSet.insert(mBlockedWarpQueryList[mBlockedWarpQueryIdx]);
-        }
-        mState = State::AcknowledgeBlockedQuery;
-      }
-      break;
-    case State::AcknowledgeBlockedQuery:
-      *blockedWarpQueryRespStored = 1;
-      advanceBlockedWarpQuery();
       break;
     case State::RunRound:
       runRound();
@@ -1042,10 +997,6 @@ private:
     WaitAccess,
     WaitAccessReadyLow,
     PrepareBlockedQueries,
-    RequestBlockedQuery,
-    WaitBlockedQueryAccepted,
-    WaitBlockedQuery,
-    AcknowledgeBlockedQuery,
     RunRound,
     DrainOutputs,
   };
@@ -1064,14 +1015,6 @@ private:
       return 4;
     case State::PrepareBlockedQueries:
       return 5;
-    case State::RequestBlockedQuery:
-      return 6;
-    case State::WaitBlockedQueryAccepted:
-      return 7;
-    case State::WaitBlockedQuery:
-      return 8;
-    case State::AcknowledgeBlockedQuery:
-      return 9;
     case State::RunRound:
       return 10;
     case State::DrainOutputs:
@@ -1085,7 +1028,7 @@ private:
     mLastConsumedAccessReadRespId = 0;
   }
 
-  void buildBlockedWarpQueryList() {
+  void buildBlockedWarpSet() {
     std::set<WarpKey> uniqueWarps;
     for (const auto &access : mLoadedAccesses) {
       if (access.warpBlocked) {
@@ -1099,61 +1042,25 @@ private:
       }
     }
     mBlockedWarpSet = std::move(uniqueWarps);
-    mBlockedWarpQueryList.assign(mBlockedWarpSet.begin(), mBlockedWarpSet.end());
-    logBlockedWarpQueryList();
   }
 
-  void advanceBlockedWarpQuery() {
-    ++mBlockedWarpQueryIdx;
-    if (mBlockedWarpQueryIdx >= mBlockedWarpQueryList.size()) {
-      logBlockedWarpQueryResult();
-      mState = State::RunRound;
-    } else {
-      mState = State::RequestBlockedQuery;
-    }
-  }
-
-  void logBlockedWarpQueryList() {
+  void logBlockedWarpSet() {
     auto &log = dpiLog();
     if (!log) {
       return;
     }
 
-    log << "\n=== Blocked warp query list ===\n"
+    log << "\n=== Blocked warp set ===\n"
         << "current_cycle=" << mCurrentCycle
         << " round_start_cycle=" << mRoundCurrentCycle
         << " loaded_accesses=" << mLoadedAccesses.size()
         << " outstanding_bundles=" << mOutstandingBundles.size()
-        << " unique_warps=" << mBlockedWarpQueryList.size() << "\n"
-        << "entry,blocked_warp_query_idx,sm_id,scheduler_id,warp_id\n";
-
-    for (std::size_t idx = 0; idx < mBlockedWarpQueryList.size(); ++idx) {
-      const auto &warp = mBlockedWarpQueryList[idx];
-      log << idx << ','
-          << blockedWarpIndex(warp) << ','
-          << warp.smId << ','
-          << static_cast<unsigned>(warp.schedulerId) << ','
-          << warp.warpId << '\n';
-    }
-    log.flush();
-  }
-
-  void logBlockedWarpQueryResult() {
-    auto &log = dpiLog();
-    if (!log) {
-      return;
-    }
-
-    log << "\n=== Blocked warp query result ===\n"
-        << "current_cycle=" << mCurrentCycle
-        << " queried_warps=" << mBlockedWarpQueryList.size()
         << " blocked_warps=" << mBlockedWarpSet.size() << "\n"
-        << "entry,blocked_warp_query_idx,sm_id,scheduler_id,warp_id\n";
+        << "entry,sm_id,scheduler_id,warp_id\n";
 
     std::size_t entry = 0;
     for (const auto &warp : mBlockedWarpSet) {
       log << entry << ','
-          << blockedWarpIndex(warp) << ','
           << warp.smId << ','
           << static_cast<unsigned>(warp.schedulerId) << ','
           << warp.warpId << '\n';
@@ -1480,8 +1387,6 @@ private:
   std::uint64_t mAccessLoadEndCycle = 0;
   bool mAccessReadRespConsumed = false;
   std::uint32_t mLastConsumedAccessReadRespId = 0;
-  std::vector<WarpKey> mBlockedWarpQueryList;
-  std::size_t mBlockedWarpQueryIdx = 0;
   std::set<WarpKey> mBlockedWarpSet;
 
   std::vector<Access> mIssuedQueue;
@@ -1535,9 +1440,6 @@ extern "C" void trafficgen_dpi_step(
     const svBit *access_read_wake_relevant_bundle,
     const svBit *access_read_is_write,
     const svBit *access_read_warp_blocked,
-    svBit blocked_warp_query_resp_valid,
-    svBit blocked_warp_query_resp,
-    svBit blocked_warp_query_ready,
     svBit issued_access_writeback_ready,
     svBit *target_busy,
     svBit *has_pending_work,
@@ -1549,9 +1451,6 @@ extern "C" void trafficgen_dpi_step(
     svBit *access_read_en,
     unsigned long long *access_read_cycle,
     svBit *access_read_batch_ready,
-    svBit *blocked_warp_query_en,
-    unsigned int *blocked_warp_query_idx,
-    svBit *blocked_warp_query_resp_stored,
     svBit *issued_access_writeback_valid,
     unsigned long long *issued_access_writeback_id,
     unsigned long long *issued_access_writeback_address,
@@ -1631,9 +1530,6 @@ extern "C" void trafficgen_dpi_step(
       accessReadBatch,
       access_read_bucket_done,
       access_read_ready,
-      blocked_warp_query_resp_valid,
-      blocked_warp_query_resp,
-      blocked_warp_query_ready,
       issued_access_writeback_ready,
       target_busy,
       has_pending_work,
@@ -1645,9 +1541,6 @@ extern "C" void trafficgen_dpi_step(
       access_read_en,
       &accessReadCycleDpi,
       access_read_batch_ready,
-      blocked_warp_query_en,
-      blocked_warp_query_idx,
-      blocked_warp_query_resp_stored,
       issued_access_writeback_valid,
       &issuedAccess,
       completed_bundle_count_write_en,

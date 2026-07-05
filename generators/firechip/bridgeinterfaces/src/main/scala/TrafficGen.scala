@@ -74,27 +74,6 @@ object TrafficGenAccessBatch {
   val lanes = 16
 }
 
-object BlockedWarpBitmap {
-  val smBits = 8
-  val schedulerBits = 2
-  val warpBits = 15
-  val indexBits = smBits + schedulerBits + warpBits
-  val totalBits = 1 << indexBits
-  val streamBeatBits = L2Access.streamWidthBits
-  val streamBeatCount = totalBits / streamBeatBits
-  val streamBeatIdxBits = log2Ceil(streamBeatCount)
-  val streamBeatOffsetBits = log2Ceil(streamBeatBits)
-
-  require(totalBits % streamBeatBits == 0, "Blocked warp bitmap must be stream-beat aligned")
-
-  def indexFromFields(smId: UInt, schedulerId: UInt, warpId: UInt): UInt =
-    Cat(
-      smId(smBits - 1, 0),
-      schedulerId(schedulerBits - 1, 0),
-      warpId(warpBits - 1, 0),
-    )
-}
-
 object CompletedBundleIds {
   val capacity = 32768
   val idsPerBeat = 8
@@ -131,18 +110,12 @@ class TrafficGenPortIO extends Bundle {
   val accessReadCycle = Output(UInt(64.W))
   val accessReadEn = Output(Bool())
   val accessReadBatchReady = Output(Bool())
-  val blockedWarpQueryIdx = Output(UInt(BlockedWarpBitmap.indexBits.W))
-  val blockedWarpQueryEn = Output(Bool())
-  val blockedWarpQueryRespStored = Output(Bool())
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
   val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
   val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
-  val blockedWarpQueryResp = Input(Bool())
-  val blockedWarpQueryRespValid = Input(Bool())
-  val blockedWarpQueryReady = Input(Bool())
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
