@@ -213,6 +213,24 @@ class FireSimRocketWithRTLTrafficGenConfig extends Config(
   new freechips.rocketchip.subsystem.WithExtMemSize((1L << 30) * 8) ++
   new FireSimRocketConfig)
 
+class WithGPGPUSimLikeInclusiveL2 extends Config(
+  new freechips.rocketchip.subsystem.WithNMemoryChannels(8) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(
+    nWays = 16,
+    capacityKB = 4096,
+    writeBytes = 32) ++
+  new freechips.rocketchip.subsystem.WithNBanks(16) ++
+  new freechips.rocketchip.subsystem.WithCacheBlockBytes(128) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new chipyard.config.WithSystemBusWidth(256) ++
+  new freechips.rocketchip.subsystem.WithNBitMemoryBus(256))
+
+class FireSimRocketWithRTLTrafficGenL2Config extends Config(
+  new chipyard.example.WithTrafficGenMemL2 ++
+  new WithGPGPUSimLikeInclusiveL2 ++
+  new FireSimRocketWithRTLTrafficGenConfig)
+
 class FireSimRocket1GiBDRAMConfig extends Config(
   new freechips.rocketchip.subsystem.WithExtMemSize((1 << 30) * 1L) ++
   new FireSimRocketConfig)

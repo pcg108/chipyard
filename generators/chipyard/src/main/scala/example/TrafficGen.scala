@@ -19,6 +19,10 @@ sealed trait TrafficGenBackend
 case object TrafficGenDPIBackend extends TrafficGenBackend
 case object TrafficGenRTLBackend extends TrafficGenBackend
 
+sealed trait TrafficGenMemBackend
+case object TrafficGenUncachedMemBackend extends TrafficGenMemBackend
+case object TrafficGenL2MemBackend extends TrafficGenMemBackend
+
 case class TrafficGenParams(
   address: BigInt = 0x5000,
   width: Int = 32,
@@ -30,6 +34,7 @@ case class TrafficGenParams(
   memOutstanding: Int = 4,
   accessReadResponseDepth: Int = 1024,
   backend: TrafficGenBackend = TrafficGenDPIBackend,
+  memBackend: TrafficGenMemBackend = TrafficGenUncachedMemBackend,
   remapTraceAddresses: Boolean = false,
   remapBase: BigInt = 0x80000000L,
   remapSize: BigInt = 1L << 32
@@ -961,8 +966,26 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
   }
 }
 
-class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
+class TrafficGenMemIO(params: TrafficGenParams) extends Bundle {
+  val active = Output(Bool())
+  val inflightAccessCount = Output(UInt(log2Ceil(params.memOutstanding + 1).W))
+  val coreOffset = Input(UInt(32.W))
+  val req = Flipped(Decoupled(new L2Access))
+  val completion = Decoupled(new L2Access)
+}
+
+abstract class TrafficGenMemBase(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
     extends ClockSinkDomain(ClockSinkParameters())(p) {
+  val node: TLClientNode
+
+  override lazy val module: TrafficGenMemBaseModuleImp = new TrafficGenMemBaseModuleImp(this)
+  class TrafficGenMemBaseModuleImp(outer: TrafficGenMemBase) extends Impl {
+    val io = IO(new TrafficGenMemIO(params))
+  }
+}
+
+class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
+    extends TrafficGenMemBase(id, beatBytes, params)(p) {
   require(beatBytes <= 64 && 64 % beatBytes == 0,
     "TrafficGenMem assumes 64-byte accesses split into an integral number of TL beats")
   require(params.memOutstanding >= 1, "TrafficGenMem requires at least one outstanding access slot")
@@ -993,15 +1016,7 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
 
   override lazy val module = new TrafficGenMemModuleImp(this)
 
-  class TrafficGenMemModuleImp(outer: TrafficGenMem) extends Impl {
-    val io = IO(new Bundle {
-      val active = Output(Bool())
-      val inflightAccessCount = Output(UInt(log2Ceil(params.memOutstanding + 1).W))
-      val coreOffset = Input(UInt(32.W))
-      val req = Flipped(Decoupled(new L2Access))
-      val completion = Decoupled(new L2Access)
-    })
-
+  class TrafficGenMemModuleImp(outer: TrafficGenMem) extends TrafficGenMemBaseModuleImp(outer) {
     withClockAndReset(clock, reset) {
       val (mem, edge) = outer.node.out(0)
       dontTouch(io.coreOffset)
@@ -1103,6 +1118,311 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
   }
 }
 
+class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
+    extends TrafficGenMemBase(id, beatBytes, params)(p) {
+  private val blockBytes = p(CacheBlockBytes)
+  private val blockBeats = blockBytes / beatBytes
+  private val accessBytes = 64
+  private val accessBeats = accessBytes / beatBytes
+
+  require(blockBytes >= accessBytes && isPow2(blockBytes) && blockBytes % accessBytes == 0,
+    "TrafficGenMemL2 requires cache blocks that are a power-of-two multiple of 64 bytes")
+  require(beatBytes <= accessBytes && accessBytes % beatBytes == 0,
+    "TrafficGenMemL2 assumes 64-byte accesses split into an integral number of TL beats")
+  require(blockBytes % beatBytes == 0,
+    "TrafficGenMemL2 requires cache blocks split into an integral number of TL beats")
+  require(params.memOutstanding >= 1, "TrafficGenMemL2 requires at least one outstanding access slot")
+  if (params.remapTraceAddresses) {
+    require(params.remapSize == (1L << 32),
+      "TrafficGenMemL2 trace-address remapping currently assumes a 4 GiB window")
+    require(params.remapBase % accessBytes == 0,
+      "TrafficGenMemL2 trace-address remap base must be 64-byte aligned")
+  }
+
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(
+    clients = Seq(TLMasterParameters.v2(
+      name = s"trafficgenmeml2$id",
+      sourceId = IdRange(0, params.memOutstanding),
+      supports = TLSlaveToMasterTransferSizes(
+        probe = TransferSizes(blockBytes, blockBytes)
+      ),
+      emits = TLMasterToSlaveTransferSizes(
+        acquireB = TransferSizes(blockBytes, blockBytes),
+        acquireT = TransferSizes(blockBytes, blockBytes)
+      )
+    ))
+  )))
+
+  override lazy val module = new TrafficGenMemL2ModuleImp(this)
+
+  class TrafficGenMemL2ModuleImp(outer: TrafficGenMemL2) extends TrafficGenMemBaseModuleImp(outer) {
+    withClockAndReset(clock, reset) {
+      val (mem, edge) = outer.node.out(0)
+      dontTouch(io.coreOffset)
+
+      val issueQueue = Module(new Queue(new L2Access, params.memOutstanding))
+      val completionQueue = Module(new Queue(new L2Access, params.memOutstanding))
+      val sourceIdxWidth = log2Ceil(params.memOutstanding max 2)
+      val beatIdxWidth = log2Ceil(blockBeats max 2)
+      val beatBits = beatBytes * 8
+      val blockOffsetBits = log2Ceil(blockBytes)
+      val beatOffsetBits = log2Ceil(beatBytes)
+      val blockSize = log2Ceil(blockBytes).U
+
+      val sInvalid :: sAcquire :: sWaitGrant :: sReleaseClean :: sReleaseDirty :: sWaitReleaseAck :: Nil = Enum(6)
+      val sourceStates = RegInit(VecInit(Seq.fill(params.memOutstanding)(sInvalid)))
+      val inflightValid = RegInit(VecInit(Seq.fill(params.memOutstanding)(false.B)))
+      val inflightAccesses = Reg(Vec(params.memOutstanding, new L2Access))
+      val inflightLineAddrs = Reg(Vec(params.memOutstanding, UInt(64.W)))
+      val inflightAccessBeatBases = Reg(Vec(params.memOutstanding, UInt(beatIdxWidth.W)))
+      val lineData = Reg(Vec(params.memOutstanding, Vec(blockBeats, UInt(beatBits.W))))
+
+      val senderValid = RegInit(false.B)
+      val senderAccess = Reg(new L2Access)
+      val senderSource = Reg(UInt(sourceIdxWidth.W))
+      val senderLineAddr = Reg(UInt(64.W))
+
+      def selectedAddress(access: L2Access): UInt = {
+        val rawAddr = access.address + io.coreOffset
+        val remappedAddr = params.remapBase.U(64.W) + access.address(31, 0)
+        Mux(params.remapTraceAddresses.B, remappedAddr, rawAddr)
+      }
+
+      def patternFromSeed(seed: UInt): UInt = {
+        if (beatBits <= 64) {
+          seed(beatBits - 1, 0)
+        } else {
+          Cat(Seq.tabulate((beatBits + 63) / 64) { i =>
+            seed ^ i.U(64.W)
+          }.reverse)(beatBits - 1, 0)
+        }
+      }
+
+      def writePatternForLineBeat(source: UInt, lineBeat: UInt): UInt = {
+        val relativeBeat = lineBeat - inflightAccessBeatBases(source)
+        val relativeBeat64 = Wire(UInt(64.W))
+        relativeBeat64 := relativeBeat
+        val seed = inflightAccesses(source).id ^
+          inflightAccesses(source).mBundleId ^
+          id.U(64.W) ^
+          relativeBeat64 ^
+          "h9e3779b97f4a7c15".U(64.W)
+        patternFromSeed(seed)
+      }
+
+      def lineBeatIsAccessBeat(source: UInt, lineBeat: UInt): Bool = {
+        val base = inflightAccessBeatBases(source)
+        lineBeat >= base && lineBeat < (base + accessBeats.U)
+      }
+
+      issueQueue.io.enq <> io.req
+
+      val freeSourceOH = VecInit(inflightValid.map(v => !v)).asUInt
+      val hasFreeSource = freeSourceOH.orR
+      val nextSource = PriorityEncoder(freeSourceOH)
+      val canStartRequest = !senderValid && hasFreeSource
+      issueQueue.io.deq.ready := canStartRequest
+
+      when(issueQueue.io.deq.fire) {
+        val allocatedSource = nextSource(sourceIdxWidth - 1, 0)
+        val accessAddr = selectedAddress(issueQueue.io.deq.bits)
+        val lineAddr = Cat(accessAddr(63, blockOffsetBits), 0.U(blockOffsetBits.W))
+        val accessBeatBase =
+          if (blockBeats == 1) 0.U(beatIdxWidth.W) else accessAddr(blockOffsetBits - 1, beatOffsetBits)
+        assert(hasFreeSource, "TrafficGenMemL2 allocated a request with no free source slots")
+        senderValid := true.B
+        senderAccess := issueQueue.io.deq.bits
+        senderSource := allocatedSource
+        senderLineAddr := lineAddr
+        inflightValid(allocatedSource) := true.B
+        sourceStates(allocatedSource) := sAcquire
+        inflightAccesses(allocatedSource) := issueQueue.io.deq.bits
+        inflightLineAddrs(allocatedSource) := lineAddr
+        inflightAccessBeatBases(allocatedSource) := accessBeatBase
+      }
+
+      val activeAccess = senderAccess
+      val (acquireBLegal, acquireBBits) =
+        edge.AcquireBlock(senderSource, senderLineAddr, blockSize, TLPermissions.NtoB)
+      val (acquireTLegal, acquireTBits) =
+        edge.AcquireBlock(senderSource, senderLineAddr, blockSize, TLPermissions.NtoT)
+
+      mem.a.valid := senderValid
+      mem.a.bits := Mux(activeAccess.mIsWrite, acquireTBits, acquireBBits)
+      val (_, aLast, _, _) = edge.count(mem.a)
+
+      when(mem.a.fire) {
+        assert(Mux(activeAccess.mIsWrite, acquireTLegal, acquireBLegal),
+          "TrafficGenMemL2 issued illegal TL-C AcquireBlock")
+      }
+      when(mem.a.fire && aLast) {
+        senderValid := false.B
+        sourceStates(senderSource) := sWaitGrant
+      }
+
+      val (dFirst, dLast, _, dBeat) = edge.count(mem.d)
+      val dSourceInRange = mem.d.bits.source < params.memOutstanding.U
+      val dSource = mem.d.bits.source(sourceIdxWidth - 1, 0)
+      val dSourceValid = dSourceInRange && inflightValid(dSource)
+      val dIsGrant = mem.d.bits.opcode === TLMessages.Grant || mem.d.bits.opcode === TLMessages.GrantData
+      val dIsReleaseAck = mem.d.bits.opcode === TLMessages.ReleaseAck
+      val dHasData = edge.hasData(mem.d.bits)
+      val dGrantReadyNoE = dSourceValid && sourceStates(dSource) === sWaitGrant
+      val dReleaseAckReady = dSourceValid &&
+        sourceStates(dSource) === sWaitReleaseAck &&
+        completionQueue.io.enq.ready
+
+      mem.e.valid := mem.d.valid && dIsGrant && dFirst && dGrantReadyNoE
+      mem.e.bits := edge.GrantAck(mem.d.bits)
+      mem.d.ready := Mux(dIsGrant,
+        dGrantReadyNoE && (!dFirst || mem.e.ready),
+        dIsReleaseAck && dReleaseAckReady)
+
+      when(mem.d.fire && dIsGrant) {
+        assert(!mem.d.bits.denied, "TrafficGenMemL2 received a denied Grant")
+        assert(dSourceValid, "TrafficGenMemL2 received a Grant for an invalid source slot")
+        when(dHasData) {
+          lineData(dSource)(dBeat(beatIdxWidth - 1, 0)) := mem.d.bits.data
+        }
+        when(dLast) {
+          when(inflightAccesses(dSource).mIsWrite) {
+            for (i <- 0 until blockBeats) {
+              val beat = i.U(beatIdxWidth.W)
+              when(lineBeatIsAccessBeat(dSource, beat)) {
+                lineData(dSource)(i) := writePatternForLineBeat(dSource, beat)
+              }
+            }
+            sourceStates(dSource) := sReleaseDirty
+          }.otherwise {
+            sourceStates(dSource) := sReleaseClean
+          }
+        }
+      }
+
+      val releaseSourceOH = VecInit(sourceStates.map(s => s === sReleaseClean || s === sReleaseDirty)).asUInt
+      val hasRelease = releaseSourceOH.orR
+      val releaseSource = PriorityEncoder(releaseSourceOH)(sourceIdxWidth - 1, 0)
+      val releaseDirty = hasRelease && sourceStates(releaseSource) === sReleaseDirty
+
+      val probeValid = RegInit(false.B)
+      val probeBits = Reg(new TLBundleB(edge.bundle))
+      mem.b.ready := !probeValid
+      when(mem.b.fire) {
+        probeValid := true.B
+        probeBits := mem.b.bits
+      }
+
+      val probeAddressBits = probeBits.address.getWidth
+      val probeLineAddr = Cat(
+        0.U((64 - probeAddressBits).W),
+        probeBits.address(probeAddressBits - 1, blockOffsetBits),
+        0.U(blockOffsetBits.W))
+      val probeSourceOH = VecInit((0 until params.memOutstanding).map { i =>
+        inflightValid(i) &&
+        (sourceStates(i) === sReleaseClean || sourceStates(i) === sReleaseDirty) &&
+        inflightLineAddrs(i) === probeLineAddr
+      }).asUInt
+      val probeSource = PriorityEncoder(probeSourceOH)(sourceIdxWidth - 1, 0)
+      val probeOwned = probeValid && probeSourceOH.orR
+      val probeDirty = probeOwned && sourceStates(probeSource) === sReleaseDirty
+      val probeParam = Mux(probeOwned,
+        Mux(probeDirty, TLPermissions.TtoN, TLPermissions.BtoN),
+        TLPermissions.NtoN)
+
+      val cActive = RegInit(false.B)
+      val cActiveIsProbe = Reg(Bool())
+      val cActiveSource = Reg(UInt(sourceIdxWidth.W))
+      val cActiveReleaseDirty = Reg(Bool())
+      val cActiveProbeOwned = Reg(Bool())
+      val cActiveProbeDirty = Reg(Bool())
+      val cActiveProbeBits = Reg(new TLBundleB(edge.bundle))
+
+      when(!cActive) {
+        when(probeValid) {
+          cActive := true.B
+          cActiveIsProbe := true.B
+          cActiveSource := probeSource
+          cActiveReleaseDirty := false.B
+          cActiveProbeOwned := probeOwned
+          cActiveProbeDirty := probeDirty
+          cActiveProbeBits := probeBits
+        }.elsewhen(hasRelease) {
+          cActive := true.B
+          cActiveIsProbe := false.B
+          cActiveSource := releaseSource
+          cActiveReleaseDirty := releaseDirty
+          cActiveProbeOwned := false.B
+          cActiveProbeDirty := false.B
+          cActiveProbeBits := DontCare
+        }
+      }
+
+      val cBeatWire = Wire(UInt(beatIdxWidth.W))
+      val probeData = lineData(cActiveSource)(cBeatWire)
+      val releaseData = lineData(cActiveSource)(cBeatWire)
+      val activeProbeParam = Mux(cActiveProbeOwned,
+        Mux(cActiveProbeDirty, TLPermissions.TtoN, TLPermissions.BtoN),
+        TLPermissions.NtoN)
+      val probeAck = edge.ProbeAck(cActiveProbeBits, activeProbeParam)
+      val probeAckData = edge.ProbeAck(cActiveProbeBits, activeProbeParam, probeData)
+      val (releaseCleanLegal, releaseCleanBits) =
+        edge.Release(cActiveSource, inflightLineAddrs(cActiveSource), blockSize, TLPermissions.BtoN)
+      val (releaseDirtyLegal, releaseDirtyBits) =
+        edge.Release(cActiveSource, inflightLineAddrs(cActiveSource), blockSize, TLPermissions.TtoN, releaseData)
+
+      mem.c.bits := Mux(cActiveIsProbe,
+        Mux(cActiveProbeDirty, probeAckData, probeAck),
+        Mux(cActiveReleaseDirty, releaseDirtyBits, releaseCleanBits))
+      val (_, cLast, cDone, cBeat) = edge.count(mem.c)
+      cBeatWire := cBeat(beatIdxWidth - 1, 0)
+      val cProbeCompletesAccess = cActiveIsProbe && cActiveProbeOwned
+      val dReleaseAckCompletesAccess = mem.d.valid && dIsReleaseAck && dReleaseAckReady
+      mem.c.valid := cActive &&
+        (!cProbeCompletesAccess || !cLast || (completionQueue.io.enq.ready && !dReleaseAckCompletesAccess))
+
+      when(mem.c.fire && !cActiveIsProbe) {
+        assert(Mux(cActiveReleaseDirty, releaseDirtyLegal, releaseCleanLegal),
+          "TrafficGenMemL2 issued illegal TL-C Release")
+      }
+
+      when(cDone) {
+        cActive := false.B
+        when(cActiveIsProbe) {
+          probeValid := false.B
+          when(cActiveProbeOwned) {
+            inflightValid(cActiveSource) := false.B
+            sourceStates(cActiveSource) := sInvalid
+          }
+        }.otherwise {
+          sourceStates(cActiveSource) := sWaitReleaseAck
+        }
+      }
+
+      val dCompletionFire = mem.d.fire && dIsReleaseAck && dSourceValid
+      val cProbeCompletionFire = cDone && cActiveIsProbe && cActiveProbeOwned
+      completionQueue.io.enq.valid := dCompletionFire || cProbeCompletionFire
+      completionQueue.io.enq.bits := Mux(dCompletionFire,
+        inflightAccesses(dSource),
+        inflightAccesses(cActiveSource))
+
+      when(dCompletionFire) {
+        inflightValid(dSource) := false.B
+        sourceStates(dSource) := sInvalid
+      }
+      when(mem.d.valid && dIsReleaseAck) {
+        assert(dSourceValid, "TrafficGenMemL2 received a ReleaseAck for an invalid source slot")
+      }
+
+      io.completion <> completionQueue.io.deq
+      io.active := senderValid ||
+        issueQueue.io.deq.valid ||
+        inflightValid.asUInt.orR ||
+        completionQueue.io.deq.valid
+      io.inflightAccessCount := PopCount(inflightValid)
+    }
+  }
+}
+
 trait CanHaveTrafficGen { this: BaseSubsystem =>
   private val portName = "TrafficGenTL"
   private val pbus = locateTLBusWrapper(PBUS)
@@ -1116,7 +1436,10 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
     }
 
     val generators = (0 until params.numGenerators).map { i =>
-      val trafficGenMem = LazyModule(new TrafficGenMem(i, sbus.beatBytes, params)(p))
+      val trafficGenMem = params.memBackend match {
+        case TrafficGenUncachedMemBackend => LazyModule(new TrafficGenMem(i, sbus.beatBytes, params)(p))
+        case TrafficGenL2MemBackend => LazyModule(new TrafficGenMemL2(i, sbus.beatBytes, params)(p))
+      }
       trafficGenMem.clockNode := sbus.fixedClockNode
       sbus.coupleFrom(s"trafficgen-mem-$i") { _ := trafficGenMem.node }
       trafficGenMem
@@ -1173,6 +1496,10 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
 
 class WithTrafficGen extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams())
+})
+
+class WithTrafficGenMemL2 extends Config((site, here, up) => {
+  case TrafficGenKey => up(TrafficGenKey, site).map(_.copy(memBackend = TrafficGenL2MemBackend))
 })
 
 class WithRTLTrafficGen extends Config((site, here, up) => {
