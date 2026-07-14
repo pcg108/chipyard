@@ -206,7 +206,8 @@ lazy val chipyard = {
     .settings(libraryDependencies ++= rocketLibDeps.value)
     .settings(
       libraryDependencies ++= Seq(
-        "org.reflections" % "reflections" % "0.10.2"
+        "org.reflections" % "reflections" % "0.10.2",
+        "edu.berkeley.cs" %% "chiseltest" % chiselTestVersion % Test
       )
     )
     .settings(commonSettings)

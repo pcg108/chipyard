@@ -366,11 +366,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val sDrainOutputs = rtlStates(6)
 
   val state = RegInit(sIdle)
-  val modelCycle = RegInit(0.U(64.W))
   val targetCycle = RegInit(0.U(64.W))
-  val roundStartModelCycle = RegInit(0.U(64.W))
   val roundLoadEndCycle = RegInit(0.U(64.W))
-  val roundHasFutureIssueWork = RegInit(false.B)
+  val roundHasIssuedQuery = RegInit(false.B)
+  val roundLastQueryCycle = RegInit(0.U(64.W))
   val roundCapacityBounded = RegInit(false.B)
   val wakeExitPending = RegInit(false.B)
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
@@ -453,11 +452,14 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     completedBundleCount := completedBundleCount + 1.U
   }
 
-  io.currentCycleAfterIssue := modelCycle
+  io.currentCycleAfterIssue := targetCycle
 
   val bundleTableHasOutstanding = bundleValid.asUInt.orR
   val outputQueuesHaveWork =
     issuedWritebackArb.io.out.valid || completedBundleArb.io.out.valid
+  val roundHasFutureIssueWork =
+    io.accessStoreHasEntries &&
+    (!roundHasIssuedQuery || io.accessStoreMaxCycle > roundLastQueryCycle)
   val livePendingWork =
     state =/= sIdle ||
     io.memActive ||
@@ -574,7 +576,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventSchedulerId(_)))
   debugRtlCompletionEventWarpId :=
     Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventWarpId(_)))
-  debugRtlCompletionEventCycle := modelCycle
+  debugRtlCompletionEventCycle := targetCycle
   dontTouch(debugRtlCompletionEventValid)
   dontTouch(debugRtlCompletionEventWakeExit)
   dontTouch(debugRtlCompletionEventBundleId)
@@ -603,7 +605,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     val batchIdx = batchIssueCursor + lane.U
     val issuedAccess = Wire(new L2Access)
     issuedAccess := batchAccessAt(batchIdx)
-    issuedAccess.cycleCount := modelCycle
+    // Record when this access is actually issued by the target.
+    issuedAccess.cycleCount := targetCycle
     currentIssueAccess(lane) := issuedAccess
     currentIssueValid(lane) := batchIdx < TrafficGenAccessBatch.lanes.U && batchValidAt(batchIdx)
   }
@@ -721,10 +724,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val nextBatchIssueCursor = batchIssueCursor + params.numGenerators.U
   val batchFinishedAfterCurrentChunk = nextBatchIssueCursor >= TrafficGenAccessBatch.lanes.U
   val maxUInt64 = Fill(64, true.B)
-  val canFetchBeforeWakeExit = modelCycle === roundStartModelCycle
-  val shouldFetchModelCycle =
+  val queryReachedLoadEnd = roundHasIssuedQuery && roundLastQueryCycle >= roundLoadEndCycle
+  val canFetchBeforeWakeExit = !roundHasIssuedQuery
+  val shouldFetchTargetCycle =
     io.accessStoreHasEntries &&
-    modelCycle <= roundLoadEndCycle &&
+    !queryReachedLoadEnd &&
     (!wakeExitPending || canFetchBeforeWakeExit)
   val outputQueuesEmpty =
     !issuedWritebackArb.io.out.valid &&
@@ -742,8 +746,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         Mux(io.accessStoreMaxCycle < io.minIssueCycle, io.accessStoreMaxCycle, io.minIssueCycle))
 
       roundLoadEndCycle := loadEndCycle
-      roundStartModelCycle := modelCycle
-      roundHasFutureIssueWork := io.accessStoreHasEntries && io.accessStoreMaxCycle > loadEndCycle
+      roundHasIssuedQuery := false.B
+      roundLastQueryCycle := targetCycle
       roundCapacityBounded := io.accessStoreHasEntries && io.accessStoreMaxCycle < io.minIssueCycle
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
@@ -769,7 +773,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         }
       }
     }.otherwise {
-      when(shouldFetchModelCycle) {
+      when(shouldFetchTargetCycle) {
         state := sRequestAccess
       }.elsewhen(wakeExitPending) {
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
@@ -783,13 +787,15 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       }
     }
   }.elsewhen(state === sRequestAccess) {
-    io.accessReadCycle := modelCycle
+    io.accessReadCycle := targetCycle
     when(io.accessReadReady) {
       io.accessReadEn := true.B
+      roundHasIssuedQuery := true.B
+      roundLastQueryCycle := targetCycle
       state := sWaitAccessAccepted
     }
   }.elsewhen(state === sWaitAccessAccepted) {
-    io.accessReadCycle := modelCycle
+    io.accessReadCycle := roundLastQueryCycle
     io.accessReadEn := true.B
     when(!io.accessReadReady) {
       state := sWaitAccess
@@ -821,9 +827,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       when(batchFinishedAfterCurrentChunk) {
         batchValid.foreach(_ := false.B)
         when(batchBucketDone) {
-          when(modelCycle <= roundLoadEndCycle) {
-            modelCycle := modelCycle + 1.U
-          }
           state := sDrainCompletions
         }.otherwise {
           state := sWaitAccess
@@ -845,9 +848,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       when(batchFinishedAfterCurrentChunk) {
         batchValid.foreach(_ := false.B)
         when(batchBucketDone) {
-          when(modelCycle <= roundLoadEndCycle) {
-            modelCycle := modelCycle + 1.U
-          }
           state := sDrainCompletions
         }.otherwise {
           state := sWaitAccess

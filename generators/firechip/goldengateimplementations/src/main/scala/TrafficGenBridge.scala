@@ -237,15 +237,15 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     /*
      * Respond to traffic-generator queries for accesses.
 
-     * For cycle N, target requests all accesses with cycleCount==N.
-     * Bridge walks accessStore with cursor and returns matching entries, followed by bucket done (cycle complete)
+     * For cycle N, target requests all not-yet-consumed accesses with cycleCount <= N.
+     * Bridge walks accessStore with cursor and returns eligible entries, followed by bucket done.
 
      */
 
-    // target requests one logical cycle bucket at a time. The bridge scans a
-    // flat accessStore sorted by cycleCount and returns each matching entry,
-    // followed by an explicit bucket-done. A one-entry peek buffer preserves
-    // the first future-cycle access for the next request.
+    // The bridge scans a flat accessStore sorted by cycleCount and returns
+    // every entry through the requested target cycle, followed by an explicit
+    // bucket-done. A one-entry peek buffer preserves the first future-cycle
+    // access for the next request.
 
     // expanded from 1 L2Access register and 1 valid bit, to 16 access lanes with batch valid bits, to support streaming parallel accesses to target
     // target sees:
@@ -357,10 +357,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
          !accessReadRespWaitForReadyLow) {
       // if there is a valid peek entry
       when(accessReadPeekValidReg) {
-        assert(accessReadPeekData.cycleCount >= accessReadReqCycleReg,
-          "TrafficGen flat accessStore returned stale/unsorted access")
-        // if it is for the requested cycle, put it in the next free lane
-        when(accessReadPeekData.cycleCount === accessReadReqCycleReg) {
+        // Overdue entries are valid: bridge/target handshake latency can move
+        // targetCycle beyond the cycle originally assigned by the scheduler.
+        when(accessReadPeekData.cycleCount <= accessReadReqCycleReg) {
           accessReadDataRegs(accessReadBatchCount) := accessReadPeekData
           accessReadDataValidRegs(accessReadBatchCount) := true.B
           accessReadPeekValidReg := false.B
@@ -371,7 +370,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
             publishAccessReadResp()
           }
         }.otherwise {
-          // if it is for future cycle, do not consume and mark cycle bucket done
+          // If it is for a future cycle, do not consume it and finish this query.
           accessReadBucketDoneReg := true.B
           publishAccessReadResp()
         }

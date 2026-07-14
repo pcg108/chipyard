@@ -54,6 +54,18 @@ constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot
 constexpr const char *kSocketRoundLogRoot =
     "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0/bridge_socket_round_logs";
 
+struct TrafficGenInitializationMessage {
+  std::uint64_t currentCycle = 0;
+
+private:
+  friend class boost::serialization::access;
+
+  template <class Archive>
+  void serialize(Archive &ar, const unsigned int /*version*/) {
+    ar & currentCycle;
+  }
+};
+
 struct ReservationsMessage {
   L2SubpartitionReservationsByCycle reservedSubpartitionsByCycle;
 
@@ -866,6 +878,18 @@ void trafficgen_t::connect_gpu_model_socket() {
   gpu_model_socket_client->connect_loopback(kGpuModelSocketPort);
   std::cout << "[bridge driver] connected to gpu_model_socket at 127.0.0.1:"
             << static_cast<unsigned>(kGpuModelSocketPort) << std::endl;
+
+  const std::uint64_t current_target_cycle =
+      (static_cast<std::uint64_t>(
+           read(mmio_addrs.current_cycle_after_issue_high))
+       << 32) |
+      static_cast<std::uint64_t>(
+          read(mmio_addrs.current_cycle_after_issue_low));
+  TrafficGenInitializationMessage message;
+  message.currentCycle = current_target_cycle;
+  gpu_model_socket_client->send_frame(serialize_message(message));
+  std::cout << "[bridge driver] sent initial target cycle to gpu_model_socket: cycle="
+            << current_target_cycle << std::endl;
 }
 
 bool trafficgen_t::receive_main_loop_complete_from_gpu_model() const {
