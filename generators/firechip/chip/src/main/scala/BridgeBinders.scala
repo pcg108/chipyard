@@ -171,6 +171,19 @@ class WithDefaultFireSimBridges extends Config(
   new WithFireSimIOCellModels
 )
 
+// Shorthand to register all default bridges except TracerV.
+class WithDefaultFireSimBridgesWithoutTracerV extends Config(
+  new WithTSIBridgeAndHarnessRAMOverSerialTL ++
+  new WithDMIBridge ++
+  new WithNICBridge ++
+  new WithUARTBridge ++
+  new WithBlockDeviceBridge ++
+  new WithFASEDBridge ++
+  new WithFireSimMultiCycleRegfile ++
+  new WithFireSimFAME5 ++
+  new WithFireSimIOCellModels
+)
+
 // Shorthand to register all of the provided mmio-only bridges above
 class WithDefaultMMIOOnlyFireSimBridges extends Config(
   new WithTSIBridgeAndHarnessRAMOverSerialTL ++

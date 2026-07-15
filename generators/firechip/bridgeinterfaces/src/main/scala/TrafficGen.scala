@@ -74,6 +74,16 @@ object TrafficGenAccessBatch {
   val lanes = 16
 }
 
+class IssuedAccessBatch extends Bundle {
+  val batchId = UInt(32.W)
+  val validMask = UInt(TrafficGenAccessBatch.lanes.W)
+  // Keep all lanes in the existing 512-bit stream encoding, with lane 0 in
+  // the least-significant bits. Golden Gate's bridge extraction cannot lower
+  // aggregate fields nested inside Decoupled[IssuedAccessBatch], so the lane
+  // vector crosses HostPort as one ground UInt.
+  val accesses = UInt((TrafficGenAccessBatch.lanes * L2Access.streamWidthBits).W)
+}
+
 object CompletedBundleIds {
   val capacity = 32768
   val idsPerBeat = 8
@@ -98,7 +108,7 @@ class TrafficGenPortIO extends Bundle {
   val roundExitReason = Output(UInt(2.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val issuedAccessWriteback = Decoupled(new L2Access)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))

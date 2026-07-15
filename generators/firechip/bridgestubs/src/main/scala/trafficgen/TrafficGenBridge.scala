@@ -40,7 +40,7 @@ object TrafficGenBridge {
     ep.io.trafficgen.roundExitReason := trafficGenIO.roundExitReason
     ep.io.trafficgen.currentCycleAfterIssue := trafficGenIO.currentCycleAfterIssue
     ep.io.trafficgen.dpiState := trafficGenIO.dpiState
-    ep.io.trafficgen.issuedAccessWriteback <> trafficGenIO.issuedAccessWriteback
+    ep.io.trafficgen.issuedAccessBatch <> trafficGenIO.issuedAccessBatch
     ep.io.trafficgen.completedBundleIdWriteEn := trafficGenIO.completedBundleIdWriteEn
     ep.io.trafficgen.completedBundleIdWriteIdx := trafficGenIO.completedBundleIdWriteIdx
     ep.io.trafficgen.completedBundleIdWriteData := trafficGenIO.completedBundleIdWriteData

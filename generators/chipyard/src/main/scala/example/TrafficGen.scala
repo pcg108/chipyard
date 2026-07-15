@@ -13,7 +13,7 @@ import freechips.rocketchip.tilelink._
 
 import chipyard.iobinders.TrafficGenPortPeripheralIO
 import testchipip.util.ClockedIO
-import firechip.bridgeinterfaces.{CompletedBundleIds, L2Access, TrafficGenAccessBatch, TrafficGenRoundExitReason}
+import firechip.bridgeinterfaces.{CompletedBundleIds, IssuedAccessBatch, L2Access, TrafficGenAccessBatch, TrafficGenRoundExitReason}
 
 sealed trait TrafficGenBackend
 case object TrafficGenDPIBackend extends TrafficGenBackend
@@ -75,7 +75,7 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   //// Target -> Host execution data
 
   // TG issue logic will enqueue the actual issued L2 accesses here with cycleCount updated to the real issue cycle.
-  val issuedAccessWriteback = Decoupled(new L2Access)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
 
   // query the L2 access store for an L2 access
   val accessReadCycle = Output(UInt(64.W))
@@ -202,6 +202,38 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
   addResource("/vsrc/trafficgen_dpi.v")
 }
 
+/** Adapts the legacy DPI single-record writeback contract to the target-wide
+  * batch protocol without changing the SystemVerilog or C++ ABI.
+  */
+class LegacyIssuedAccessBatchAdapter extends Module {
+  val io = IO(new Bundle {
+    val legacy = Flipped(Decoupled(new L2Access))
+    val batch = Decoupled(new IssuedAccessBatch)
+  })
+
+  val queue = Module(new Queue(new IssuedAccessBatch, 2))
+  val nextBatchId = RegInit(0.U(32.W))
+  queue.io.enq.valid := io.legacy.valid
+  queue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch)
+  queue.io.enq.bits.batchId := nextBatchId
+  queue.io.enq.bits.validMask := 1.U
+  queue.io.enq.bits.accesses := L2Access.pack(io.legacy.bits)
+  io.legacy.ready := queue.io.enq.ready
+  io.batch <> queue.io.deq
+
+  when(queue.io.enq.fire) {
+    nextBatchId := nextBatchId + 1.U
+  }
+
+  val batchStalled = RegNext(io.batch.valid && !io.batch.ready, false.B)
+  val batchBitsPrev = RegNext(io.batch.bits.asUInt)
+  when(batchStalled) {
+    assert(io.batch.valid, "LegacyIssuedAccessBatchAdapter dropped a batch under backpressure")
+    assert(io.batch.bits.asUInt === batchBitsPrev,
+      "LegacyIssuedAccessBatchAdapter changed a batch under backpressure")
+  }
+}
+
 class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTrafficGenTopIO {
   require(params.numGenerators >= 1, "TrafficGenDPIEngine requires at least one generator")
 
@@ -245,25 +277,31 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     dpi.io.access_read_warp_blocked(i) := io.accessReadData(i).mWarpBlocked
   }
 
-  val issuedAccessWritebackLanes = Wire(Vec(params.numGenerators, Decoupled(new L2Access)))
+  // Preserve the legacy single-access DPI contract by adapting each record to
+  // a one-valid-lane issued batch. The external target/bridge interface remains
+  // uniformly batch based for both backends.
+  val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter)
+  val dpiIssuedAccess = Wire(new L2Access)
+  dpiIssuedAccess := 0.U.asTypeOf(new L2Access)
+  dpiIssuedAccess.id := dpi.io.issued_access_writeback_id
+  dpiIssuedAccess.address := dpi.io.issued_access_writeback_address
+  dpiIssuedAccess.cycleCount := dpi.io.issued_access_writeback_cycle_count
+  dpiIssuedAccess.mSubpartition := dpi.io.issued_access_writeback_subpartition
+  dpiIssuedAccess.mSetIndex := dpi.io.issued_access_writeback_set_index
+  dpiIssuedAccess.mTag := dpi.io.issued_access_writeback_tag
+  dpiIssuedAccess.mMask := dpi.io.issued_access_writeback_mask
+  dpiIssuedAccess.smId := dpi.io.issued_access_writeback_sm_id
+  dpiIssuedAccess.schedulerId := dpi.io.issued_access_writeback_scheduler_id
+  dpiIssuedAccess.warpId := dpi.io.issued_access_writeback_warp_id
+  dpiIssuedAccess.mBundleId := dpi.io.issued_access_writeback_bundle_id
+  dpiIssuedAccess.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
+  dpiIssuedAccess.mIsWrite := dpi.io.issued_access_writeback_is_write
+  dpiIssuedAccess.mWarpBlocked := dpi.io.issued_access_writeback_warp_blocked
 
-  val issuedAccessWritebackQueues = Seq.fill(params.numGenerators) {
-    Module(new Queue(new L2Access, 4))
-  }
-  val issuedAccessWritebackArb = Module(new RRArbiter(new L2Access, params.numGenerators))
-
-  for (i <- 0 until params.numGenerators) {
-    issuedAccessWritebackQueues(i).io.enq.valid := issuedAccessWritebackLanes(i).valid
-    issuedAccessWritebackQueues(i).io.enq.bits := issuedAccessWritebackLanes(i).bits
-    issuedAccessWritebackLanes(i).ready := issuedAccessWritebackQueues(i).io.enq.ready
-    issuedAccessWritebackArb.io.in(i) <> issuedAccessWritebackQueues(i).io.deq
-  }
-
-  io.issuedAccessWriteback.valid := issuedAccessWritebackArb.io.out.valid
-  io.issuedAccessWriteback.bits := issuedAccessWritebackArb.io.out.bits
-  issuedAccessWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
-
-  dpi.io.issued_access_writeback_ready := issuedAccessWritebackLanes(0).ready
+  issuedBatchAdapter.io.legacy.valid := dpi.io.issued_access_writeback_valid
+  issuedBatchAdapter.io.legacy.bits := dpiIssuedAccess
+  dpi.io.issued_access_writeback_ready := issuedBatchAdapter.io.legacy.ready
+  io.issuedAccessBatch <> issuedBatchAdapter.io.batch
 
   io.currentCycleAfterIssue := currentCycleAfterIssue
   io.roundStarted := roundStarted
@@ -278,8 +316,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   io.dpiState := dpi.io.dpi_state
 
   val issuedWritebackDraining =
-    issuedAccessWritebackArb.io.out.valid ||
-      issuedAccessWritebackQueues.map(_.io.count =/= 0.U).reduce(_ || _)
+    issuedBatchAdapter.io.batch.valid || dpi.io.issued_access_writeback_valid
   val roundCompletePending = RegInit(false.B)
   val roundCompleteReady = (roundCompletePending || dpi.io.round_complete) && !issuedWritebackDraining
   when(roundCompleteReady) {
@@ -331,21 +368,6 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     io.issue(i).valid := false.B
     io.issue(i).bits := 0.U.asTypeOf(new L2Access)
     io.completion(i).ready := true.B
-    issuedAccessWritebackLanes(i).valid := (if (i == 0) dpi.io.issued_access_writeback_valid else false.B)
-    issuedAccessWritebackLanes(i).bits.id := dpi.io.issued_access_writeback_id
-    issuedAccessWritebackLanes(i).bits.address := dpi.io.issued_access_writeback_address
-    issuedAccessWritebackLanes(i).bits.cycleCount := dpi.io.issued_access_writeback_cycle_count
-    issuedAccessWritebackLanes(i).bits.mSubpartition := dpi.io.issued_access_writeback_subpartition
-    issuedAccessWritebackLanes(i).bits.mSetIndex := dpi.io.issued_access_writeback_set_index
-    issuedAccessWritebackLanes(i).bits.mTag := dpi.io.issued_access_writeback_tag
-    issuedAccessWritebackLanes(i).bits.mMask := dpi.io.issued_access_writeback_mask
-    issuedAccessWritebackLanes(i).bits.smId := dpi.io.issued_access_writeback_sm_id
-    issuedAccessWritebackLanes(i).bits.schedulerId := dpi.io.issued_access_writeback_scheduler_id
-    issuedAccessWritebackLanes(i).bits.warpId := dpi.io.issued_access_writeback_warp_id
-    issuedAccessWritebackLanes(i).bits.mBundleId := dpi.io.issued_access_writeback_bundle_id
-    issuedAccessWritebackLanes(i).bits.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
-    issuedAccessWritebackLanes(i).bits.mIsWrite := dpi.io.issued_access_writeback_is_write
-    issuedAccessWritebackLanes(i).bits.mWarpBlocked := dpi.io.issued_access_writeback_warp_blocked
   }
 }
 
@@ -393,10 +415,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val bundleSchedulerIds = Reg(Vec(bundleTableEntries, UInt(8.W)))
   val bundleWarpIds = Reg(Vec(bundleTableEntries, UInt(32.W)))
 
-  val issuedWritebackQueues = Seq.fill(params.numGenerators) {
-    Module(new Queue(new L2Access, params.memOutstanding * 2 + TrafficGenAccessBatch.lanes))
-  }
-  val issuedWritebackArb = Module(new RRArbiter(new L2Access, params.numGenerators))
+  val issuedBatchQueue = Module(new Queue(new IssuedAccessBatch, 2))
+  val issuedBatchId = RegInit(0.U(32.W))
   val completedBundleQueues = Seq.fill(params.numGenerators) {
     Module(new Queue(UInt(64.W), params.memOutstanding * 2 + TrafficGenAccessBatch.lanes))
   }
@@ -423,17 +443,14 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.dpiState := state
 
   for (i <- 0 until params.numGenerators) {
-    issuedWritebackQueues(i).io.enq.valid := false.B
-    issuedWritebackQueues(i).io.enq.bits := 0.U.asTypeOf(new L2Access)
-    issuedWritebackArb.io.in(i) <> issuedWritebackQueues(i).io.deq
     completedBundleQueues(i).io.enq.valid := false.B
     completedBundleQueues(i).io.enq.bits := 0.U
     completedBundleArb.io.in(i) <> completedBundleQueues(i).io.deq
   }
 
-  io.issuedAccessWriteback.valid := issuedWritebackArb.io.out.valid
-  io.issuedAccessWriteback.bits := issuedWritebackArb.io.out.bits
-  issuedWritebackArb.io.out.ready := io.issuedAccessWriteback.ready
+  issuedBatchQueue.io.enq.valid := false.B
+  issuedBatchQueue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch)
+  io.issuedAccessBatch <> issuedBatchQueue.io.deq
 
   io.accessReadCycle := 0.U
   io.accessReadEn := false.B
@@ -456,7 +473,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   val bundleTableHasOutstanding = bundleValid.asUInt.orR
   val outputQueuesHaveWork =
-    issuedWritebackArb.io.out.valid || completedBundleArb.io.out.valid
+    issuedBatchQueue.io.deq.valid || completedBundleArb.io.out.valid
   val roundHasFutureIssueWork =
     io.accessStoreHasEntries &&
     (!roundHasIssuedQuery || io.accessStoreMaxCycle > roundLastQueryCycle)
@@ -633,24 +650,55 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val freeBundleEntries = PopCount(VecInit(bundleValid.map(v => !v)).asUInt)
   val neededNewBundleEntries = PopCount(issueFirstNewBundles)
   val issueReady = VecInit((0 until params.numGenerators).map { lane =>
-    !currentIssueValid(lane) || (io.issue(lane).ready && issuedWritebackQueues(lane).io.enq.ready)
+    !currentIssueValid(lane) || io.issue(lane).ready
   }).asUInt.andR
   val chunkHasValid = currentIssueValid.asUInt.orR
   val issueCanFire =
     state === sIssueBatch &&
     chunkHasValid &&
     issueReady &&
-    freeBundleEntries >= neededNewBundleEntries
+    freeBundleEntries >= neededNewBundleEntries &&
+    issuedBatchQueue.io.enq.ready
   drainCompletionsThisCycle := state === sDrainCompletions ||
     (state === sIssueBatch && !issueCanFire)
 
   val issueFires = Wire(Vec(params.numGenerators, Bool()))
+  val issuedBatchMask = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
+    if (lane < params.numGenerators) currentIssueValid(lane) else false.B
+  }).asUInt
+  issuedBatchQueue.io.enq.valid := issueCanFire
+  issuedBatchQueue.io.enq.bits.batchId := issuedBatchId
+  issuedBatchQueue.io.enq.bits.validMask := issuedBatchMask
+  val issuedBatchPackedAccesses = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
+    if (lane < params.numGenerators) L2Access.pack(currentIssueAccess(lane))
+    else 0.U(L2Access.streamWidthBits.W)
+  })
+  issuedBatchQueue.io.enq.bits.accesses := issuedBatchPackedAccesses.asUInt
+  when(issuedBatchQueue.io.enq.fire) {
+    assert(PopCount(issuedBatchMask) === PopCount(currentIssueValid),
+      "TrafficGenRTLEngine issued batch mask did not match the issued lanes")
+    issuedBatchId := issuedBatchId + 1.U
+  }
   for (lane <- 0 until params.numGenerators) {
     io.issue(lane).valid := issueCanFire && currentIssueValid(lane)
     io.issue(lane).bits := currentIssueAccess(lane)
     issueFires(lane) := io.issue(lane).valid && io.issue(lane).ready
-    issuedWritebackQueues(lane).io.enq.valid := issueFires(lane)
-    issuedWritebackQueues(lane).io.enq.bits := currentIssueAccess(lane)
+  }
+  when(state === sIssueBatch) {
+    assert(issuedBatchQueue.io.enq.fire === issueFires.asUInt.orR,
+      "TrafficGenRTLEngine did not enqueue exactly one batch for an issue fire")
+  }
+  when(issuedBatchQueue.io.enq.fire) {
+    assert(PopCount(issuedBatchMask) === PopCount(issueFires.asUInt),
+      "TrafficGenRTLEngine issued batch population did not match firing lanes")
+  }
+  val rtlIssuedBatchStalled = RegNext(io.issuedAccessBatch.valid && !io.issuedAccessBatch.ready, false.B)
+  val rtlIssuedBatchBitsPrev = RegNext(io.issuedAccessBatch.bits.asUInt)
+  when(rtlIssuedBatchStalled) {
+    assert(io.issuedAccessBatch.valid,
+      "TrafficGenRTLEngine dropped an issued batch under backpressure")
+    assert(io.issuedAccessBatch.bits.asUInt === rtlIssuedBatchBitsPrev,
+      "TrafficGenRTLEngine changed an issued batch under backpressure")
   }
 
   var issueValidExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleValid(_))
@@ -731,10 +779,14 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     !queryReachedLoadEnd &&
     (!wakeExitPending || canFetchBeforeWakeExit)
   val outputQueuesEmpty =
-    !issuedWritebackArb.io.out.valid &&
+    !issuedBatchQueue.io.deq.valid &&
     !completedBundleArb.io.out.valid
 
-  when(state =/= sIdle) {
+  // HostPort backpressure can leave a small number of target tokens in flight
+  // after the bridge requests an access-read pause. Do not let those tokens
+  // advance architectural target time while this engine is waiting for the
+  // bridge to finish assembling the next access batch.
+  when(state =/= sIdle && state =/= sWaitAccess) {
     targetCycle := targetCycle + 1.U
   }
 
@@ -925,9 +977,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.roundExitReason := engine.io.roundExitReason
       io.currentCycleAfterIssue := engine.io.currentCycleAfterIssue
       io.dpiState := engine.io.dpiState
-      io.issuedAccessWriteback.valid := engine.io.issuedAccessWriteback.valid
-      io.issuedAccessWriteback.bits := engine.io.issuedAccessWriteback.bits
-      engine.io.issuedAccessWriteback.ready := io.issuedAccessWriteback.ready
+      io.issuedAccessBatch <> engine.io.issuedAccessBatch
       io.completedBundleIdWriteEn := engine.io.completedBundleIdWriteEn
       io.completedBundleIdWriteIdx := engine.io.completedBundleIdWriteIdx
       io.completedBundleIdWriteData := engine.io.completedBundleIdWriteData
@@ -1458,7 +1508,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.roundExitReason <> trafficGenTL.module.io.roundExitReason
       outerIO.bits.currentCycleAfterIssue <> trafficGenTL.module.io.currentCycleAfterIssue
       outerIO.bits.dpiState <> trafficGenTL.module.io.dpiState
-      outerIO.bits.issuedAccessWriteback <> trafficGenTL.module.io.issuedAccessWriteback
+      outerIO.bits.issuedAccessBatch <> trafficGenTL.module.io.issuedAccessBatch
       outerIO.bits.completedBundleIdWriteEn <> trafficGenTL.module.io.completedBundleIdWriteEn
       outerIO.bits.completedBundleIdWriteIdx <> trafficGenTL.module.io.completedBundleIdWriteIdx
       outerIO.bits.completedBundleIdWriteData <> trafficGenTL.module.io.completedBundleIdWriteData

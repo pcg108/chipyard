@@ -20,7 +20,7 @@ import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, Slave
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
-import firechip.bridgeinterfaces.{CompletedBundleIds, L2Access, TrafficGenAccessBatch}
+import firechip.bridgeinterfaces.{CompletedBundleIds, IssuedAccessBatch, L2Access, TrafficGenAccessBatch}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -130,7 +130,7 @@ class TrafficGenPortPeripheralIO extends Bundle {
   val roundExitReason = Output(UInt(2.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val issuedAccessWriteback = Decoupled(new L2Access)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
