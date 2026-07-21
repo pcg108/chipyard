@@ -52,6 +52,7 @@ struct trafficgen_l2_access_t {
   uint64_t cycle_count;
   uint64_t l1_to_l2_cycle;
   uint64_t elapsed_cycle;
+  bool has_timing;
   uint32_t m_subpartition;
   uint32_t m_set_index;
   uint64_t m_tag;
@@ -78,6 +79,19 @@ struct trafficgen_issued_access_point_t {
 };
 
 struct trafficgen_outstanding_bundle_info_t {
+  bool wake_relevant = false;
+  uint32_t sm_id = 0;
+  uint8_t scheduler_id = 0;
+  uint32_t warp_id = 0;
+};
+
+struct trafficgen_logical_inflight_access_t {
+  std::uint64_t finish_cycle = 0;
+  std::uint64_t bundle_id = 0;
+};
+
+struct trafficgen_logical_bundle_info_t {
+  std::uint64_t remaining_request_count = 0;
   bool wake_relevant = false;
   uint32_t sm_id = 0;
   uint8_t scheduler_id = 0;
@@ -152,6 +166,14 @@ private:
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_l1_to_l2_by_id;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_elapsed_by_id;
+  std::uint64_t logical_issue_cycle = 0;
+  std::unordered_map<std::uint64_t, trafficgen_logical_inflight_access_t>
+      logical_inflight_accesses_by_id;
+  std::unordered_map<std::uint64_t, trafficgen_logical_bundle_info_t>
+      logical_outstanding_bundles_by_id;
+  std::vector<trafficgen_issued_access_point_t> logical_round_issued_accesses;
+  std::vector<std::uint64_t> logical_round_completed_bundle_ids;
+  std::uint64_t logical_round_current_cycle_after_issue = 0;
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -192,6 +214,9 @@ private:
   void depopulate_issued_accesses(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void depopulate_uploaded_l2_access_chunk();
+  void build_logical_round_result();
+  void depopulate_target_accesses(
+      const std::vector<trafficgen_l2_access_t> &issued_accesses);
   void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);
   bool complete_bundle_is_current_wake(std::uint64_t bundle_id);
   void record_completed_bundle_id(std::uint64_t bundle_id);

@@ -133,6 +133,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       issuedBatchBufferData.asTypeOf(Vec(TrafficGenAccessBatch.lanes, UInt(L2Access.streamWidthBits.W)))
     val issuedBatchDrainLane = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes).W))
     val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
+    val issuedBatchLane0Only = target.issuedAccessBatch.bits.validMask === 1.U
     val issuedBatchFits =
       issuedAccessWritebackCount +& issuedBatchIncomingCount <= key.maxL2AccessEntries.U
 
@@ -149,12 +150,28 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         "TrafficGenBridge captured an empty issued-access batch")
       assert(target.issuedAccessBatch.bits.batchId === issuedBatchExpectedId,
         "TrafficGenBridge captured an out-of-order issued-access batch")
-      issuedBatchBufferValid := true.B
-      issuedBatchBufferId := target.issuedAccessBatch.bits.batchId
-      issuedBatchBufferMask := target.issuedAccessBatch.bits.validMask
-      issuedBatchBufferData := target.issuedAccessBatch.bits.accesses
-      issuedBatchDrainLane := 0.U
       issuedBatchExpectedId := issuedBatchExpectedId + 1.U
+      when(issuedBatchLane0Only) {
+        // Preserve the legacy one-record writeback throughput. Routing a
+        // lane-0-only compatibility batch through the generic 16-lane drain
+        // would scan fifteen invalid lanes and feed that diagnostic latency
+        // back into target memory scheduling.
+        assert(issuedAccessWritebackIdx < key.maxL2AccessEntries.U,
+          "TrafficGenBridge issued-access writeback store overflowed")
+        issuedBatchDrainWriteEn := true.B
+        issuedAccessWritebackStoreWriteEn := true.B
+        issuedAccessWritebackStoreWriteAddr := issuedAccessWritebackIdx(accessIdxWidth - 1, 0)
+        issuedAccessWritebackStoreWriteData := target.issuedAccessBatch.bits.accesses(
+          L2Access.streamWidthBits - 1, 0)
+        issuedAccessWritebackIdx := issuedAccessWritebackIdx + 1.U
+        issuedAccessWritebackCount := issuedAccessWritebackCount + 1.U
+      }.otherwise {
+        issuedBatchBufferValid := true.B
+        issuedBatchBufferId := target.issuedAccessBatch.bits.batchId
+        issuedBatchBufferMask := target.issuedAccessBatch.bits.validMask
+        issuedBatchBufferData := target.issuedAccessBatch.bits.accesses
+        issuedBatchDrainLane := 0.U
+      }
     }
 
     when(issuedBatchBufferValid) {
@@ -723,27 +740,26 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     target.startRound := startRoundPending
 
-    // Hold round completion for the bridge driver, but expose it only after the
-    // final captured issued batch has drained and its last BRAM write has
-    // committed. The target does not assert roundComplete until its own batch
-    // FIFO has transferred, so this closes both sides of the flush protocol.
+    // Hold round completion for the bridge driver, but expose it only after all
+    // issued batches have crossed the target-to-host channel, the final captured
+    // batch has drained, and its last BRAM write has committed. A batch leaving
+    // the target's FIFO may still be held by the channel while this bridge is
+    // draining the previous batch, so target.roundComplete is a fence request,
+    // not proof that host-side writeback has finished.
     val roundCompleteLatched = RegInit(false.B)
     val roundCompletePending = RegInit(false.B)
     when(target.roundStarted) {
       roundCompleteLatched := false.B
       roundCompletePending := false.B
     }.elsewhen(roundCompletePending &&
+               !target.issuedAccessBatch.valid &&
                !issuedBatchBufferValid &&
                !issuedAccessWritebackStoreWriteEn) {
-      assert(!target.issuedAccessBatch.valid,
-        "TrafficGenBridge exposed round completion with a target batch pending")
       assert(!issuedBatchDrainWriteEn,
         "TrafficGenBridge exposed round completion before issued-batch drain completed")
       roundCompleteLatched := true.B
       roundCompletePending := false.B
     }.elsewhen(fire && target.roundComplete) {
-      assert(!target.issuedAccessBatch.valid,
-        "TrafficGenBridge observed target completion before its batch FIFO drained")
       roundCompletePending := true.B
     }
 
