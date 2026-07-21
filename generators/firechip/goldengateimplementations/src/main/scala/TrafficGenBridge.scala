@@ -131,7 +131,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       Reg(UInt((TrafficGenAccessBatch.lanes * L2Access.streamWidthBits).W))
     val issuedBatchBufferLanes =
       issuedBatchBufferData.asTypeOf(Vec(TrafficGenAccessBatch.lanes, UInt(L2Access.streamWidthBits.W)))
-    val issuedBatchDrainLane = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes + 1).W))
+    val issuedBatchDrainLane = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes).W))
     val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
     val issuedBatchFits =
       issuedAccessWritebackCount +& issuedBatchIncomingCount <= key.maxL2AccessEntries.U
