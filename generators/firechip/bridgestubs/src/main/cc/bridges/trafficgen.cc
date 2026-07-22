@@ -776,7 +776,8 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
   words[7] = (access.m_warp_blocked ? 1ULL : 0ULL) << 42 |
              (access.m_is_write ? 1ULL : 0ULL) << 41 |
              (access.m_wake_relevant_bundle ? 1ULL : 0ULL) << 40 |
-             (access.m_bundle_id >> 24);
+             (access.m_bundle_id >> 24) |
+             (static_cast<uint64_t>(access.bundle_issue_count) << 43);
 }
 
 static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
@@ -796,6 +797,7 @@ static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
   access.m_wake_relevant_bundle = ((words[7] >> 40) & 0x1ULL) != 0;
   access.m_is_write = ((words[7] >> 41) & 0x1ULL) != 0;
   access.m_warp_blocked = ((words[7] >> 42) & 0x1ULL) != 0;
+  access.bundle_issue_count = static_cast<uint16_t>((words[7] >> 43) & 0xffffULL);
   return access;
 }
 
@@ -1189,6 +1191,62 @@ void trafficgen_t::build_logical_round_result() {
   logical_round_current_cycle_after_issue = logical_issue_cycle;
 }
 
+void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
+  constexpr std::size_t kLanes = 16;
+  std::unordered_map<std::uint64_t, std::size_t> bundle_counts;
+  for (const auto &access : l2_accesses) {
+    ++bundle_counts[access.m_bundle_id];
+  }
+  for (auto &access : l2_accesses) {
+    const auto count = bundle_counts.at(access.m_bundle_id);
+    if (count == 0 || count > std::numeric_limits<std::uint16_t>::max()) {
+      throw std::runtime_error("TrafficGen bundle member count exceeds packed width");
+    }
+    access.bundle_issue_count = static_cast<std::uint16_t>(count);
+  }
+
+  std::array<std::size_t, kLanes> lane_counts{};
+  for (std::size_t begin = 0; begin < l2_accesses.size();) {
+    std::size_t end = begin + 1;
+    while (end < l2_accesses.size() &&
+           l2_accesses[end].cycle_count == l2_accesses[begin].cycle_count) {
+      ++end;
+    }
+    const std::size_t group_size = end - begin;
+    if (group_size > kLanes) {
+      throw std::runtime_error(
+          "TrafficGen schedule has more than 16 accesses in one cycle");
+    }
+    std::unordered_set<std::uint32_t> subpartitions;
+    for (std::size_t i = begin; i < end; ++i) {
+      if (!subpartitions.insert(l2_accesses[i].m_subpartition).second) {
+        throw std::runtime_error(
+            "TrafficGen schedule has duplicate L2 subpartition in one cycle");
+      }
+    }
+
+    std::array<std::size_t, kLanes> lane_order{};
+    for (std::size_t lane = 0; lane < kLanes; ++lane) lane_order[lane] = lane;
+    std::stable_sort(lane_order.begin(), lane_order.end(),
+                     [&lane_counts](std::size_t lhs, std::size_t rhs) {
+                       if (lane_counts[lhs] != lane_counts[rhs])
+                         return lane_counts[lhs] < lane_counts[rhs];
+                       return lhs < rhs;
+                     });
+    for (std::size_t i = 0; i < group_size; ++i) {
+      const std::size_t lane = lane_order[i];
+      l2_accesses[begin + i].assigned_lane = static_cast<std::uint8_t>(lane);
+      ++lane_counts[lane];
+    }
+    begin = end;
+  }
+
+  const auto [min_it, max_it] = std::minmax_element(lane_counts.begin(), lane_counts.end());
+  if (*max_it - *min_it > 1) {
+    throw std::runtime_error("TrafficGen replay lane coloring is unbalanced");
+  }
+}
+
 void trafficgen_t::depopulate_target_accesses(
     const std::vector<trafficgen_l2_access_t> &issued_accesses) {
   std::unordered_set<std::uint64_t> issued_ids;
@@ -1390,6 +1448,7 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
 
   refresh_pending_access_blocked_annotations();
   build_logical_round_result();
+  assign_replay_lanes_and_bundle_counts();
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
@@ -1447,13 +1506,36 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
   return total_bytes;
 }
 
+void trafficgen_t::write_upload_lane_count(unsigned lane, std::uint32_t count) {
+  const std::array<std::uint64_t, 16> addrs = {
+      mmio_addrs.upload_lane_count_0, mmio_addrs.upload_lane_count_1,
+      mmio_addrs.upload_lane_count_2, mmio_addrs.upload_lane_count_3,
+      mmio_addrs.upload_lane_count_4, mmio_addrs.upload_lane_count_5,
+      mmio_addrs.upload_lane_count_6, mmio_addrs.upload_lane_count_7,
+      mmio_addrs.upload_lane_count_8, mmio_addrs.upload_lane_count_9,
+      mmio_addrs.upload_lane_count_10, mmio_addrs.upload_lane_count_11,
+      mmio_addrs.upload_lane_count_12, mmio_addrs.upload_lane_count_13,
+      mmio_addrs.upload_lane_count_14, mmio_addrs.upload_lane_count_15};
+  if (lane >= addrs.size()) throw std::out_of_range("TrafficGen upload lane");
+  write(addrs[lane], count);
+}
+
+std::uint32_t trafficgen_t::read_issued_lane_count(unsigned lane) {
+  const std::array<std::uint64_t, 16> addrs = {
+      mmio_addrs.issued_lane_count_0, mmio_addrs.issued_lane_count_1,
+      mmio_addrs.issued_lane_count_2, mmio_addrs.issued_lane_count_3,
+      mmio_addrs.issued_lane_count_4, mmio_addrs.issued_lane_count_5,
+      mmio_addrs.issued_lane_count_6, mmio_addrs.issued_lane_count_7,
+      mmio_addrs.issued_lane_count_8, mmio_addrs.issued_lane_count_9,
+      mmio_addrs.issued_lane_count_10, mmio_addrs.issued_lane_count_11,
+      mmio_addrs.issued_lane_count_12, mmio_addrs.issued_lane_count_13,
+      mmio_addrs.issued_lane_count_14, mmio_addrs.issued_lane_count_15};
+  if (lane >= addrs.size()) throw std::out_of_range("TrafficGen issued lane");
+  return static_cast<std::uint32_t>(read(addrs[lane]));
+}
+
 size_t
 trafficgen_t::process_issued_access_writeback_stream() {
-
-  /*
-    read issued access from bridge module using XDMA
-  */
-
   if (issued_access_writeback_count == 0) {
     return 0;
   }
@@ -1466,28 +1548,48 @@ trafficgen_t::process_issued_access_writeback_stream() {
   if (total_bytes > access_window_bytes) {
     throw std::runtime_error("TrafficGen issued-access readback exceeds BRAM access window");
   }
+  constexpr std::size_t kLanes = 16;
+  if (access_window_bytes % kLanes != 0) {
+    throw std::runtime_error("TrafficGen issued-access window is not lane divisible");
+  }
+  const std::size_t bank_stride_bytes = access_window_bytes / kLanes;
   auto &xdma = simif.get_cpu_managed_stream_io();
-  auto stream_bytes = make_aligned_bytes(total_bytes);
-  xdma_read_exact(
-      xdma,
-      bram_base + raw_issued_access_writeback_store_offset,
-      stream_bytes.get(),
-      total_bytes,
-      "XDMA read while reading issuedAccessWriteback");
-  issued_access_writeback_stream_bytes.resize(total_bytes);
-  std::memcpy(issued_access_writeback_stream_bytes.data(),
-              stream_bytes.get(),
-              total_bytes);
-  issued_access_writeback_bytes_received += total_bytes;
-
   issued_access_writeback_entries.clear();
   issued_access_writeback_entries.reserve(issued_access_writeback_count);
-  for (uint32_t access_idx = 0; access_idx < issued_access_writeback_count; ++access_idx) {
-    const auto *beat_words = reinterpret_cast<const uint64_t *>(
-        issued_access_writeback_stream_bytes.data() +
-        static_cast<size_t>(access_idx) * STREAM_WIDTH_BYTES);
-    issued_access_writeback_entries.push_back(unpack_l2_access(beat_words));
+  std::size_t summed_count = 0;
+  for (std::size_t lane = 0; lane < kLanes; ++lane) {
+    const std::uint32_t lane_count = read_issued_lane_count(lane);
+    const std::size_t lane_bytes = static_cast<std::size_t>(lane_count) * STREAM_WIDTH_BYTES;
+    if (lane_bytes > bank_stride_bytes) {
+      throw std::runtime_error("TrafficGen issued lane exceeds bank capacity");
+    }
+    summed_count += lane_count;
+    if (lane_bytes == 0) continue;
+    auto lane_data = make_aligned_bytes(lane_bytes);
+    xdma_read_exact(
+        xdma,
+        bram_base + raw_issued_access_writeback_store_offset + lane * bank_stride_bytes,
+        lane_data.get(), lane_bytes,
+        "XDMA read while reading banked issuedAccessWriteback");
+    for (std::uint32_t idx = 0; idx < lane_count; ++idx) {
+      const auto *words = reinterpret_cast<const std::uint64_t *>(
+          lane_data.get() + static_cast<std::size_t>(idx) * STREAM_WIDTH_BYTES);
+      auto access = unpack_l2_access(words);
+      access.assigned_lane = static_cast<std::uint8_t>(lane);
+      issued_access_writeback_entries.push_back(access);
+    }
   }
+  if (summed_count != issued_access_writeback_count) {
+    throw std::runtime_error("TrafficGen issued per-lane counts do not match total");
+  }
+  std::stable_sort(issued_access_writeback_entries.begin(),
+                   issued_access_writeback_entries.end(),
+                   [](const auto &lhs, const auto &rhs) {
+                     if (lhs.cycle_count != rhs.cycle_count)
+                       return lhs.cycle_count < rhs.cycle_count;
+                     return lhs.assigned_lane < rhs.assigned_lane;
+                   });
+  issued_access_writeback_bytes_received = total_bytes;
 
   std::cout << "[bridge driver] issuedAccessWriteback count="
             << issued_access_writeback_count << std::endl;
@@ -1505,6 +1607,7 @@ void trafficgen_t::write_schedule_to_bram() {
   // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O
   auto &xdma = simif.get_cpu_managed_stream_io();
 
+  constexpr std::size_t kLanes = 16;
   const size_t access_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
   if (access_bytes > access_window_bytes) {
     throw std::runtime_error("TrafficGen L2 access upload exceeds BRAM access window");
@@ -1512,20 +1615,35 @@ void trafficgen_t::write_schedule_to_bram() {
   if (l2_accesses.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("TrafficGen L2 access upload count exceeds MMIO width");
   }
-  // Pack the L2 accesses into a byte buffer for XDMA writing
-  if (access_bytes != 0) {
-    auto packed_accesses = make_aligned_bytes(access_bytes);
-    std::memset(packed_accesses.get(), 0, access_bytes);
-    auto *packed_words = reinterpret_cast<std::uint64_t *>(packed_accesses.get());
-    for (size_t i = 0; i < l2_accesses.size(); ++i) {
-      pack_l2_access(l2_accesses[i], packed_words + i * STREAM_WORDS_PER_BEAT);
+  if (access_window_bytes % kLanes != 0) {
+    throw std::runtime_error("TrafficGen access window is not lane divisible");
+  }
+  const std::size_t bank_stride_bytes = access_window_bytes / kLanes;
+  std::array<std::vector<const trafficgen_l2_access_t *>, kLanes> lanes;
+  for (const auto &access : l2_accesses) {
+    if (access.assigned_lane >= kLanes) {
+      throw std::runtime_error("TrafficGen access has invalid replay lane");
+    }
+    lanes[access.assigned_lane].push_back(&access);
+  }
+  for (std::size_t lane = 0; lane < kLanes; ++lane) {
+    const std::size_t lane_bytes = lanes[lane].size() * L2_ACCESS_STREAM_BYTES;
+    if (lane_bytes > bank_stride_bytes) {
+      throw std::runtime_error("TrafficGen access lane exceeds bank capacity");
+    }
+    write_upload_lane_count(lane, static_cast<std::uint32_t>(lanes[lane].size()));
+    if (lane_bytes == 0) continue;
+    auto packed = make_aligned_bytes(lane_bytes);
+    std::memset(packed.get(), 0, lane_bytes);
+    auto *packed_words = reinterpret_cast<std::uint64_t *>(packed.get());
+    for (std::size_t idx = 0; idx < lanes[lane].size(); ++idx) {
+      pack_l2_access(*lanes[lane][idx], packed_words + idx * STREAM_WORDS_PER_BEAT);
     }
     xdma_write_exact(
         xdma,
-        bram_base + raw_access_store_offset,
-        packed_accesses.get(),
-        access_bytes,
-        "XDMA write while uploading TrafficGen L2 accesses");
+        bram_base + raw_access_store_offset + lane * bank_stride_bytes,
+        packed.get(), lane_bytes,
+        "XDMA write while uploading banked TrafficGen L2 accesses");
   }
 
   // write access meta data into MMIO registers
@@ -1560,7 +1678,7 @@ void trafficgen_t::tick() {
       if (receive_main_loop_complete_from_gpu_model()) {
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
-        state = trafficgen_state_t::IDLE;
+        state = trafficgen_state_t::DONE;
         break;
       }
 
@@ -1744,7 +1862,7 @@ void trafficgen_t::tick() {
         // indicate to target that trafficgen is done and unpause target
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
-        state = trafficgen_state_t::IDLE;
+        state = trafficgen_state_t::DONE;
       } else {
         issued_access_writeback_entries.clear();
         issued_access_writeback_stream_bytes.clear();
@@ -1757,6 +1875,10 @@ void trafficgen_t::tick() {
         state = trafficgen_state_t::SEND_RESERVED_PARTITIONS;
       }
     }
+    break;
+  case trafficgen_state_t::DONE:
+    // Terminal state: do not sample the start doorbell again while the final
+    // done/unpause MMIO pulses propagate to the target.
     break;
   }
 }

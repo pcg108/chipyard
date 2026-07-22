@@ -26,6 +26,22 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t current_round_low;
   uint64_t current_round_high;
   uint64_t upload_count;
+  uint64_t upload_lane_count_0;
+  uint64_t upload_lane_count_1;
+  uint64_t upload_lane_count_2;
+  uint64_t upload_lane_count_3;
+  uint64_t upload_lane_count_4;
+  uint64_t upload_lane_count_5;
+  uint64_t upload_lane_count_6;
+  uint64_t upload_lane_count_7;
+  uint64_t upload_lane_count_8;
+  uint64_t upload_lane_count_9;
+  uint64_t upload_lane_count_10;
+  uint64_t upload_lane_count_11;
+  uint64_t upload_lane_count_12;
+  uint64_t upload_lane_count_13;
+  uint64_t upload_lane_count_14;
+  uint64_t upload_lane_count_15;
   uint64_t access_store_max_cycle_low;
   uint64_t access_store_max_cycle_high;
   uint64_t commit_upload;
@@ -38,6 +54,22 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t round_exit_reason;
   uint64_t dpi_state;
   uint64_t issued_access_writeback_count;
+  uint64_t issued_lane_count_0;
+  uint64_t issued_lane_count_1;
+  uint64_t issued_lane_count_2;
+  uint64_t issued_lane_count_3;
+  uint64_t issued_lane_count_4;
+  uint64_t issued_lane_count_5;
+  uint64_t issued_lane_count_6;
+  uint64_t issued_lane_count_7;
+  uint64_t issued_lane_count_8;
+  uint64_t issued_lane_count_9;
+  uint64_t issued_lane_count_10;
+  uint64_t issued_lane_count_11;
+  uint64_t issued_lane_count_12;
+  uint64_t issued_lane_count_13;
+  uint64_t issued_lane_count_14;
+  uint64_t issued_lane_count_15;
   uint64_t completed_bundle_count;
 };
 
@@ -64,6 +96,8 @@ struct trafficgen_l2_access_t {
   bool m_wake_relevant_bundle;
   bool m_is_write;
   bool m_warp_blocked;
+  uint16_t bundle_issue_count = 1;
+  uint8_t assigned_lane = 0;
 };
 
 struct trafficgen_issued_access_point_t {
@@ -104,6 +138,7 @@ enum class trafficgen_state_t {
   UPLOAD_SCHEDULE,
   ISSUING_TRAFFIC,
   READING_TRAFFICGEN_OUTPUT,
+  DONE,
 };
 
 class trafficgen_t final : public bridge_driver_t {
@@ -215,6 +250,9 @@ private:
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void depopulate_uploaded_l2_access_chunk();
   void build_logical_round_result();
+  void assign_replay_lanes_and_bundle_counts();
+  void write_upload_lane_count(unsigned lane, std::uint32_t count);
+  std::uint32_t read_issued_lane_count(unsigned lane);
   void depopulate_target_accesses(
       const std::vector<trafficgen_l2_access_t> &issued_accesses);
   void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);

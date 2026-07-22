@@ -58,6 +58,10 @@ object TrafficGenBridge {
     trafficGenIO.accessReadDataValid := ep.io.trafficgen.accessReadDataValid
     trafficGenIO.accessReadBucketDone := ep.io.trafficgen.accessReadBucketDone
     trafficGenIO.accessReadReady := ep.io.trafficgen.accessReadReady
+    ep.io.trafficgen.accessReadConsumeMask := trafficGenIO.accessReadConsumeMask
+    trafficGenIO.accessReadLaneDoneMask := ep.io.trafficgen.accessReadLaneDoneMask
+    trafficGenIO.accessReadPrefetchPauseReq := ep.io.trafficgen.accessReadPrefetchPauseReq
+    ep.io.trafficgen.accessReadPrefetchPauseAck := trafficGenIO.accessReadPrefetchPauseAck
     trafficGenIO.accessStoreCount := ep.io.trafficgen.accessStoreCount
     trafficGenIO.accessStoreMaxCycle := ep.io.trafficgen.accessStoreMaxCycle
     trafficGenIO.accessStoreHasEntries := ep.io.trafficgen.accessStoreHasEntries

@@ -21,10 +21,14 @@ class L2Access extends Bundle {
   val mWakeRelevantBundle = Bool()
   val mIsWrite = Bool()
   val mWarpBlocked = Bool()
+  // Number of members of this bundle selected for the current logical replay
+  // round.  The RTL uses this to prevent a fast member from completing the
+  // bundle before members on backpressured lanes have issued.
+  val bundleIssueCount = UInt(16.W)
 }
 
 object L2Access {
-  val packedWidth = 491
+  val packedWidth = 507
   val streamWidthBits = 512
   private val paddingWidth = streamWidthBits - packedWidth
 
@@ -32,6 +36,7 @@ object L2Access {
   def pack(access: L2Access): UInt = {
     Cat(
       0.U(paddingWidth.W),
+      access.bundleIssueCount,
       access.mWarpBlocked,
       access.mIsWrite,
       access.mWakeRelevantBundle,
@@ -66,6 +71,7 @@ object L2Access {
     access.mWakeRelevantBundle := bits(488)
     access.mIsWrite := bits(489)
     access.mWarpBlocked := bits(490)
+    access.bundleIssueCount := bits(506, 491)
     access
   }
 }
@@ -126,6 +132,10 @@ class TrafficGenPortIO extends Bundle {
   val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
+  val accessReadConsumeMask = Output(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadPrefetchPauseReq = Input(Bool())
+  val accessReadPrefetchPauseAck = Output(Bool())
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
