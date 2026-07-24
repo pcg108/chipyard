@@ -76,6 +76,80 @@ object L2Access {
   }
 }
 
+/** Minimal access state required by the synthesizable traffic generator.
+  *
+  * DPI-only trace metadata deliberately does not appear here so RTL replay
+  * stores and target-side queues do not pay for unused fields.
+  */
+class RTLL2Access extends Bundle {
+  val id = UInt(64.W)
+  val address = UInt(64.W)
+  val cycleCount = UInt(64.W)
+  val mBundleId = UInt(64.W)
+  val mWakeRelevantBundle = Bool()
+  val mIsWrite = Bool()
+  val mWarpBlocked = Bool()
+  val bundleIssueCount = UInt(16.W)
+}
+
+object RTLL2Access {
+  val streamWidthBits = 275
+
+  def pack(access: RTLL2Access): UInt = Cat(
+    access.bundleIssueCount,
+    access.mWarpBlocked,
+    access.mIsWrite,
+    access.mWakeRelevantBundle,
+    access.mBundleId,
+    access.cycleCount,
+    access.address,
+    access.id,
+  )
+
+  def unpack(bits: UInt): RTLL2Access = {
+    require(bits.getWidth == streamWidthBits, s"RTLL2Access.unpack expects ${streamWidthBits}b input")
+    val access = Wire(new RTLL2Access)
+    access.id := bits(63, 0)
+    access.address := bits(127, 64)
+    access.cycleCount := bits(191, 128)
+    access.mBundleId := bits(255, 192)
+    access.mWakeRelevantBundle := bits(256)
+    access.mIsWrite := bits(257)
+    access.mWarpBlocked := bits(258)
+    access.bundleIssueCount := bits(274, 259)
+    access
+  }
+}
+
+/** The only per-access fields returned by either traffic-generator engine. */
+class IssuedAccess extends Bundle {
+  val requestUid = UInt(64.W)
+  val cycleIssued = UInt(64.W)
+  val address = UInt(64.W)
+  val isWrite = Bool()
+}
+
+object IssuedAccess {
+  val streamWidthBits = 193
+
+  def pack(access: IssuedAccess): UInt = Cat(
+    access.isWrite,
+    access.address,
+    access.cycleIssued,
+    access.requestUid,
+  )
+
+  def unpack(bits: UInt): IssuedAccess = {
+    require(bits.getWidth == streamWidthBits, s"IssuedAccess.unpack expects ${streamWidthBits}b input")
+    val access = Wire(new IssuedAccess)
+    access.requestUid := bits(63, 0)
+    access.cycleIssued := bits(127, 64)
+    access.address := bits(191, 128)
+    access.isWrite := bits(192)
+    access
+  }
+}
+
 object TrafficGenAccessBatch {
   val lanes = 16
 }
@@ -83,11 +157,10 @@ object TrafficGenAccessBatch {
 class IssuedAccessBatch extends Bundle {
   val batchId = UInt(32.W)
   val validMask = UInt(TrafficGenAccessBatch.lanes.W)
-  // Keep all lanes in the existing 512-bit stream encoding, with lane 0 in
-  // the least-significant bits. Golden Gate's bridge extraction cannot lower
-  // aggregate fields nested inside Decoupled[IssuedAccessBatch], so the lane
-  // vector crosses HostPort as one ground UInt.
-  val accesses = UInt((TrafficGenAccessBatch.lanes * L2Access.streamWidthBits).W)
+  // Golden Gate's bridge extraction cannot lower aggregate fields nested
+  // inside Decoupled[IssuedAccessBatch], so the compact issued records cross
+  // HostPort as one ground UInt.
+  val accesses = UInt((TrafficGenAccessBatch.lanes * IssuedAccess.streamWidthBits).W)
 }
 
 object CompletedBundleIds {
@@ -105,7 +178,7 @@ object TrafficGenRoundExitReason {
   val capacity = 1.U(2.W)
 }
 
-class TrafficGenPortIO extends Bundle {
+class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -128,7 +201,9 @@ class TrafficGenPortIO extends Bundle {
   val accessReadBatchReady = Output(Bool())
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
-  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
+  private val accessStreamWidth =
+    if (useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
+  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, UInt(accessStreamWidth.W)))
   val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
@@ -142,10 +217,10 @@ class TrafficGenPortIO extends Bundle {
   val uploadReady = Input(Bool())
 }
 
-case class TrafficGenBridgeKey(maxL2AccessEntries: Int)
+case class TrafficGenBridgeKey(maxL2AccessEntries: Int, useRTL: Boolean)
 
-class TrafficGenBridgeTargetIO extends Bundle {
+class TrafficGenBridgeTargetIO(useRTL: Boolean) extends Bundle {
   val clock = Input(Clock())
-  val trafficgen = Flipped(new TrafficGenPortIO)
+  val trafficgen = Flipped(new TrafficGenPortIO(useRTL))
   val reset = Input(Bool())
 }

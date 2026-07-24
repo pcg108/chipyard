@@ -115,7 +115,6 @@ struct socket_l2_access_t {
   std::uint64_t mUniqueId = 0;
   std::uint64_t mAddress = 0;
   std::uint64_t mCycleCount = 0;
-  std::uint64_t mL1ToL2Cycle = 0;
   unsigned mSubpartition = 0;
   unsigned mSetIndex = 0;
   std::uint64_t mTag = 0;
@@ -136,7 +135,6 @@ private:
     ar & mUniqueId;
     ar & mAddress;
     ar & mCycleCount;
-    ar & mL1ToL2Cycle;
     ar & mSubpartition;
     ar & mSetIndex;
     ar & mTag;
@@ -205,13 +203,8 @@ private:
 
 struct IssuedAccessPoint {
   std::uint64_t requestUid = 0;
-  std::uint64_t address = 0;
   std::uint64_t cycleIssued = 0;
-  std::uint64_t l1ToL2Cycle = 0;
-  std::uint64_t elapsedCycle = 0;
-  unsigned smId = 0;
-  unsigned schedulerId = 0;
-  unsigned warpId = 0;
+  std::uint64_t address = 0;
   bool isWrite = false;
 
 private:
@@ -220,13 +213,8 @@ private:
   template <class Archive>
   void serialize(Archive &ar, const unsigned int /*version*/) {
     ar & requestUid;
-    ar & address;
     ar & cycleIssued;
-    ar & l1ToL2Cycle;
-    ar & elapsedCycle;
-    ar & smId;
-    ar & schedulerId;
-    ar & warpId;
+    ar & address;
     ar & isWrite;
   }
 };
@@ -762,10 +750,19 @@ private:
 };
 
 static void pack_l2_access(const trafficgen_l2_access_t &access,
-                           uint64_t *words) {
+                           uint64_t *words,
+                           bool use_rtl_engine) {
   words[0] = access.id;
   words[1] = access.address;
   words[2] = access.cycle_count;
+  if (use_rtl_engine) {
+    words[3] = access.m_bundle_id;
+    words[4] = (access.m_wake_relevant_bundle ? 1ULL : 0ULL) |
+               ((access.m_is_write ? 1ULL : 0ULL) << 1) |
+               ((access.m_warp_blocked ? 1ULL : 0ULL) << 2) |
+               (static_cast<std::uint64_t>(access.bundle_issue_count) << 3);
+    return;
+  }
   words[3] = (static_cast<uint64_t>(access.m_set_index) << 32) |
              access.m_subpartition;
   words[4] = access.m_tag;
@@ -780,24 +777,13 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
              (static_cast<uint64_t>(access.bundle_issue_count) << 43);
 }
 
-static trafficgen_l2_access_t unpack_l2_access(const uint64_t *words) {
-  trafficgen_l2_access_t access{};
-  access.id = words[0];
-  access.address = words[1];
-  access.cycle_count = words[2];
-  access.m_subpartition = static_cast<uint32_t>(words[3] & 0xffffffffULL);
-  access.m_set_index = static_cast<uint32_t>(words[3] >> 32);
-  access.m_tag = words[4];
-  access.m_mask = static_cast<uint32_t>(words[5] & 0xffffffffULL);
-  access.sm_id = static_cast<uint32_t>(words[5] >> 32);
-  access.scheduler_id = static_cast<uint8_t>(words[6] & 0xffULL);
-  access.warp_id = static_cast<uint32_t>((words[6] >> 8) & 0xffffffffULL);
-  access.m_bundle_id =
-      ((words[7] & 0xffffffffffULL) << 24) | ((words[6] >> 40) & 0xffffffULL);
-  access.m_wake_relevant_bundle = ((words[7] >> 40) & 0x1ULL) != 0;
-  access.m_is_write = ((words[7] >> 41) & 0x1ULL) != 0;
-  access.m_warp_blocked = ((words[7] >> 42) & 0x1ULL) != 0;
-  access.bundle_issue_count = static_cast<uint16_t>((words[7] >> 43) & 0xffffULL);
+static trafficgen_issued_access_point_t
+unpack_issued_access(const uint64_t *words) {
+  trafficgen_issued_access_point_t access{};
+  access.request_uid = words[0];
+  access.cycle_issued = words[1];
+  access.address = words[2];
+  access.is_write = (words[3] & 0x1ULL) != 0;
   return access;
 }
 
@@ -805,21 +791,24 @@ trafficgen_t::trafficgen_t(simif_t &simif,
                            const TRAFFICGENBRIDGEMODULE_struct &mmio_addrs,
                            int /*trafficgenno*/,
                            const std::vector<std::string> &args,
-	                           uint64_t bram_base,
-	                           uint64_t raw_access_store_offset,
-	                           uint64_t raw_issued_access_writeback_store_offset,
-	                           uint64_t raw_completed_bundle_ids_offset,
-	                           uint64_t access_window_bytes,
-	                           uint64_t completed_window_bytes)
+                           uint64_t bram_base,
+                           uint64_t raw_access_store_offset,
+                           uint64_t raw_issued_access_writeback_store_offset,
+                           uint64_t raw_completed_bundle_ids_offset,
+                           uint64_t access_window_bytes,
+                           uint64_t completed_window_bytes,
+                           uint64_t use_rtl_engine)
     : bridge_driver_t(simif, &KIND),
       mmio_addrs(mmio_addrs),
-	      bram_base(bram_base),
-	      raw_access_store_offset(raw_access_store_offset),
-	      raw_issued_access_writeback_store_offset(raw_issued_access_writeback_store_offset),
-	      raw_completed_bundle_ids_offset(raw_completed_bundle_ids_offset),
-	      access_window_bytes(access_window_bytes),
-	      completed_window_bytes(completed_window_bytes) {
-	  const std::string stretch_scale =
+      bram_base(bram_base),
+      raw_access_store_offset(raw_access_store_offset),
+      raw_issued_access_writeback_store_offset(
+          raw_issued_access_writeback_store_offset),
+      raw_completed_bundle_ids_offset(raw_completed_bundle_ids_offset),
+      access_window_bytes(access_window_bytes),
+      completed_window_bytes(completed_window_bytes),
+      use_rtl_engine(use_rtl_engine != 0) {
+  const std::string stretch_scale =
       plusarg_value(args, "trafficgen-memory-issue-stretch-scale");
   if (!stretch_scale.empty()) {
     memory_issue_stretch_scale = std::max(std::strtod(stretch_scale.c_str(), nullptr), 1e-9);
@@ -864,8 +853,6 @@ void trafficgen_t::init() {
   l2_accesses.clear();
   pending_accesses_by_cycle.clear();
   pending_access_cycle_by_id.clear();
-  pending_access_l1_to_l2_by_id.clear();
-  pending_access_elapsed_by_id.clear();
   logical_issue_cycle = 0;
   logical_inflight_accesses_by_id.clear();
   logical_outstanding_bundles_by_id.clear();
@@ -1034,8 +1021,6 @@ void trafficgen_t::depopulate_issued_accesses(
                            return false;
                          }
                          pending_access_cycle_by_id.erase(access.id);
-                         pending_access_l1_to_l2_by_id.erase(access.id);
-                         pending_access_elapsed_by_id.erase(access.id);
                          return true;
                        }),
         accesses.end());
@@ -1065,8 +1050,6 @@ void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
                            return false;
                          }
                          pending_access_cycle_by_id.erase(access.id);
-                         pending_access_l1_to_l2_by_id.erase(access.id);
-                         pending_access_elapsed_by_id.erase(access.id);
                          return true;
                        }),
         accesses.end());
@@ -1153,11 +1136,6 @@ void trafficgen_t::build_logical_round_result() {
           issued.request_uid = access.id;
           issued.address = access.address;
           issued.cycle_issued = logical_issue_cycle;
-          issued.l1_to_l2_cycle = access.l1_to_l2_cycle;
-          issued.elapsed_cycle = access.elapsed_cycle;
-          issued.sm_id = access.sm_id;
-          issued.scheduler_id = access.scheduler_id;
-          issued.warp_id = access.warp_id;
           issued.is_write = access.m_is_write;
           logical_round_issued_accesses.push_back(issued);
 
@@ -1173,8 +1151,6 @@ void trafficgen_t::build_logical_round_result() {
         }
 
         pending_access_cycle_by_id.erase(access.id);
-        pending_access_l1_to_l2_by_id.erase(access.id);
-        pending_access_elapsed_by_id.erase(access.id);
       }
       pending_accesses_by_cycle.erase(pending_it);
     }
@@ -1248,11 +1224,11 @@ void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
 }
 
 void trafficgen_t::depopulate_target_accesses(
-    const std::vector<trafficgen_l2_access_t> &issued_accesses) {
+    const std::vector<trafficgen_issued_access_point_t> &issued_accesses) {
   std::unordered_set<std::uint64_t> issued_ids;
   issued_ids.reserve(issued_accesses.size());
   for (const auto &access : issued_accesses) {
-    issued_ids.insert(access.id);
+    issued_ids.insert(access.request_uid);
   }
   l2_accesses.erase(
       std::remove_if(l2_accesses.begin(),
@@ -1318,13 +1294,8 @@ void trafficgen_t::log_logical_round_for_compare(
   for (const auto &access : issued_accesses) {
     IssuedAccessPoint point{};
     point.requestUid = access.request_uid;
-    point.address = access.address;
     point.cycleIssued = access.cycle_issued;
-    point.l1ToL2Cycle = access.l1_to_l2_cycle;
-    point.elapsedCycle = access.elapsed_cycle;
-    point.smId = access.sm_id;
-    point.schedulerId = access.scheduler_id;
-    point.warpId = access.warp_id;
+    point.address = access.address;
     point.isWrite = access.is_write;
     issued_snapshot_points.push_back(point);
   }
@@ -1395,7 +1366,6 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     access.id = wire_access.mUniqueId;
     access.address = wire_access.mAddress;
     access.cycle_count = wire_access.mCycleCount;
-    access.l1_to_l2_cycle = wire_access.mL1ToL2Cycle;
     access.m_subpartition = checked_u32(
         static_cast<std::uint64_t>(wire_access.mSubpartition),
         "l2 access subpartition");
@@ -1439,8 +1409,6 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     }
     if (pending_access_cycle_by_id.emplace(access.id, access.cycle_count).second) {
       pending_accesses_by_cycle[access.cycle_count].push_back(access);
-      pending_access_l1_to_l2_by_id[access.id] = access.l1_to_l2_cycle;
-      pending_access_elapsed_by_id[access.id] = access.elapsed_cycle;
     }
   }
   accumulated_issued_accesses.clear();
@@ -1574,8 +1542,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
     for (std::uint32_t idx = 0; idx < lane_count; ++idx) {
       const auto *words = reinterpret_cast<const std::uint64_t *>(
           lane_data.get() + static_cast<std::size_t>(idx) * STREAM_WIDTH_BYTES);
-      auto access = unpack_l2_access(words);
-      access.assigned_lane = static_cast<std::uint8_t>(lane);
+      auto access = unpack_issued_access(words);
       issued_access_writeback_entries.push_back(access);
     }
   }
@@ -1585,9 +1552,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
   std::stable_sort(issued_access_writeback_entries.begin(),
                    issued_access_writeback_entries.end(),
                    [](const auto &lhs, const auto &rhs) {
-                     if (lhs.cycle_count != rhs.cycle_count)
-                       return lhs.cycle_count < rhs.cycle_count;
-                     return lhs.assigned_lane < rhs.assigned_lane;
+                     return lhs.cycle_issued < rhs.cycle_issued;
                    });
   issued_access_writeback_bytes_received = total_bytes;
 
@@ -1637,7 +1602,10 @@ void trafficgen_t::write_schedule_to_bram() {
     std::memset(packed.get(), 0, lane_bytes);
     auto *packed_words = reinterpret_cast<std::uint64_t *>(packed.get());
     for (std::size_t idx = 0; idx < lanes[lane].size(); ++idx) {
-      pack_l2_access(*lanes[lane][idx], packed_words + idx * STREAM_WORDS_PER_BEAT);
+      pack_l2_access(
+          *lanes[lane][idx],
+          packed_words + idx * STREAM_WORDS_PER_BEAT,
+          use_rtl_engine);
     }
     xdma_write_exact(
         xdma,
@@ -1832,13 +1800,8 @@ void trafficgen_t::tick() {
       for (const auto &logical : logical_round_issued_accesses) {
         IssuedAccessPoint issued_access_point{};
         issued_access_point.requestUid = logical.request_uid;
-        issued_access_point.address = logical.address;
         issued_access_point.cycleIssued = logical.cycle_issued;
-        issued_access_point.l1ToL2Cycle = logical.l1_to_l2_cycle;
-        issued_access_point.elapsedCycle = logical.elapsed_cycle;
-        issued_access_point.smId = logical.sm_id;
-        issued_access_point.schedulerId = logical.scheduler_id;
-        issued_access_point.warpId = logical.warp_id;
+        issued_access_point.address = logical.address;
         issued_access_point.isWrite = logical.is_write;
         message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
       }

@@ -32,7 +32,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
   private val cpuManagedAXI4Params = p(CPUManagedAXI4Key).get
   private val bramBeatBytes        = cpuManagedAXI4Params.dataBits / 8
-  require(cpuManagedAXI4Params.dataBits == L2Access.streamWidthBits, "TrafficGen direct BRAM path expects 512-bit CPU-managed XDMA")
+  private val accessStreamWidth =
+    if (key.useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
+  private val issuedStreamWidth = IssuedAccess.streamWidthBits
+  require(cpuManagedAXI4Params.dataBits == 512, "TrafficGen direct BRAM path expects 512-bit CPU-managed XDMA")
 
   // create bramSlaveNode- this is connected in FPGATop to a xbar along with regular streaming engines to FPGA XDMA via io_pcis
   val bramBase: BigInt = TrafficGenBRAMAddressMap.base + BigInt(getWId) * TrafficGenBRAMAddressMap.stride
@@ -59,7 +62,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
   lazy val module = new BridgeModuleImp(this) {
     val io = IO(new WidgetIO())
-    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO))
+    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key.useRTL)))
     val target = hPort.hBits.trafficgen
 
     /*
@@ -116,7 +119,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Each target issue lane owns one writeback bank.  A masked issued batch
     // can therefore commit every firing lane in one bridge cycle.
     val issuedAccessWritebackStores = Seq.fill(replayLanes) {
-      val mem = SyncReadMem(laneBankDepth, UInt(L2Access.streamWidthBits.W))
+      val mem = SyncReadMem(laneBankDepth, UInt(issuedStreamWidth.W))
       RAMStyleHint(mem, RAMStyles.BLOCK)
       mem
     }
@@ -124,7 +127,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val issuedAccessWritebackLaneCounts = RegInit(VecInit(Seq.fill(replayLanes)(0.U(32.W))))
     val issuedBatchExpectedId = RegInit(0.U(32.W))
     val issuedBatchPackedLanes =
-      target.issuedAccessBatch.bits.accesses.asTypeOf(Vec(replayLanes, UInt(L2Access.streamWidthBits.W)))
+      target.issuedAccessBatch.bits.accesses.asTypeOf(Vec(replayLanes, UInt(issuedStreamWidth.W)))
     val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
     val issuedBatchFits = VecInit((0 until replayLanes).map { lane =>
       !target.issuedAccessBatch.bits.validMask(lane) ||
@@ -214,7 +217,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Store uploaded accesses lane-major.  Every bank has its own read port and
     // a two-entry target-facing prefetch FIFO.
     val accessStores = Seq.fill(replayLanes) {
-      val mem = SyncReadMem(laneBankDepth, UInt(L2Access.streamWidthBits.W))
+      val mem = SyncReadMem(laneBankDepth, UInt(accessStreamWidth.W))
       RAMStyleHint(mem, RAMStyles.BLOCK)
       mem
     }
@@ -225,7 +228,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     val accessStoreWriteEn = Wire(Vec(replayLanes, Bool()))
     val accessStoreWriteAddr = Wire(Vec(replayLanes, UInt(laneBankIdxWidth.W)))
-    val accessStoreWriteData = Wire(Vec(replayLanes, UInt(L2Access.streamWidthBits.W)))
+    val accessStoreWriteData = Wire(Vec(replayLanes, UInt(accessStreamWidth.W)))
     accessStoreWriteEn.foreach(_ := false.B)
     accessStoreWriteAddr.foreach(_ := 0.U)
     accessStoreWriteData.foreach(_ := 0.U)
@@ -247,14 +250,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     val accessReadQueues = Seq.fill(replayLanes) {
       withReset(reset.asBool || accessReadReset) {
-        Module(new Queue(new L2Access, 2, pipe = true, flow = false))
+        Module(new Queue(UInt(accessStreamWidth.W), 2, pipe = true, flow = false))
       }
     }
     val accessReadCursors = RegInit(VecInit(Seq.fill(replayLanes)(0.U(laneBankCountWidth.W))))
     val accessReadFetchPending = RegInit(VecInit(Seq.fill(replayLanes)(false.B)))
     val accessReadBankReadEn = Wire(Vec(replayLanes, Bool()))
     val accessReadBankReadAddr = Wire(Vec(replayLanes, UInt(laneBankIdxWidth.W)))
-    val accessReadBankReadBits = Wire(Vec(replayLanes, UInt(L2Access.streamWidthBits.W)))
+    val accessReadBankReadBits = Wire(Vec(replayLanes, UInt(accessStreamWidth.W)))
     val accessReadConsume = Wire(Vec(replayLanes, Bool()))
 
     for (lane <- 0 until replayLanes) {
@@ -268,7 +271,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         accessReadBankReadAddr(lane), accessReadBankReadEn(lane))
 
       queue.io.enq.valid := accessReadFetchPending(lane)
-      queue.io.enq.bits := L2Access.unpack(accessReadBankReadBits(lane))
+      queue.io.enq.bits := accessReadBankReadBits(lane)
       when(canFetch) {
         accessReadCursors(lane) := accessReadCursors(lane) + 1.U
       }
@@ -286,7 +289,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       when(accessReadConsume(lane)) {
         assert(queue.io.deq.valid,
           "TrafficGenBridge consumed an invalid prefetched lane head")
-        assert(queue.io.deq.bits.cycleCount <= target.accessReadCycle,
+        assert(queue.io.deq.bits(191, 128) <= target.accessReadCycle,
           "TrafficGenBridge consumed a lane head before its scheduled cycle")
       }
     }
@@ -467,15 +470,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           when(bank === lane.U) {
             accessStoreWriteEn(lane) := true.B
             accessStoreWriteAddr(lane) := bankIdx(laneBankIdxWidth - 1, 0)
-            accessStoreWriteData(lane) := bramAxi.w.bits.data
+            accessStoreWriteData(lane) := bramAxi.w.bits.data(accessStreamWidth - 1, 0)
           }
         }
       }
       ////
       //  Unused paths since XDMA does not write into issuedAccessWritebackStore or completedBundleIds
-      when(writeRawIssued) {
-        assert(false.B, "TrafficGenBridge does not support XDMA writes to issued-access banks")
-      }
+      assert(!writeRawIssued, "TrafficGenBridge does not support XDMA writes to issued-access banks")
       when(writeRawCompleted) {
         completedBundleIdsWriteEn := true.B
         completedBundleIdsWriteAddr := beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset)(completedBundleBeatIdxWidth - 1, 0)
@@ -508,7 +509,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val axiReadLastReg = RegInit(false.B)
     val axiReadPendingLast = RegInit(false.B)
     val axiReadRouteReg = RegInit(axiReadRouteNone)
-    val axiReadDataReg = Reg(UInt(L2Access.streamWidthBits.W))
+    val axiReadDataReg = Reg(UInt(cpuManagedAXI4Params.dataBits.W))
     val axiReadId = Reg(chiselTypeOf(bramAxi.ar.bits.id))
     val axiReadUser = Reg(chiselTypeOf(bramAxi.ar.bits.user))
 
@@ -554,9 +555,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
                                 TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset,
                               )(completedBundleBeatIdxWidth - 1, 0)
     axiRawCompletedReadEn := axiReadIssue && readRawCompleted
-    val axiAccessReadBits = 0.U(L2Access.streamWidthBits.W)
+    val axiAccessReadBits = 0.U(cpuManagedAXI4Params.dataBits.W)
     val axiIssuedReadBits = Mux1H(
-      UIntToOH(axiRawIssuedReadLaneReg, replayLanes), issuedAccessReadBits)
+      UIntToOH(axiRawIssuedReadLaneReg, replayLanes), issuedAccessReadBits).pad(cpuManagedAXI4Params.dataBits)
     val axiCompletedReadBits = Cat(completedBundleReadBits.reverse)
 
     // drive the axiReadDataReg from the appropriate source based on the address
@@ -582,7 +583,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(axiReadPending) {
       axiReadDataReg := MuxLookup(
         axiReadRouteReg,
-        0.U(L2Access.streamWidthBits.W),
+        0.U(cpuManagedAXI4Params.dataBits.W),
         Seq(
           axiReadRouteAccess -> axiAccessReadBits,
           axiReadRouteIssued -> axiIssuedReadBits,
@@ -737,6 +738,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           UInt64(TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset),
           UInt64(accessWindowBytes),
           UInt64(completedWindowBytes),
+          UInt64(if (key.useRTL) 1 else 0),
         ),
       )
     }

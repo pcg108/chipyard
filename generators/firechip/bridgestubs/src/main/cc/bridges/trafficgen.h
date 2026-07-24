@@ -82,7 +82,6 @@ struct trafficgen_l2_access_t {
   uint64_t id;
   uint64_t address;
   uint64_t cycle_count;
-  uint64_t l1_to_l2_cycle;
   uint64_t elapsed_cycle;
   bool has_timing;
   uint32_t m_subpartition;
@@ -102,13 +101,8 @@ struct trafficgen_l2_access_t {
 
 struct trafficgen_issued_access_point_t {
   std::uint64_t request_uid = 0;
-  std::uint64_t address = 0;
   std::uint64_t cycle_issued = 0;
-  std::uint64_t l1_to_l2_cycle = 0;
-  std::uint64_t elapsed_cycle = 0;
-  unsigned sm_id = 0;
-  unsigned scheduler_id = 0;
-  unsigned warp_id = 0;
+  std::uint64_t address = 0;
   bool is_write = false;
 };
 
@@ -169,7 +163,8 @@ public:
                uint64_t raw_issued_access_writeback_store_offset,
                uint64_t raw_completed_bundle_ids_offset,
                uint64_t access_window_bytes,
-               uint64_t completed_window_bytes);
+               uint64_t completed_window_bytes,
+               uint64_t use_rtl_engine);
 
   ~trafficgen_t() override;
 
@@ -187,6 +182,7 @@ private:
   const uint64_t raw_completed_bundle_ids_offset;
   const uint64_t access_window_bytes;
   const uint64_t completed_window_bytes;
+  const bool use_rtl_engine;
   std::uint64_t min_issue_cycle = 0;
   double memory_issue_stretch_scale = 1.0;
   bool has_first_issue_cycle = false;
@@ -199,8 +195,6 @@ private:
   std::map<std::uint64_t, std::vector<trafficgen_l2_access_t>>
       pending_accesses_by_cycle;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
-  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_l1_to_l2_by_id;
-  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_elapsed_by_id;
   std::uint64_t logical_issue_cycle = 0;
   std::unordered_map<std::uint64_t, trafficgen_logical_inflight_access_t>
       logical_inflight_accesses_by_id;
@@ -216,7 +210,7 @@ private:
       completed_bundle_stream_bytes{};
   size_t completed_bundle_bytes_received = 0;
   bool completed_bundle_read_issued = false;
-  std::vector<trafficgen_l2_access_t> issued_access_writeback_entries;
+  std::vector<trafficgen_issued_access_point_t> issued_access_writeback_entries;
   std::vector<uint8_t> issued_access_writeback_stream_bytes;
   uint32_t issued_access_writeback_count = 0;
   size_t issued_access_writeback_bytes_received = 0;
@@ -254,7 +248,7 @@ private:
   void write_upload_lane_count(unsigned lane, std::uint32_t count);
   std::uint32_t read_issued_lane_count(unsigned lane);
   void depopulate_target_accesses(
-      const std::vector<trafficgen_l2_access_t> &issued_accesses);
+      const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);
   bool complete_bundle_is_current_wake(std::uint64_t bundle_id);
   void record_completed_bundle_id(std::uint64_t bundle_id);

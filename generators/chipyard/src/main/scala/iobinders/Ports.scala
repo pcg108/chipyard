@@ -20,7 +20,13 @@ import freechips.rocketchip.subsystem.{MemoryPortParams, MasterPortParams, Slave
 import freechips.rocketchip.devices.debug.{ClockedDMIIO}
 import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
-import firechip.bridgeinterfaces.{CompletedBundleIds, IssuedAccessBatch, L2Access, TrafficGenAccessBatch}
+import firechip.bridgeinterfaces.{
+  CompletedBundleIds,
+  IssuedAccessBatch,
+  L2Access,
+  RTLL2Access,
+  TrafficGenAccessBatch,
+}
 
 trait Port[T <: Data] {
   val getIO: () => T
@@ -121,7 +127,7 @@ case class OffchipSelPort  (val getIO: () => UInt)
 case class CTCPort (val getIO: () => Data, val portId: Int) 
     extends Port[Data]
 
-class TrafficGenPortPeripheralIO extends Bundle {
+class TrafficGenPortPeripheralIO(useRTL: Boolean) extends Bundle {
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -144,7 +150,9 @@ class TrafficGenPortPeripheralIO extends Bundle {
   val accessReadBatchReady = Output(Bool())
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
-  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
+  private val accessStreamWidth =
+    if (useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
+  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, UInt(accessStreamWidth.W)))
   val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())

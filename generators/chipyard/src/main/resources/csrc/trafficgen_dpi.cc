@@ -79,7 +79,6 @@ struct Access {
   bool wakeRelevantBundle = false;
   bool isWrite = false;
   bool warpBlocked = false;
-  std::uint64_t l1ToL2Cycle = 0;
   std::string kernelFolder;
 
   WarpKey warpKey() const { return WarpKey{smId, schedulerId, warpId}; }
@@ -91,7 +90,6 @@ private:
     ar & id;
     ar & address;
     ar & cycleCount;
-    ar & l1ToL2Cycle;
     ar & subpartition;
     ar & setIndex;
     ar & tag;
@@ -133,11 +131,6 @@ struct DebugCompletionEvent {
 };
 
 using TimingMap = std::unordered_map<std::uint64_t, int>;
-struct AccessMetadata {
-  std::uint64_t l1ToL2Cycle = 0;
-  std::string kernelFolder;
-};
-using AccessMetadataMap = std::unordered_map<std::uint64_t, AccessMetadata>;
 using SchedulerKey = std::tuple<std::string, std::string, unsigned, unsigned>;
 using ReservedSubpartitionsByCycle = std::map<std::uint64_t, std::set<unsigned>>;
 
@@ -174,13 +167,8 @@ bool dpiArrayBit(const svBit *array, int idx) {
 
 struct IssuedAccessPoint {
   std::uint64_t requestUid = 0;
-  std::uint64_t address = 0;
   std::uint64_t cycleIssued = 0;
-  std::uint64_t l1ToL2Cycle = 0;
-  std::uint64_t elapsedCycle = 0;
-  unsigned smId = 0;
-  unsigned schedulerId = 0;
-  unsigned warpId = 0;
+  std::uint64_t address = 0;
   bool isWrite = false;
 
 private:
@@ -188,13 +176,8 @@ private:
   template <class Archive>
   void serialize(Archive &ar, const unsigned int /*version*/) {
     ar & requestUid;
-    ar & address;
     ar & cycleIssued;
-    ar & l1ToL2Cycle;
-    ar & elapsedCycle;
-    ar & smId;
-    ar & schedulerId;
-    ar & warpId;
+    ar & address;
     ar & isWrite;
   }
 };
@@ -402,37 +385,6 @@ std::vector<std::filesystem::path> findTimingFiles(unsigned smId,
   return matches;
 }
 
-std::vector<std::filesystem::path> findL1RequestFiles(unsigned smId,
-                                                      unsigned schedulerId) {
-  static std::map<SchedulerKey, std::vector<std::filesystem::path>> cache;
-  const auto &config = runtimeConfig();
-  const SchedulerKey key{
-      config.traceRoot.string(), config.kernelName, smId, schedulerId};
-  const auto found = cache.find(key);
-  if (found != cache.end()) {
-    return found->second;
-  }
-
-  std::vector<std::filesystem::path> matches;
-  std::error_code ec;
-  const std::filesystem::path root = config.traceRoot;
-  if (!std::filesystem::exists(root, ec)) {
-    cache.emplace(key, matches);
-    return matches;
-  }
-
-  const auto requestPath =
-      root / config.kernelName / ("shader_" + std::to_string(smId)) /
-      ("scheduler_" + std::to_string(schedulerId)) / "l1_to_l2_requests.txt";
-  if (std::filesystem::exists(requestPath, ec) &&
-      std::filesystem::is_regular_file(requestPath, ec)) {
-    matches.push_back(requestPath);
-  }
-
-  cache.emplace(key, matches);
-  return matches;
-}
-
 bool parseTimingLine(const std::string &line,
                      std::uint64_t &requestUidOut,
                      int &elapsedCycleOut) {
@@ -460,33 +412,6 @@ bool parseTimingLine(const std::string &line,
   return true;
 }
 
-bool parseL1RequestLine(const std::string &line,
-                        std::uint64_t &requestUidOut,
-                        std::uint64_t &l1ToL2CycleOut) {
-  std::unordered_map<std::string, std::string> fields;
-  std::istringstream stream(line);
-  std::string token;
-  while (stream >> token) {
-    const std::size_t equalPos = token.find('=');
-    if (equalPos == std::string::npos || equalPos + 1 >= token.size()) {
-      continue;
-    }
-    fields[token.substr(0, equalPos)] = token.substr(equalPos + 1);
-  }
-
-  const auto requestUidIt = fields.find("request_uid");
-  const auto l1ToL2CycleIt = fields.find("l1_to_l2_cycle");
-  if (requestUidIt == fields.end() || l1ToL2CycleIt == fields.end()) {
-    return false;
-  }
-
-  requestUidOut = static_cast<std::uint64_t>(
-      std::strtoull(requestUidIt->second.c_str(), nullptr, 0));
-  l1ToL2CycleOut = static_cast<std::uint64_t>(
-      std::strtoull(l1ToL2CycleIt->second.c_str(), nullptr, 0));
-  return true;
-}
-
 const TimingMap &loadTimingData(const std::filesystem::path &timingPath) {
   static std::unordered_map<std::string, TimingMap> timingCache;
   const std::string key = timingPath.lexically_normal().string();
@@ -509,31 +434,6 @@ const TimingMap &loadTimingData(const std::filesystem::path &timingPath) {
   return timingCache.emplace(key, std::move(timings)).first->second;
 }
 
-const AccessMetadataMap &loadAccessMetadata(
-    const std::filesystem::path &requestPath) {
-  static std::unordered_map<std::string, AccessMetadataMap> metadataCache;
-  const std::string key = requestPath.lexically_normal().string();
-  const auto found = metadataCache.find(key);
-  if (found != metadataCache.end()) {
-    return found->second;
-  }
-
-  const std::string kernelFolder =
-      requestPath.parent_path().parent_path().parent_path().filename().string();
-  AccessMetadataMap metadata;
-  std::ifstream ifs(requestPath);
-  std::string line;
-  while (std::getline(ifs, line)) {
-    std::uint64_t requestUid = 0;
-    std::uint64_t l1ToL2Cycle = 0;
-    if (parseL1RequestLine(line, requestUid, l1ToL2Cycle)) {
-      metadata[requestUid] = AccessMetadata{l1ToL2Cycle, kernelFolder};
-    }
-  }
-
-  return metadataCache.emplace(key, std::move(metadata)).first->second;
-}
-
 bool findAccessTime(const Access &access, int &accessTime) {
   const auto timingFiles = findTimingFiles(access.smId, access.schedulerId);
   for (const auto &timingFile : timingFiles) {
@@ -545,20 +445,6 @@ bool findAccessTime(const Access &access, int &accessTime) {
     }
   }
   return false;
-}
-
-Access enrichAccessMetadata(Access access) {
-  const auto requestFiles = findL1RequestFiles(access.smId, access.schedulerId);
-  for (const auto &requestFile : requestFiles) {
-    const auto &metadata = loadAccessMetadata(requestFile);
-    const auto it = metadata.find(access.id);
-    if (it != metadata.end()) {
-      access.l1ToL2Cycle = it->second.l1ToL2Cycle;
-      access.kernelFolder = it->second.kernelFolder;
-      break;
-    }
-  }
-  return access;
 }
 
 std::ofstream &dpiLog() {
@@ -887,10 +773,8 @@ public:
           (!mAccessReadRespConsumed ||
            accessReadRespId != mLastConsumedAccessReadRespId);
       if (newAccessReadResp) {
-        for (const auto &access : accessReadBatch) {
-          auto enrichedAccess = enrichAccessMetadata(access);
-          mLoadedAccesses.push_back(std::move(enrichedAccess));
-        }
+        mLoadedAccesses.insert(
+            mLoadedAccesses.end(), accessReadBatch.begin(), accessReadBatch.end());
         mAccessReadRespConsumed = true;
         mLastConsumedAccessReadRespId = accessReadRespId;
         if (accessReadBucketDone) {
@@ -1332,13 +1216,8 @@ private:
           mIssuedQueue.push_back(issuedAccess);
           mIssuedAccessPoints.push_back(IssuedAccessPoint{
               access.id,
-              access.address,
               mCurrentCycle,
-              access.l1ToL2Cycle,
-              elapsedCycle,
-              static_cast<unsigned>(access.smId),
-              static_cast<unsigned>(access.schedulerId),
-              static_cast<unsigned>(access.warpId),
+              access.address,
               access.isWrite,
           });
           clearReservedSubpartition(access.cycleCount, access.subpartition);

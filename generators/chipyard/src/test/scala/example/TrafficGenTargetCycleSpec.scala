@@ -2,7 +2,7 @@ package chipyard.example
 
 import chisel3._
 import chiseltest._
-import firechip.bridgeinterfaces.{L2Access, TrafficGenAccessBatch}
+import firechip.bridgeinterfaces.{IssuedAccess, RTLL2Access, TrafficGenAccessBatch}
 import org.scalatest.flatspec.AnyFlatSpec
 
 class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
@@ -10,19 +10,12 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
 
   private val allLanes = (BigInt(1) << TrafficGenAccessBatch.lanes) - 1
 
-  private def pokeAccess(access: L2Access, id: BigInt = 0, cycle: BigInt = 0,
+  private def pokeAccess(access: RTLL2Access, id: BigInt = 0, cycle: BigInt = 0,
                          bundleId: BigInt = 0, bundleCount: Int = 1,
                          wake: Boolean = false, blocked: Boolean = false): Unit = {
     access.id.poke(id.U)
     access.address.poke(0.U)
     access.cycleCount.poke(cycle.U)
-    access.mSubpartition.poke(0.U)
-    access.mSetIndex.poke(0.U)
-    access.mTag.poke(0.U)
-    access.mMask.poke(0.U)
-    access.smId.poke(0.U)
-    access.schedulerId.poke(0.U)
-    access.warpId.poke(0.U)
     access.mBundleId.poke(bundleId.U)
     access.mWakeRelevantBundle.poke(wake.B)
     access.mIsWrite.poke(false.B)
@@ -30,13 +23,38 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     access.bundleIssueCount.poke(bundleCount.U)
   }
 
+  private def pokePackedAccess(access: UInt, id: BigInt, cycle: BigInt = 0,
+                               bundleId: BigInt = 0, bundleCount: Int = 1,
+                               wake: Boolean = false, blocked: Boolean = false): Unit = {
+    val packed =
+      id |
+      (cycle << 128) |
+      (bundleId << 192) |
+      ((if (wake) BigInt(1) else BigInt(0)) << 256) |
+      ((if (blocked) BigInt(1) else BigInt(0)) << 258) |
+      (BigInt(bundleCount) << 259)
+    access.poke(packed.U)
+  }
+
+  private def pokeIssued(access: IssuedAccess, id: BigInt = 0, cycle: BigInt = 0,
+                         address: BigInt = 0, isWrite: Boolean = false): Unit = {
+    access.requestUid.poke(id.U)
+    access.cycleIssued.poke(cycle.U)
+    access.address.poke(address.U)
+    access.isWrite.poke(isWrite.B)
+  }
+
   private def packedLane(value: UInt, lane: Int): BigInt =
-    (value.peek().litValue >> (lane * L2Access.streamWidthBits)) &
-      ((BigInt(1) << L2Access.streamWidthBits) - 1)
+    (value.peek().litValue >> (lane * IssuedAccess.streamWidthBits)) &
+      ((BigInt(1) << IssuedAccess.streamWidthBits) - 1)
 
   private def packedId(value: BigInt): BigInt = value & ((BigInt(1) << 64) - 1)
   private def packedCycle(value: BigInt): BigInt =
+    (value >> 64) & ((BigInt(1) << 64) - 1)
+  private def packedAddress(value: BigInt): BigInt =
     (value >> 128) & ((BigInt(1) << 64) - 1)
+  private def packedIsWrite(value: BigInt): Boolean =
+    ((value >> 192) & 1) != 0
 
   private def initialize(dut: TrafficGenRTLEngine, numGenerators: Int): Unit = {
     dut.io.uploadReady.poke(true.B)
@@ -62,7 +80,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
     for (lane <- 0 until TrafficGenAccessBatch.lanes) {
       dut.io.accessReadDataValid(lane).poke(false.B)
-      pokeAccess(dut.io.accessReadData(lane))
+      pokePackedAccess(dut.io.accessReadData(lane), id = 0)
     }
   }
 
@@ -86,7 +104,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       initialize(dut, 16)
       for (lane <- 0 until 16) {
         dut.io.accessReadDataValid(lane).poke(true.B)
-        pokeAccess(dut.io.accessReadData(lane), id = 100 + lane, bundleId = 1000 + lane)
+        pokePackedAccess(dut.io.accessReadData(lane), id = 100 + lane, bundleId = 1000 + lane)
       }
       dut.io.issue(3).ready.poke(false.B)
       startRound(dut)
@@ -115,7 +133,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 2))) { dut =>
       initialize(dut, 1)
       dut.io.accessReadDataValid(0).poke(true.B)
-      pokeAccess(dut.io.accessReadData(0), id = 1, bundleId = 1)
+      pokePackedAccess(dut.io.accessReadData(0), id = 1, bundleId = 1)
       startRound(dut)
       waitFor(dut.io.accessReadEn.peek().litToBoolean, dut)
       dut.io.accessReadPrefetchPauseReq.poke(true.B)
@@ -137,7 +155,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       initialize(dut, 2)
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(lane).poke(true.B)
-        pokeAccess(dut.io.accessReadData(lane), id = lane + 1, bundleId = 77, bundleCount = 2)
+        pokePackedAccess(dut.io.accessReadData(lane), id = lane + 1, bundleId = 77, bundleCount = 2)
       }
       dut.io.issue(1).ready.poke(false.B)
       startRound(dut)
@@ -173,7 +191,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       initialize(dut, 2)
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(lane).poke(true.B)
-        pokeAccess(dut.io.accessReadData(lane), id = 20 + lane, cycle = 3, bundleId = 20 + lane)
+        pokePackedAccess(dut.io.accessReadData(lane), id = 20 + lane, cycle = 3, bundleId = 20 + lane)
       }
       dut.io.issue(1).ready.poke(false.B)
       startRound(dut)
@@ -194,7 +212,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 2))) { dut =>
       initialize(dut, 1)
       dut.io.accessReadDataValid(0).poke(true.B)
-      pokeAccess(dut.io.accessReadData(0), id = 90, bundleId = 90)
+      pokePackedAccess(dut.io.accessReadData(0), id = 90, bundleId = 90)
       startRound(dut)
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
       dut.clock.step()
@@ -209,7 +227,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
 
       // A different request identity releases the suppression without an
       // extra bubble and can be consumed independently.
-      pokeAccess(dut.io.accessReadData(0), id = 91, bundleId = 91)
+      pokePackedAccess(dut.io.accessReadData(0), id = 91, bundleId = 91)
       dut.io.issue(0).valid.expect(true.B)
       dut.io.accessReadConsumeMask.expect(1.U)
       dut.clock.step()
@@ -221,7 +239,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       initialize(dut, 2)
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(lane).poke(true.B)
-        pokeAccess(dut.io.accessReadData(lane), id = 200 + lane,
+        pokePackedAccess(dut.io.accessReadData(lane), id = 200 + lane,
           bundleId = 55, bundleCount = 2)
       }
       startRound(dut)
@@ -238,7 +256,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.accessReadLaneDoneMask.poke((allLanes ^ 3).U)
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(lane).poke(true.B)
-        pokeAccess(dut.io.accessReadData(lane), id = 300 + lane,
+        pokePackedAccess(dut.io.accessReadData(lane), id = 300 + lane,
           bundleId = 55, bundleCount = 2)
       }
       startRound(dut)
@@ -252,18 +270,28 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
   it should "adapt legacy DPI writebacks to consecutive round-robin banks" in {
     test(new LegacyIssuedAccessBatchAdapter) { dut =>
       dut.io.legacy.valid.poke(false.B)
-      pokeAccess(dut.io.legacy.bits)
+      pokeIssued(dut.io.legacy.bits)
       dut.io.batch.ready.poke(true.B)
 
       for (lane <- 0 until 3) {
-        pokeAccess(dut.io.legacy.bits, id = 70 + lane, cycle = 120 + lane)
+        pokeIssued(
+          dut.io.legacy.bits,
+          id = 70 + lane,
+          cycle = 120 + lane,
+          address = 0x1000 + lane,
+          isWrite = lane == 1,
+        )
         dut.io.legacy.valid.poke(true.B)
         dut.clock.step()
         dut.io.legacy.valid.poke(false.B)
         dut.io.batch.valid.expect(true.B)
         dut.io.batch.bits.batchId.expect(lane.U)
         dut.io.batch.bits.validMask.expect((BigInt(1) << lane).U)
-        assert(packedId(packedLane(dut.io.batch.bits.accesses, lane)) == 70 + lane)
+        val packed = packedLane(dut.io.batch.bits.accesses, lane)
+        assert(packedId(packed) == 70 + lane)
+        assert(packedCycle(packed) == 120 + lane)
+        assert(packedAddress(packed) == 0x1000 + lane)
+        assert(packedIsWrite(packed) == (lane == 1))
         dut.clock.step()
       }
       dut.io.legacy.valid.poke(false.B)

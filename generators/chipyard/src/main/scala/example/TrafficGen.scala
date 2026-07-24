@@ -13,7 +13,15 @@ import freechips.rocketchip.tilelink._
 
 import chipyard.iobinders.TrafficGenPortPeripheralIO
 import testchipip.util.ClockedIO
-import firechip.bridgeinterfaces.{CompletedBundleIds, IssuedAccessBatch, L2Access, TrafficGenAccessBatch, TrafficGenRoundExitReason}
+import firechip.bridgeinterfaces.{
+  CompletedBundleIds,
+  IssuedAccess,
+  IssuedAccessBatch,
+  L2Access,
+  RTLL2Access,
+  TrafficGenAccessBatch,
+  TrafficGenRoundExitReason,
+}
 
 sealed trait TrafficGenBackend
 case object TrafficGenDPIBackend extends TrafficGenBackend
@@ -42,7 +50,12 @@ case class TrafficGenParams(
 
 case object TrafficGenKey extends Field[Option[TrafficGenParams]](None)
 
-class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int) extends Bundle {
+class TrafficGenTopIO(
+  val w: Int,
+  val nGenerators: Int,
+  val memOutstanding: Int,
+  val useRTL: Boolean
+) extends Bundle {
 
   //// Target -> Host control/status
 
@@ -97,7 +110,9 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
   // L2 access returned from access store in bridge module
   val accessReadRespValid = Input(Bool())
   val accessReadRespId = Input(UInt(32.W))
-  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, new L2Access))
+  private val accessStreamWidth =
+    if (useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
+  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, UInt(accessStreamWidth.W)))
   val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
@@ -111,8 +126,8 @@ class TrafficGenTopIO(val w: Int, val nGenerators: Int, val memOutstanding: Int)
 
   val memActive = Input(Bool())
   val memInflightAccesses = Input(Vec(nGenerators, UInt(log2Ceil(memOutstanding + 1).W)))
-  val issue = Vec(nGenerators, Decoupled(new L2Access))
-  val completion = Vec(nGenerators, Flipped(Decoupled(new L2Access)))
+  val issue = Vec(nGenerators, Decoupled(new RTLL2Access))
+  val completion = Vec(nGenerators, Flipped(Decoupled(new RTLL2Access)))
 }
 
 trait HasTrafficGenTopIO {
@@ -211,16 +226,16 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
   */
 class LegacyIssuedAccessBatchAdapter extends Module {
   val io = IO(new Bundle {
-    val legacy = Flipped(Decoupled(new L2Access))
+    val legacy = Flipped(Decoupled(new IssuedAccess))
     val batch = Decoupled(new IssuedAccessBatch)
   })
 
   val queue = Module(new Queue(new IssuedAccessBatch, 2))
   val nextBatchId = RegInit(0.U(32.W))
   val nextLane = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes).W))
-  val packedLanes = Wire(Vec(TrafficGenAccessBatch.lanes, UInt(L2Access.streamWidthBits.W)))
+  val packedLanes = Wire(Vec(TrafficGenAccessBatch.lanes, UInt(IssuedAccess.streamWidthBits.W)))
   packedLanes.foreach(_ := 0.U)
-  packedLanes(nextLane) := L2Access.pack(io.legacy.bits)
+  packedLanes(nextLane) := IssuedAccess.pack(io.legacy.bits)
   queue.io.enq.valid := io.legacy.valid
   queue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch)
   queue.io.enq.bits.batchId := nextBatchId
@@ -246,7 +261,8 @@ class LegacyIssuedAccessBatchAdapter extends Module {
 class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTrafficGenTopIO {
   require(params.numGenerators >= 1, "TrafficGenDPIEngine requires at least one generator")
 
-  val io = IO(new TrafficGenTopIO(params.width, params.numGenerators, params.memOutstanding))
+  val io = IO(new TrafficGenTopIO(
+    params.width, params.numGenerators, params.memOutstanding, useRTL = false))
 
   val currentCycleAfterIssue = Wire(UInt(64.W))
   val roundStarted = Wire(Bool())
@@ -276,8 +292,9 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     dpiCompatRequestActive && io.accessReadRespValid && !dpiCompatResponseSuppressed
   dpi.io.access_read_resp_valid := dpiCompatRespValid
   dpi.io.access_read_resp_id := io.accessReadRespId
+  val dpiAccessReadData = VecInit(io.accessReadData.map(L2Access.unpack))
   val dpiDueLaneMask = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
-    io.accessReadDataValid(lane) && io.accessReadData(lane).cycleCount <= dpi.io.access_read_cycle
+    io.accessReadDataValid(lane) && dpiAccessReadData(lane).cycleCount <= dpi.io.access_read_cycle
   }).asUInt
   dpi.io.access_read_data_valid := VecInit(dpiDueLaneMask.asBools)
   // The legacy engine treats bucket_done as "no more accesses are due for
@@ -298,42 +315,32 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   // discrete query transaction.
   dpi.io.access_read_ready := io.accessReadReady && !dpiCompatRequestActive
   for (i <- 0 until TrafficGenAccessBatch.lanes) {
-    dpi.io.access_read_id(i) := io.accessReadData(i).id
-    dpi.io.access_read_address(i) := io.accessReadData(i).address
-    dpi.io.access_read_cycle_count(i) := io.accessReadData(i).cycleCount
-    dpi.io.access_read_subpartition(i) := io.accessReadData(i).mSubpartition
-    dpi.io.access_read_set_index(i) := io.accessReadData(i).mSetIndex
-    dpi.io.access_read_tag(i) := io.accessReadData(i).mTag
-    dpi.io.access_read_mask(i) := io.accessReadData(i).mMask
-    dpi.io.access_read_sm_id(i) := io.accessReadData(i).smId
-    dpi.io.access_read_scheduler_id(i) := io.accessReadData(i).schedulerId
-    dpi.io.access_read_warp_id(i) := io.accessReadData(i).warpId
-    dpi.io.access_read_bundle_id(i) := io.accessReadData(i).mBundleId
-    dpi.io.access_read_wake_relevant_bundle(i) := io.accessReadData(i).mWakeRelevantBundle
-    dpi.io.access_read_is_write(i) := io.accessReadData(i).mIsWrite
-    dpi.io.access_read_warp_blocked(i) := io.accessReadData(i).mWarpBlocked
+    val access = dpiAccessReadData(i)
+    dpi.io.access_read_id(i) := access.id
+    dpi.io.access_read_address(i) := access.address
+    dpi.io.access_read_cycle_count(i) := access.cycleCount
+    dpi.io.access_read_subpartition(i) := access.mSubpartition
+    dpi.io.access_read_set_index(i) := access.mSetIndex
+    dpi.io.access_read_tag(i) := access.mTag
+    dpi.io.access_read_mask(i) := access.mMask
+    dpi.io.access_read_sm_id(i) := access.smId
+    dpi.io.access_read_scheduler_id(i) := access.schedulerId
+    dpi.io.access_read_warp_id(i) := access.warpId
+    dpi.io.access_read_bundle_id(i) := access.mBundleId
+    dpi.io.access_read_wake_relevant_bundle(i) := access.mWakeRelevantBundle
+    dpi.io.access_read_is_write(i) := access.mIsWrite
+    dpi.io.access_read_warp_blocked(i) := access.mWarpBlocked
   }
 
   // Preserve the legacy single-access DPI contract by adapting each record to
   // a one-valid-lane issued batch. The external target/bridge interface remains
   // uniformly batch based for both backends.
   val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter)
-  val dpiIssuedAccess = Wire(new L2Access)
-  dpiIssuedAccess := 0.U.asTypeOf(new L2Access)
-  dpiIssuedAccess.id := dpi.io.issued_access_writeback_id
+  val dpiIssuedAccess = Wire(new IssuedAccess)
+  dpiIssuedAccess.requestUid := dpi.io.issued_access_writeback_id
   dpiIssuedAccess.address := dpi.io.issued_access_writeback_address
-  dpiIssuedAccess.cycleCount := dpi.io.issued_access_writeback_cycle_count
-  dpiIssuedAccess.mSubpartition := dpi.io.issued_access_writeback_subpartition
-  dpiIssuedAccess.mSetIndex := dpi.io.issued_access_writeback_set_index
-  dpiIssuedAccess.mTag := dpi.io.issued_access_writeback_tag
-  dpiIssuedAccess.mMask := dpi.io.issued_access_writeback_mask
-  dpiIssuedAccess.smId := dpi.io.issued_access_writeback_sm_id
-  dpiIssuedAccess.schedulerId := dpi.io.issued_access_writeback_scheduler_id
-  dpiIssuedAccess.warpId := dpi.io.issued_access_writeback_warp_id
-  dpiIssuedAccess.mBundleId := dpi.io.issued_access_writeback_bundle_id
-  dpiIssuedAccess.mWakeRelevantBundle := dpi.io.issued_access_writeback_wake_relevant_bundle
-  dpiIssuedAccess.mIsWrite := dpi.io.issued_access_writeback_is_write
-  dpiIssuedAccess.mWarpBlocked := dpi.io.issued_access_writeback_warp_blocked
+  dpiIssuedAccess.cycleIssued := dpi.io.issued_access_writeback_cycle_count
+  dpiIssuedAccess.isWrite := dpi.io.issued_access_writeback_is_write
 
   issuedBatchAdapter.io.legacy.valid := dpi.io.issued_access_writeback_valid
   issuedBatchAdapter.io.legacy.bits := dpiIssuedAccess
@@ -408,7 +415,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
 
   for (i <- 0 until params.numGenerators) {
     io.issue(i).valid := false.B
-    io.issue(i).bits := 0.U.asTypeOf(new L2Access)
+    io.issue(i).bits := 0.U.asTypeOf(new RTLL2Access)
     io.completion(i).ready := true.B
   }
 }
@@ -418,7 +425,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   require(params.numGenerators <= TrafficGenAccessBatch.lanes,
     "TrafficGenRTLEngine cannot issue more lanes than the bridge access-read batch returns")
 
-  val io = IO(new TrafficGenTopIO(params.width, params.numGenerators, params.memOutstanding))
+  val io = IO(new TrafficGenTopIO(
+    params.width, params.numGenerators, params.memOutstanding, useRTL = true))
 
   val rtlStates = Enum(7)
   val sIdle = rtlStates(0)
@@ -439,10 +447,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
   val lastHasPendingWork = RegInit(false.B)
 
-  val batchAccesses = Reg(Vec(TrafficGenAccessBatch.lanes, new L2Access))
-  val batchValid = RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(false.B)))
-  val batchBucketDone = RegInit(false.B)
-  val batchIssueCursor = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes + params.numGenerators + 1).W))
   val accessReadRespSeen = RegInit(false.B)
   val lastAccessReadRespId = RegInit(0.U(32.W))
 
@@ -462,9 +466,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val bundleOutstanding = RegInit(VecInit(Seq.fill(bundleTableEntries)(0.U(bundleCountWidth.W))))
   val bundleWakeRelevant = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
   val bundleWarpBlocked = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
-  val bundleSmIds = Reg(Vec(bundleTableEntries, UInt(32.W)))
-  val bundleSchedulerIds = Reg(Vec(bundleTableEntries, UInt(8.W)))
-  val bundleWarpIds = Reg(Vec(bundleTableEntries, UInt(32.W)))
   // A bundle ID is intentionally shared across schedulers and may acquire a
   // new tranche of members in a later uploaded round while older members are
   // still outstanding.  Track the target-round generation that most recently
@@ -481,18 +482,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   }
   val completedBundleArb = Module(new RRArbiter(UInt(64.W), params.numGenerators))
   val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
-
-  def batchAccessAt(idx: UInt): L2Access = {
-    val zero = 0.U.asTypeOf(new L2Access)
-    PriorityMux((0 until TrafficGenAccessBatch.lanes).map { i =>
-      (idx === i.U) -> batchAccesses(i)
-    } :+ (true.B -> zero))
-  }
-
-  def batchValidAt(idx: UInt): Bool =
-    PriorityMux((0 until TrafficGenAccessBatch.lanes).map { i =>
-      (idx === i.U) -> batchValid(i)
-    } :+ (true.B -> false.B))
 
   io.startTrafficGen := false.B
   io.targetBusy := state =/= sIdle
@@ -547,7 +536,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   for (i <- 0 until params.numGenerators) {
     io.issue(i).valid := false.B
-    io.issue(i).bits := 0.U.asTypeOf(new L2Access)
+    io.issue(i).bits := 0.U.asTypeOf(new RTLL2Access)
     io.completion(i).ready := false.B
   }
 
@@ -566,9 +555,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val completeEventWakeExit = Wire(Vec(params.numGenerators, Bool()))
   val completeEventWakeRelevant = Wire(Vec(params.numGenerators, Bool()))
   val completeEventWarpBlocked = Wire(Vec(params.numGenerators, Bool()))
-  val completeEventSmId = Wire(Vec(params.numGenerators, UInt(32.W)))
-  val completeEventSchedulerId = Wire(Vec(params.numGenerators, UInt(32.W)))
-  val completeEventWarpId = Wire(Vec(params.numGenerators, UInt(32.W)))
 
   // Forward-declared issue reduction.  Completion reduction starts from this
   // state so simultaneous events are applied in deterministic issue-before-
@@ -580,9 +566,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issueBundleIdNext = Wire(Vec(bundleTableEntries, UInt(64.W)))
   val issueBundleWakeNext = Wire(Vec(bundleTableEntries, Bool()))
   val issueBundleBlockedNext = Wire(Vec(bundleTableEntries, Bool()))
-  val issueBundleSmIdNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
-  val issueBundleSchedulerIdNext = Wire(Vec(bundleTableEntries, UInt(8.W)))
-  val issueBundleWarpIdNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
   val issueBundleRoundNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
 
   var completionValidExpr: Seq[Bool] = (0 until bundleTableEntries).map { e =>
@@ -620,15 +603,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     val oldWarpBlocked = PriorityMux((0 until bundleTableEntries).map { e =>
       matchVec(e) -> completionBlockedExpr(e)
     } :+ (true.B -> false.B))
-    val oldSmId = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> Mux(issueCanFireForReducer, issueBundleSmIdNext(e), bundleSmIds(e))
-    } :+ (true.B -> 0.U(32.W)))
-    val oldSchedulerId = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> Mux(issueCanFireForReducer, issueBundleSchedulerIdNext(e), bundleSchedulerIds(e))
-    } :+ (true.B -> 0.U(8.W)))
-    val oldWarpId = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> Mux(issueCanFireForReducer, issueBundleWarpIdNext(e), bundleWarpIds(e))
-    } :+ (true.B -> 0.U(32.W)))
     val oldRemaining = PriorityMux((0 until bundleTableEntries).map { e =>
       matchVec(e) -> completionRemainingExpr(e)
     } :+ (true.B -> 0.U(16.W)))
@@ -639,9 +613,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     completeEventWakeExit(lane) := willComplete && oldWakeRelevant && oldWarpBlocked
     completeEventWakeRelevant(lane) := oldWakeRelevant
     completeEventWarpBlocked(lane) := oldWarpBlocked
-    completeEventSmId(lane) := oldSmId
-    completeEventSchedulerId(lane) := Cat(0.U(24.W), oldSchedulerId)
-    completeEventWarpId(lane) := oldWarpId
 
     completionCountExpr = (0 until bundleTableEntries).map { e =>
       Mux(active && matchVec(e), oldCount - 1.U, completionCountExpr(e))
@@ -661,9 +632,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val debugRtlCompletionEventBundleId = Wire(UInt(64.W))
   val debugRtlCompletionEventWakeRelevant = Wire(Bool())
   val debugRtlCompletionEventWarpBlocked = Wire(Bool())
-  val debugRtlCompletionEventSmId = Wire(UInt(32.W))
-  val debugRtlCompletionEventSchedulerId = Wire(UInt(32.W))
-  val debugRtlCompletionEventWarpId = Wire(UInt(32.W))
   val debugRtlCompletionEventCycle = Wire(UInt(64.W))
   val debugRtlAnyCompletionEvent = completeEventValid.asUInt.orR
   val debugRtlAnyWakeExit = completeEventWakeExit.asUInt.orR
@@ -679,21 +647,12 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventWakeRelevant(_)))
   debugRtlCompletionEventWarpBlocked :=
     Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventWarpBlocked(_)))
-  debugRtlCompletionEventSmId :=
-    Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventSmId(_)))
-  debugRtlCompletionEventSchedulerId :=
-    Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventSchedulerId(_)))
-  debugRtlCompletionEventWarpId :=
-    Mux1H(debugRtlEventSelect, (0 until params.numGenerators).map(completeEventWarpId(_)))
   debugRtlCompletionEventCycle := targetCycle
   dontTouch(debugRtlCompletionEventValid)
   dontTouch(debugRtlCompletionEventWakeExit)
   dontTouch(debugRtlCompletionEventBundleId)
   dontTouch(debugRtlCompletionEventWakeRelevant)
   dontTouch(debugRtlCompletionEventWarpBlocked)
-  dontTouch(debugRtlCompletionEventSmId)
-  dontTouch(debugRtlCompletionEventSchedulerId)
-  dontTouch(debugRtlCompletionEventWarpId)
   dontTouch(debugRtlCompletionEventCycle)
 
   val completionBundleValidNext = Wire(Vec(bundleTableEntries, Bool()))
@@ -710,21 +669,22 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     completedBundleQueues(lane).io.enq.bits := completeEventId(lane)
   }
 
-  val currentIssueAccess = Wire(Vec(params.numGenerators, new L2Access))
+  val rtlAccessReadData = VecInit(io.accessReadData.map(RTLL2Access.unpack))
+  val currentIssueAccess = Wire(Vec(params.numGenerators, new RTLL2Access))
   val currentIssueValid = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
-    val issuedAccess = Wire(new L2Access)
-    issuedAccess := io.accessReadData(lane)
+    val issuedAccess = Wire(new RTLL2Access)
+    issuedAccess := rtlAccessReadData(lane)
     // Record when this access is actually issued by the target.
     issuedAccess.cycleCount := targetCycle
     currentIssueAccess(lane) := issuedAccess
     val headIsUnconsumed = !consumedHeadPending(lane) ||
-      io.accessReadData(lane).id =/= consumedHeadId(lane)
+      rtlAccessReadData(lane).id =/= consumedHeadId(lane)
     currentIssueValid(lane) := io.accessReadDataValid(lane) && headIsUnconsumed &&
-      io.accessReadData(lane).cycleCount <= targetCycle
+      rtlAccessReadData(lane).cycleCount <= targetCycle
 
     when(!io.accessReadDataValid(lane) ||
-         (consumedHeadPending(lane) && io.accessReadData(lane).id =/= consumedHeadId(lane))) {
+         (consumedHeadPending(lane) && rtlAccessReadData(lane).id =/= consumedHeadId(lane))) {
       consumedHeadPending(lane) := false.B
     }
   }
@@ -774,18 +734,26 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   issuedBatchQueue.io.enq.bits.batchId := issuedBatchId
   issuedBatchQueue.io.enq.bits.validMask := issuedBatchMask
   val issuedBatchPackedAccesses = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
-    if (lane < params.numGenerators) L2Access.pack(currentIssueAccess(lane))
-    else 0.U(L2Access.streamWidthBits.W)
+    if (lane < params.numGenerators) {
+      val issued = Wire(new IssuedAccess)
+      issued.requestUid := currentIssueAccess(lane).id
+      issued.cycleIssued := currentIssueAccess(lane).cycleCount
+      issued.address := currentIssueAccess(lane).address
+      issued.isWrite := currentIssueAccess(lane).mIsWrite
+      IssuedAccess.pack(issued)
+    } else {
+      0.U(IssuedAccess.streamWidthBits.W)
+    }
   })
   issuedBatchQueue.io.enq.bits.accesses := issuedBatchPackedAccesses.asUInt
   io.accessReadConsumeMask := issuedBatchMask
   for (lane <- 0 until params.numGenerators) {
     when(issueFires(lane)) {
       consumedHeadPending(lane) := true.B
-      consumedHeadId(lane) := io.accessReadData(lane).id
+      consumedHeadId(lane) := rtlAccessReadData(lane).id
     }
     when(consumedHeadPending(lane) && io.accessReadDataValid(lane) &&
-         io.accessReadData(lane).id === consumedHeadId(lane)) {
+         rtlAccessReadData(lane).id === consumedHeadId(lane)) {
       assert(!issueFires(lane),
         "TrafficGenRTLEngine re-issued a consumed bridge head")
     }
@@ -818,9 +786,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   var issueIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIds(_))
   var issueWakeExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWakeRelevant(_))
   var issueBlockedExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWarpBlocked(_))
-  var issueSmIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleSmIds(_))
-  var issueSchedulerIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleSchedulerIds(_))
-  var issueWarpIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleWarpIds(_))
   var issueRoundExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIssueRound(_))
 
   for (lane <- 0 until params.numGenerators) {
@@ -877,15 +842,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       val priorBlocked = Mux(matchVec(e), issueBlockedExpr(e), false.B)
       Mux(active && (matchVec(e) || allocOH(e)), priorBlocked || access.mWarpBlocked, issueBlockedExpr(e))
     }
-    issueSmIdExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && (matchVec(e) || allocOH(e)), access.smId, issueSmIdExpr(e))
-    }
-    issueSchedulerIdExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && (matchVec(e) || allocOH(e)), access.schedulerId, issueSchedulerIdExpr(e))
-    }
-    issueWarpIdExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && (matchVec(e) || allocOH(e)), access.warpId, issueWarpIdExpr(e))
-    }
     issueRoundExpr = (0 until bundleTableEntries).map { e =>
       Mux((active && allocOH(e)) || (startsNewTranche && matchVec(e)),
         issueRoundId, issueRoundExpr(e))
@@ -899,9 +855,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     issueBundleIdNext(e) := issueIdExpr(e)
     issueBundleWakeNext(e) := issueWakeExpr(e)
     issueBundleBlockedNext(e) := issueBlockedExpr(e)
-    issueBundleSmIdNext(e) := issueSmIdExpr(e)
-    issueBundleSchedulerIdNext(e) := issueSchedulerIdExpr(e)
-    issueBundleWarpIdNext(e) := issueWarpIdExpr(e)
     issueBundleRoundNext(e) := issueRoundExpr(e)
   }
 
@@ -936,9 +889,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
       completedBundleCount := 0.U
-      batchValid.foreach(_ := false.B)
-      batchBucketDone := false.B
-      batchIssueCursor := 0.U
       accessReadRespSeen := false.B
       lastAccessReadRespId := 0.U
       lastHasPendingWork := false.B
@@ -984,9 +934,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         bundleIds(e) := issueBundleIdNext(e)
         bundleWakeRelevant(e) := issueBundleWakeNext(e)
         bundleWarpBlocked(e) := issueBundleBlockedNext(e)
-        bundleSmIds(e) := issueBundleSmIdNext(e)
-        bundleSchedulerIds(e) := issueBundleSchedulerIdNext(e)
-        bundleWarpIds(e) := issueBundleWarpIdNext(e)
         bundleIssueRound(e) := issueBundleRoundNext(e)
       }
       when(completionCanFire && completeEventWakeExit.asUInt.orR) {
@@ -1036,7 +983,12 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
   override lazy val module = new TrafficGenImpl
 
   class TrafficGenImpl extends Impl with HasTrafficGenTopIO {
-    val io = IO(new TrafficGenTopIO(params.width, params.numGenerators, params.memOutstanding))
+    val io = IO(new TrafficGenTopIO(
+      params.width,
+      params.numGenerators,
+      params.memOutstanding,
+      useRTL = params.backend == TrafficGenRTLBackend,
+    ))
 
     withClockAndReset(clock, reset) {
 
@@ -1128,8 +1080,8 @@ class TrafficGenMemIO(params: TrafficGenParams) extends Bundle {
   val active = Output(Bool())
   val inflightAccessCount = Output(UInt(log2Ceil(params.memOutstanding + 1).W))
   val coreOffset = Input(UInt(32.W))
-  val req = Flipped(Decoupled(new L2Access))
-  val completion = Decoupled(new L2Access)
+  val req = Flipped(Decoupled(new RTLL2Access))
+  val completion = Decoupled(new RTLL2Access)
 }
 
 abstract class TrafficGenMemBase(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
@@ -1179,12 +1131,12 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
       val (mem, edge) = outer.node.out(0)
       dontTouch(io.coreOffset)
 
-      val issueQueue = Module(new Queue(new L2Access, params.memOutstanding))
-      val completionQueue = Module(new Queue(new L2Access, params.memOutstanding))
+      val issueQueue = Module(new Queue(new RTLL2Access, params.memOutstanding))
+      val completionQueue = Module(new Queue(new RTLL2Access, params.memOutstanding))
       val inflightValid = RegInit(VecInit(Seq.fill(params.memOutstanding)(false.B)))
-      val inflightAccesses = Reg(Vec(params.memOutstanding, new L2Access))
+      val inflightAccesses = Reg(Vec(params.memOutstanding, new RTLL2Access))
       val senderValid = RegInit(false.B)
-      val senderAccess = Reg(new L2Access)
+      val senderAccess = Reg(new RTLL2Access)
       val sourceIdxWidth = log2Ceil(params.memOutstanding max 2)
       val senderSource = Reg(UInt(sourceIdxWidth.W))
       val freeSourceOH = VecInit(inflightValid.map(v => !v)).asUInt
@@ -1318,8 +1270,8 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
       val (mem, edge) = outer.node.out(0)
       dontTouch(io.coreOffset)
 
-      val issueQueue = Module(new Queue(new L2Access, params.memOutstanding))
-      val completionQueue = Module(new Queue(new L2Access, params.memOutstanding))
+      val issueQueue = Module(new Queue(new RTLL2Access, params.memOutstanding))
+      val completionQueue = Module(new Queue(new RTLL2Access, params.memOutstanding))
       val sourceIdxWidth = log2Ceil(params.memOutstanding max 2)
       val beatIdxWidth = log2Ceil(blockBeats max 2)
       val beatBits = beatBytes * 8
@@ -1330,17 +1282,17 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
       val sInvalid :: sAcquire :: sWaitGrant :: sReleaseClean :: sReleaseDirty :: sWaitReleaseAck :: Nil = Enum(6)
       val sourceStates = RegInit(VecInit(Seq.fill(params.memOutstanding)(sInvalid)))
       val inflightValid = RegInit(VecInit(Seq.fill(params.memOutstanding)(false.B)))
-      val inflightAccesses = Reg(Vec(params.memOutstanding, new L2Access))
+      val inflightAccesses = Reg(Vec(params.memOutstanding, new RTLL2Access))
       val inflightLineAddrs = Reg(Vec(params.memOutstanding, UInt(64.W)))
       val inflightAccessBeatBases = Reg(Vec(params.memOutstanding, UInt(beatIdxWidth.W)))
       val lineData = Reg(Vec(params.memOutstanding, Vec(blockBeats, UInt(beatBits.W))))
 
       val senderValid = RegInit(false.B)
-      val senderAccess = Reg(new L2Access)
+      val senderAccess = Reg(new RTLL2Access)
       val senderSource = Reg(UInt(sourceIdxWidth.W))
       val senderLineAddr = Reg(UInt(64.W))
 
-      def selectedAddress(access: L2Access): UInt = {
+      def selectedAddress(access: RTLL2Access): UInt = {
         val rawAddr = access.address + io.coreOffset
         val remappedAddr = params.remapBase.U(64.W) + access.address(31, 0)
         Mux(params.remapTraceAddresses.B, remappedAddr, rawAddr)
@@ -1604,7 +1556,8 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
     }
 
     InModuleBody {
-      val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO)).suggestName("trafficgen")
+      val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO(
+        params.backend == TrafficGenRTLBackend))).suggestName("trafficgen")
       dontTouch(outerIO)
 
       outerIO.clock := trafficGenTL.module.clock
