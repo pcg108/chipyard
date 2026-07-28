@@ -442,6 +442,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   val state = RegInit(sIdle)
   val targetCycle = RegInit(0.U(64.W))
+  val targetTimeStarted = RegInit(false.B)
   val roundCapacityBounded = RegInit(false.B)
   val wakeExitPending = RegInit(false.B)
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
@@ -916,18 +917,31 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val minExitReady =
     roundReachedMin &&
     (!accessReadConsumePending || allAccessLanesDone)
+  val acceptingRound =
+    state === sIdle && io.startRound && io.uploadReady
+  val startingWorkload =
+    acceptingRound && !targetTimeStarted
 
   io.accessReadCycle := targetCycle
   io.accessReadEn := state === sIssueBatch && issueWindowOpen
   io.accessReadBatchReady := state === sIssueBatch && issueWindowOpen
 
-  // Target time is free-running in the target clock domain. The bridge's
-  // HostPort fire gating is the sole authority over whether a target clock
-  // edge occurs; engine state and scheduling boundaries must not freeze time.
-  targetCycle := targetCycle + 1.U
+  // The workload's target-time epoch begins on the first accepted round. Until
+  // then the socket scheduler's initialization cycle and the RTL both remain
+  // at zero even while the rest of the target boots. Once armed, target time is
+  // free-running: HostPort fire gating is the sole authority over whether a
+  // target edge occurs, and engine state or scheduling boundaries never stop
+  // it.
+  when(targetTimeStarted || startingWorkload) {
+    targetCycle := targetCycle + 1.U
+  }
+  when(startingWorkload) {
+    targetTimeStarted := true.B
+  }
+  dontTouch(targetTimeStarted)
 
   when(state === sIdle) {
-    when(io.startRound && io.uploadReady) {
+    when(acceptingRound) {
       roundCapacityBounded := io.accessStoreHasMore
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
@@ -1020,6 +1034,40 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       io.completedBundleCountWriteData := completedBundleCount
       io.roundComplete := true.B
       state := sIdle
+    }
+  }
+
+  // The bridge asserts trafficGenDone only after the scheduler has consumed
+  // the final round outputs and reported global workload completion. Reset all
+  // workload-scoped state while the level remains asserted so a later kernel
+  // can establish a fresh cycle-zero epoch without resetting the machine.
+  when(io.trafficGenDone) {
+    assert(state === sIdle,
+      "TrafficGenRTLEngine workload completed while a round was active")
+    assert(!io.memActive && !bundleTableHasInflight,
+      "TrafficGenRTLEngine workload completed with memory requests in flight")
+    assert(outputQueuesEmpty,
+      "TrafficGenRTLEngine workload completed with undrained outputs")
+
+    state := sIdle
+    targetCycle := 0.U
+    targetTimeStarted := false.B
+    roundCapacityBounded := false.B
+    wakeExitPending := false.B
+    roundExitReasonReg := TrafficGenRoundExitReason.scheduling
+    lastHasPendingWork := false.B
+    lastAccessReadRespId := io.accessReadRespId
+    accessReadConsumePending := false.B
+    issuedBatchId := 0.U
+    completedBundleCount := 0.U
+    for (e <- 0 until bundleTableEntries) {
+      bundleValid(e) := false.B
+      bundleIds(e) := 0.U
+      bundleRemainingToIssue(e) := 0.U
+      bundleOutstanding(e) := 0.U
+      bundleWakeRelevant(e) := false.B
+      bundleWarpBlocked(e) := false.B
+      bundleIssueRound(e) := 0.U
     }
   }
 }

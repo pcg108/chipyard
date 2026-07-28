@@ -112,7 +112,6 @@ enum class trafficgen_state_t {
   UPLOAD_SCHEDULE,
   ISSUING_TRAFFIC,
   READING_TRAFFICGEN_OUTPUT,
-  DONE,
 };
 
 class trafficgen_t final : public bridge_driver_t {
@@ -195,6 +194,7 @@ private:
   void push_upload_data();
   void write_schedule_to_bram();
   void connect_gpu_model_socket();
+  void reset_workload_state();
   bool receive_main_loop_complete_from_gpu_model() const;
   void send_reserved_subpartitions_snapshot(
       const L2SubpartitionReservationsByCycle &reservations) const;

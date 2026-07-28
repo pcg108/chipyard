@@ -163,14 +163,21 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "run target time in idle and stop issue at the minimum cycle" in {
+  it should "start target time with round one and stop issue at the minimum cycle" in {
     test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 2, memOutstanding = 2))) { dut =>
       initialize(dut, 2)
-      val idleCycle = dut.io.currentCycleAfterIssue.peek().litValue
       dut.clock.step(3)
-      dut.io.currentCycleAfterIssue.expect((idleCycle + 3).U)
+      dut.io.currentCycleAfterIssue.expect(0.U)
 
-      val minCycle = dut.io.currentCycleAfterIssue.peek().litValue + 8
+      // A start request cannot establish the workload epoch until its upload
+      // has been accepted.
+      dut.io.uploadReady.poke(false.B)
+      startRound(dut)
+      dut.io.currentCycleAfterIssue.expect(0.U)
+      dut.io.targetBusy.expect(false.B)
+      dut.io.uploadReady.poke(true.B)
+
+      val minCycle = BigInt(8)
       dut.io.minIssueCycle.poke(minCycle.U)
       dut.io.accessReadDataValid(0).poke(true.B)
       dut.io.accessReadDataValid(1).poke(true.B)
@@ -206,15 +213,113 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
       dut.io.hasPendingWork.expect(true.B)
       dut.clock.step()
+      val idleCycle = dut.io.currentCycleAfterIssue.peek().litValue
+      dut.clock.step(3)
+      dut.io.currentCycleAfterIssue.expect((idleCycle + 3).U)
 
       // The unconsumed boundary-cycle head remains available to the next
       // scheduler round and receives its actual later target issue cycle.
       val nextMinCycle = dut.io.currentCycleAfterIssue.peek().litValue + 8
       dut.io.minIssueCycle.poke(nextMinCycle.U)
+      val beforeLaterRound = dut.io.currentCycleAfterIssue.peek().litValue
       startRound(dut)
+      dut.io.currentCycleAfterIssue.expect((beforeLaterRound + 1).U)
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 2, dut)
       assert(dut.io.issue(1).bits.cycleCount.peek().litValue < nextMinCycle)
       dut.clock.step()
+    }
+  }
+
+  it should "reset and rearm workload time and bundle bookkeeping at global completion" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 2))) { dut =>
+      initialize(dut, 1)
+      val noBoundary = (BigInt(1) << 64) - 1
+      dut.io.minIssueCycle.poke(noBoundary.U)
+      dut.io.accessReadDataValid(0).poke(true.B)
+      pokePackedAccess(
+        dut.io.accessReadData(0),
+        id = 800,
+        bundleId = 80,
+        bundleCount = 2,
+        generation = 1,
+      )
+
+      startRound(dut)
+      dut.io.currentCycleAfterIssue.expect(1.U)
+      waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
+      val firstTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
+      dut.clock.step()
+      dut.io.accessReadDataValid(0).poke(false.B)
+      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadRespId.poke(1.U)
+
+      // Return the only resident member. The bundle-table entry remains valid
+      // because one member is expected from a later round.
+      pokeAccess(
+        dut.io.completion(0).bits,
+        id = 800,
+        bundleId = firstTrackingToken,
+        bundleCount = 2,
+      )
+      dut.io.completion(0).valid.poke(true.B)
+      waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+      dut.clock.step()
+      dut.io.completion(0).valid.poke(false.B)
+      waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
+      dut.clock.step()
+      val idleCycle = dut.io.currentCycleAfterIssue.peek().litValue
+      dut.clock.step(3)
+      dut.io.currentCycleAfterIssue.expect((idleCycle + 3).U)
+
+      dut.io.trafficGenDone.poke(true.B)
+      dut.clock.step()
+      dut.io.currentCycleAfterIssue.expect(0.U)
+      dut.io.targetBusy.expect(false.B)
+      dut.io.hasPendingWork.expect(false.B)
+      dut.clock.step(5)
+      dut.io.currentCycleAfterIssue.expect(0.U)
+
+      // Reuse the same externally visible bundle ID and generation. If the
+      // prior workload's incomplete table entry survived, this single member
+      // would incorrectly finish that old bundle.
+      dut.io.trafficGenDone.poke(false.B)
+      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 1).U)
+      dut.io.accessReadDataValid(0).poke(true.B)
+      // Give the second round a finite scheduling boundary. The purpose of
+      // this phase is to prove that the old bundle entry was cleared; it must
+      // not rely on the no-next-access sentinel to select the round exit.
+      dut.io.minIssueCycle.poke(8.U)
+      pokePackedAccess(
+        dut.io.accessReadData(0),
+        id = 801,
+        bundleId = 80,
+        bundleCount = 2,
+        generation = 1,
+      )
+      startRound(dut)
+      dut.io.currentCycleAfterIssue.expect(1.U)
+      waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
+      val secondTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
+      dut.clock.step()
+      dut.io.accessReadDataValid(0).poke(false.B)
+      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadRespId.poke(2.U)
+
+      pokeAccess(
+        dut.io.completion(0).bits,
+        id = 801,
+        bundleId = secondTrackingToken,
+        bundleCount = 2,
+      )
+      dut.io.completion(0).valid.poke(true.B)
+      waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+      dut.clock.step()
+      dut.io.completion(0).valid.poke(false.B)
+      for (_ <- 0 until 5) {
+        dut.io.completedBundleIdWriteEn.expect(false.B)
+        dut.clock.step()
+      }
+      dut.io.targetBusy.expect(false.B)
     }
   }
 

@@ -572,11 +572,17 @@ public:
   socket_client_t(const socket_client_t &) = delete;
   socket_client_t &operator=(const socket_client_t &) = delete;
 
-  void connect_loopback(std::uint16_t port) {
+  bool is_connected() const { return fd >= 0; }
+
+  void disconnect() {
     if (fd >= 0) {
       close(fd);
       fd = -1;
     }
+  }
+
+  void connect_loopback(std::uint16_t port) {
+    disconnect();
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -710,6 +716,11 @@ void trafficgen_t::init() {
   clear_round_log_entries(round_log_root);
   clear_round_log_entries(kSocketRoundLogRoot);
 
+  engine_round_number = 0;
+  reset_workload_state();
+}
+
+void trafficgen_t::reset_workload_state() {
   completed_bundle_ids.fill(0);
   completed_bundle_count = 0;
   completed_bundle_stream_bytes.fill(0);
@@ -722,7 +733,6 @@ void trafficgen_t::init() {
   issued_access_writeback_read_issued = false;
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
-  engine_round_number = 0;
   current_round_all_l2_trace_steps.clear();
   current_round_blocked_warp_ids.clear();
   min_issue_cycle = 0;
@@ -1360,11 +1370,20 @@ void trafficgen_t::tick() {
       // pause the target clock 
       write(mmio_addrs.pause_target, 1);
 
+      // The first workload is connected during init. Later workloads reconnect
+      // to a freshly launched one-kernel scheduler after the prior scheduler
+      // has reported global completion and disconnected.
+      if (!gpu_model_socket_client ||
+          !gpu_model_socket_client->is_connected()) {
+        connect_gpu_model_socket();
+      }
+
       // if the full kernel scheduling is complete, then return to IDLE
       if (receive_main_loop_complete_from_gpu_model()) {
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
-        state = trafficgen_state_t::DONE;
+        gpu_model_socket_client->disconnect();
+        reset_workload_state();
         break;
       }
 
@@ -1563,9 +1582,15 @@ void trafficgen_t::tick() {
 
       if (receive_main_loop_complete_from_gpu_model()) {
         // indicate to target that trafficgen is done and unpause target
+        if (engine_has_pending_work || !pending_access_cycle_by_id.empty()) {
+          throw std::runtime_error(
+              "gpu_model completed a workload while TrafficGen still had "
+              "pending work");
+        }
         write(mmio_addrs.trafficgen_done, 1);
         write(mmio_addrs.pause_target, 1);
-        state = trafficgen_state_t::DONE;
+        gpu_model_socket_client->disconnect();
+        reset_workload_state();
       } else {
         issued_access_writeback_entries.clear();
         issued_access_writeback_stream_bytes.clear();
@@ -1578,10 +1603,6 @@ void trafficgen_t::tick() {
         state = trafficgen_state_t::SEND_RESERVED_PARTITIONS;
       }
     }
-    break;
-  case trafficgen_state_t::DONE:
-    // Terminal state: do not sample the start doorbell again while the final
-    // done/unpause MMIO pulses propagate to the target.
     break;
   }
 }
