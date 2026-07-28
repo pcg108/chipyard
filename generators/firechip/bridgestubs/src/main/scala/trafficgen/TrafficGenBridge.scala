@@ -68,6 +68,7 @@ object TrafficGenBridge {
     trafficGenIO.accessStoreCount := ep.io.trafficgen.accessStoreCount
     trafficGenIO.accessStoreMaxCycle := ep.io.trafficgen.accessStoreMaxCycle
     trafficGenIO.accessStoreHasEntries := ep.io.trafficgen.accessStoreHasEntries
+    trafficGenIO.accessStoreHasMore := ep.io.trafficgen.accessStoreHasMore
     trafficGenIO.uploadReady := ep.io.trafficgen.uploadReady
     ep.io.clock := clock
     ep.io.reset := reset

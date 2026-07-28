@@ -625,6 +625,7 @@ public:
       std::uint32_t accessStoreCount,
       std::uint64_t accessStoreMaxCycle,
       svBit accessStoreHasEntries,
+      svBit accessStoreHasMore,
       std::uint64_t minIssueCycle,
       svBit accessReadRespValid,
       std::uint32_t accessReadRespId,
@@ -720,8 +721,7 @@ public:
         mRoundCurrentCycle = mCurrentCycle;
         mRoundHasPendingWork = false;
         mRoundExitReason = kRoundExitScheduling;
-        mRoundCapacityBounded =
-            accessStoreHasEntries && accessStoreMaxCycle < minIssueCycle;
+        mRoundCapacityBounded = accessStoreHasMore;
         mRoundHasFutureIssueWork =
             accessStoreHasEntries && accessStoreMaxCycle > mAccessLoadEndCycle;
         mRoundMinIssueCycle = minIssueCycle;
@@ -1085,7 +1085,8 @@ private:
     const auto finalizeResult = [this, &pendingByCycle](bool schedulingExit) {
       mRoundCurrentCycle = mCurrentCycle;
       mRoundHasPendingWork =
-          !pendingByCycle.empty() || mRoundHasFutureIssueWork || !mInflight.empty();
+          !pendingByCycle.empty() || mRoundHasFutureIssueWork ||
+          mRoundCapacityBounded || !mInflight.empty();
       if (schedulingExit) {
         mRoundExitReason = kRoundExitScheduling;
       } else if (mRoundCapacityBounded && pendingByCycle.empty() &&
@@ -1299,6 +1300,7 @@ extern "C" void trafficgen_dpi_step(
     unsigned int access_store_count,
     unsigned long long access_store_max_cycle,
     svBit access_store_has_entries,
+    svBit access_store_has_more,
     unsigned long long min_issue_cycle,
     svBit access_read_resp_valid,
     unsigned int access_read_resp_id,
@@ -1403,6 +1405,7 @@ extern "C" void trafficgen_dpi_step(
       access_store_count,
       access_store_max_cycle,
       access_store_has_entries,
+      access_store_has_more,
       min_issue_cycle,
       access_read_resp_valid,
       access_read_resp_id,

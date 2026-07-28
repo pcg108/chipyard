@@ -163,6 +163,7 @@ class TrafficGenPortPeripheralIO(useRTL: Boolean) extends Bundle {
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
+  val accessStoreHasMore = Input(Bool())
   val uploadReady = Input(Bool())
 }
 

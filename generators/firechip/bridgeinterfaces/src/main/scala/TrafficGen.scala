@@ -90,12 +90,17 @@ class RTLL2Access extends Bundle {
   val mIsWrite = Bool()
   val mWarpBlocked = Bool()
   val bundleIssueCount = UInt(16.W)
+  // Transport identity for the GPU scheduling round that introduced this
+  // access. Pending accesses keep this value across later host round trips
+  // and BRAM-capacity refills.
+  val bundleGeneration = UInt(32.W)
 }
 
 object RTLL2Access {
-  val streamWidthBits = 275
+  val streamWidthBits = 307
 
   def pack(access: RTLL2Access): UInt = Cat(
+    access.bundleGeneration,
     access.bundleIssueCount,
     access.mWarpBlocked,
     access.mIsWrite,
@@ -117,6 +122,7 @@ object RTLL2Access {
     access.mIsWrite := bits(257)
     access.mWarpBlocked := bits(258)
     access.bundleIssueCount := bits(274, 259)
+    access.bundleGeneration := bits(306, 275)
     access
   }
 }
@@ -214,6 +220,7 @@ class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val accessStoreCount = Input(UInt(32.W))
   val accessStoreMaxCycle = Input(UInt(64.W))
   val accessStoreHasEntries = Input(Bool())
+  val accessStoreHasMore = Input(Bool())
   val uploadReady = Input(Bool())
 }
 

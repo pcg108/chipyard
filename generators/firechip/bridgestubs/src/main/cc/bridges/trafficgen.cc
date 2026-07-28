@@ -19,7 +19,6 @@
 #include <cassert>
 #include <cinttypes>
 #include <cerrno>
-#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -32,7 +31,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -47,9 +45,6 @@ constexpr std::uint32_t kRoundExitCapacity = 1;
 constexpr std::uint16_t kGpuModelSocketPort = 50051;
 constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
 constexpr std::size_t kXDMABufferAlignment = 4096;
-constexpr const char *kDefaultTraceFolder =
-    "/home/prashanth/gpu_model/accel-sim-data-rodinia_nn";
-constexpr const char *kDefaultKernelName = "kernel_1__Z6euclidPcffPfiii";
 constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0";
 constexpr const char *kSocketRoundLogRoot =
     "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0/bridge_socket_round_logs";
@@ -464,113 +459,6 @@ std::string plusarg_value(const std::vector<std::string> &args,
   return "";
 }
 
-std::filesystem::path normalize_trace_root(std::filesystem::path trace_folder) {
-  std::error_code ec;
-  if (trace_folder.filename() == "l2_trace") {
-    const auto canonical = std::filesystem::weakly_canonical(trace_folder, ec);
-    return ec ? trace_folder.lexically_normal() : canonical;
-  }
-
-  const auto l2_trace_path = trace_folder / "l2_trace";
-  if (std::filesystem::exists(l2_trace_path, ec) &&
-      std::filesystem::is_directory(l2_trace_path, ec)) {
-    const auto canonical =
-        std::filesystem::weakly_canonical(l2_trace_path, ec);
-    return ec ? l2_trace_path.lexically_normal() : canonical;
-  }
-
-  const auto canonical = std::filesystem::weakly_canonical(trace_folder, ec);
-  return ec ? trace_folder.lexically_normal() : canonical;
-}
-
-struct trafficgen_runtime_config_t {
-  std::filesystem::path trace_root;
-  std::string kernel_name;
-};
-
-trafficgen_runtime_config_t parse_runtime_config(
-    const std::vector<std::string> &args) {
-  std::string trace_folder = plusarg_value(args, "trafficgen-trace-folder");
-  if (trace_folder.empty()) {
-    trace_folder = plusarg_value(args, "trafficgen-trace-root");
-  }
-  if (trace_folder.empty()) {
-    trace_folder = kDefaultTraceFolder;
-  }
-
-  std::string kernel_name = plusarg_value(args, "trafficgen-kernel");
-  if (kernel_name.empty()) {
-    kernel_name = kDefaultKernelName;
-  }
-
-  return {normalize_trace_root(trace_folder), kernel_name};
-}
-
-std::map<std::uint64_t, int> load_timing_data(
-    const std::filesystem::path &timing_path) {
-  std::map<std::uint64_t, int> timings;
-  std::ifstream input(timing_path);
-  if (!input.is_open()) {
-    return timings;
-  }
-
-  std::string line;
-  while (std::getline(input, line)) {
-    std::unordered_map<std::string, std::string> fields;
-    std::istringstream stream(line);
-    std::string token;
-    while (stream >> token) {
-      const std::size_t equal_pos = token.find('=');
-      if (equal_pos == std::string::npos || equal_pos + 1 >= token.size()) {
-        continue;
-      }
-      fields[token.substr(0, equal_pos)] = token.substr(equal_pos + 1);
-    }
-
-    const auto request_uid_it = fields.find("request_uid");
-    const auto elapsed_it = fields.find("elapsed_cycle");
-    if (request_uid_it == fields.end() || elapsed_it == fields.end()) {
-      continue;
-    }
-
-    const auto request_uid = static_cast<std::uint64_t>(
-        std::strtoull(request_uid_it->second.c_str(), nullptr, 0));
-    const int elapsed_cycle = std::atoi(elapsed_it->second.c_str());
-    timings[request_uid] = elapsed_cycle;
-  }
-
-  return timings;
-}
-
-bool find_access_time(const trafficgen_runtime_config_t &config,
-                      const trafficgen_l2_access_t &access,
-                      int &access_time) {
-  using scheduler_key_t = std::tuple<std::string, std::string, std::uint32_t, std::uint32_t>;
-  static std::map<scheduler_key_t, std::map<std::uint64_t, int>> cache;
-
-  const scheduler_key_t key{
-      config.trace_root.string(),
-      config.kernel_name,
-      access.sm_id,
-      static_cast<std::uint32_t>(access.scheduler_id)};
-  auto found = cache.find(key);
-  if (found == cache.end()) {
-    const auto timing_path =
-        config.trace_root / config.kernel_name /
-        ("shader_" + std::to_string(access.sm_id)) /
-        ("scheduler_" + std::to_string(static_cast<unsigned>(access.scheduler_id))) /
-        "l2_to_icnt_timing.txt";
-    found = cache.emplace(key, load_timing_data(timing_path)).first;
-  }
-
-  const auto timing_it = found->second.find(access.id);
-  if (timing_it == found->second.end()) {
-    return false;
-  }
-  access_time = timing_it->second;
-  return true;
-}
-
 std::uint64_t host_to_network_64(std::uint64_t value) {
   const std::uint32_t high =
       htonl(static_cast<std::uint32_t>(value >> 32));
@@ -760,7 +648,8 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
     words[4] = (access.m_wake_relevant_bundle ? 1ULL : 0ULL) |
                ((access.m_is_write ? 1ULL : 0ULL) << 1) |
                ((access.m_warp_blocked ? 1ULL : 0ULL) << 2) |
-               (static_cast<std::uint64_t>(access.bundle_issue_count) << 3);
+               (static_cast<std::uint64_t>(access.bundle_issue_count) << 3) |
+               (static_cast<std::uint64_t>(access.bundle_generation) << 19);
     return;
   }
   words[3] = (static_cast<uint64_t>(access.m_set_index) << 32) |
@@ -808,14 +697,6 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       access_window_bytes(access_window_bytes),
       completed_window_bytes(completed_window_bytes),
       use_rtl_engine(use_rtl_engine != 0) {
-  const std::string stretch_scale =
-      plusarg_value(args, "trafficgen-memory-issue-stretch-scale");
-  if (!stretch_scale.empty()) {
-    memory_issue_stretch_scale = std::max(std::strtod(stretch_scale.c_str(), nullptr), 1e-9);
-  }
-  const auto runtime_config = parse_runtime_config(args);
-  trace_root = runtime_config.trace_root.string();
-  kernel_name = runtime_config.kernel_name;
   const std::string round_log_dir =
       plusarg_value(args, "trafficgen-round-log-dir");
   round_log_root = std::filesystem::path(kRoundLogBase) /
@@ -841,24 +722,13 @@ void trafficgen_t::init() {
   issued_access_writeback_read_issued = false;
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
-  outstanding_bundle_info_by_id.clear();
-  deferred_completed_bundle_ids.clear();
-  deferred_completed_bundle_id_set.clear();
-  logical_round_number = 0;
+  engine_round_number = 0;
   current_round_all_l2_trace_steps.clear();
   current_round_blocked_warp_ids.clear();
   min_issue_cycle = 0;
-  has_first_issue_cycle = false;
-  first_issue_cycle = 0;
   l2_accesses.clear();
   pending_accesses_by_cycle.clear();
   pending_access_cycle_by_id.clear();
-  logical_issue_cycle = 0;
-  logical_inflight_accesses_by_id.clear();
-  logical_outstanding_bundles_by_id.clear();
-  logical_round_issued_accesses.clear();
-  logical_round_completed_bundle_ids.clear();
-  logical_round_current_cycle_after_issue = 0;
   upload_written_to_bram = false;
   round_completion_pause_issued = false;
   round_input_reserved_subpartitions.clear();
@@ -946,7 +816,7 @@ void trafficgen_t::refresh_upload_access_blocked_annotations() {
 void trafficgen_t::build_next_l2_access_chunk() {
   /*
     Build the set of accesses to upload to target for next scheduling round,
-    rounded down to the nearest cycle boundary taht fits in BRAM
+    rounded down to the nearest cycle boundary that fits in BRAM
   */
 
   l2_accesses.clear();
@@ -1061,124 +931,41 @@ void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
   }
 }
 
-void trafficgen_t::build_logical_round_result() {
-  logical_round_issued_accesses.clear();
-  logical_round_completed_bundle_ids.clear();
-  l2_accesses.clear();
-
-  const auto retire_completed_accesses = [this]() {
-    bool completed_blocked_warp_bundle = false;
-    for (auto access_it = logical_inflight_accesses_by_id.begin();
-         access_it != logical_inflight_accesses_by_id.end();) {
-      if (access_it->second.finish_cycle > logical_issue_cycle) {
-        ++access_it;
-        continue;
-      }
-
-      const std::uint64_t bundle_id = access_it->second.bundle_id;
-      const auto bundle_it = logical_outstanding_bundles_by_id.find(bundle_id);
-      if (bundle_it != logical_outstanding_bundles_by_id.end()) {
-        auto &bundle = bundle_it->second;
-        if (bundle.remaining_request_count > 0) {
-          --bundle.remaining_request_count;
-        }
-        if (bundle.remaining_request_count == 0) {
-          logical_round_completed_bundle_ids.push_back(bundle_id);
-          const socket_warp_key_t warp_key{
-              bundle.sm_id,
-              static_cast<unsigned>(bundle.scheduler_id),
-              bundle.warp_id};
-          completed_blocked_warp_bundle =
-              (bundle.wake_relevant &&
-               current_round_blocked_warp_ids.find(warp_key) !=
-                   current_round_blocked_warp_ids.end()) ||
-              completed_blocked_warp_bundle;
-          logical_outstanding_bundles_by_id.erase(bundle_it);
-        }
-      }
-      access_it = logical_inflight_accesses_by_id.erase(access_it);
-    }
-    return completed_blocked_warp_bundle;
-  };
-
-  // Match SimpleTrafficGen's empty-issue behavior: jump directly between
-  // logical completion points until a currently blocked warp wakes or all
-  // outstanding requests have retired.
-  if (pending_accesses_by_cycle.empty() &&
-      !logical_inflight_accesses_by_id.empty()) {
-    while (!logical_inflight_accesses_by_id.empty()) {
-      const auto next_finish_it = std::min_element(
-          logical_inflight_accesses_by_id.begin(),
-          logical_inflight_accesses_by_id.end(),
-          [](const auto &lhs, const auto &rhs) {
-            return lhs.second.finish_cycle < rhs.second.finish_cycle;
-          });
-      if (next_finish_it != logical_inflight_accesses_by_id.end() &&
-          next_finish_it->second.finish_cycle > logical_issue_cycle) {
-        logical_issue_cycle = next_finish_it->second.finish_cycle;
-      }
-      if (retire_completed_accesses()) {
-        logical_round_current_cycle_after_issue = logical_issue_cycle;
-        return;
-      }
-    }
-  }
-
-  while (!pending_accesses_by_cycle.empty()) {
-    const auto pending_it = pending_accesses_by_cycle.find(logical_issue_cycle);
-    if (pending_it != pending_accesses_by_cycle.end()) {
-      for (auto access : pending_it->second) {
-        if (access.has_timing) {
-          access.cycle_count = logical_issue_cycle;
-          l2_accesses.push_back(access);
-
-          trafficgen_issued_access_point_t issued{};
-          issued.request_uid = access.id;
-          issued.address = access.address;
-          issued.cycle_issued = logical_issue_cycle;
-          issued.is_write = access.m_is_write;
-          logical_round_issued_accesses.push_back(issued);
-
-          logical_inflight_accesses_by_id[access.id] = {
-              logical_issue_cycle + access.elapsed_cycle,
-              access.m_bundle_id};
-          auto &bundle = logical_outstanding_bundles_by_id[access.m_bundle_id];
-          ++bundle.remaining_request_count;
-          bundle.wake_relevant = access.m_wake_relevant_bundle;
-          bundle.sm_id = access.sm_id;
-          bundle.scheduler_id = access.scheduler_id;
-          bundle.warp_id = access.warp_id;
-        }
-
-        pending_access_cycle_by_id.erase(access.id);
-      }
-      pending_accesses_by_cycle.erase(pending_it);
-    }
-
-    if (retire_completed_accesses()) {
-      break;
-    }
-    if (logical_issue_cycle >= min_issue_cycle) {
-      break;
-    }
-    ++logical_issue_cycle;
-  }
-
-  logical_round_current_cycle_after_issue = logical_issue_cycle;
-}
-
 void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
   constexpr std::size_t kLanes = 16;
-  std::unordered_map<std::uint64_t, std::size_t> bundle_counts;
-  for (const auto &access : l2_accesses) {
-    ++bundle_counts[access.m_bundle_id];
+  std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> bundle_counts;
+  // Count the entire currently available GPU schedule, not just this BRAM
+  // chunk.  The first member tells the RTL engine how many members remain in
+  // this scheduler generation; capacity refills then continue that same
+  // generation without allowing a partial bundle to complete early.
+  for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
+    (void)cycle;
+    for (const auto &access : accesses) {
+      ++bundle_counts[{access.bundle_generation, access.m_bundle_id}];
+    }
   }
   for (auto &access : l2_accesses) {
-    const auto count = bundle_counts.at(access.m_bundle_id);
+    const auto count =
+        bundle_counts.at({access.bundle_generation, access.m_bundle_id});
     if (count == 0 || count > std::numeric_limits<std::uint16_t>::max()) {
       throw std::runtime_error("TrafficGen bundle member count exceeds packed width");
     }
     access.bundle_issue_count = static_cast<std::uint16_t>(count);
+  }
+
+  if (use_rtl_engine) {
+    // The RTL engine accepts an ordered stream per lane and applies the real
+    // L2 backpressure when a lane's head becomes eligible.  The socket
+    // schedule can therefore contain more than 16 accesses with the same
+    // requested cycle (and repeated subpartitions); distribute that stream
+    // evenly without rewriting its cycles.  Any excess same-cycle accesses
+    // remain at the lane heads and issue on later target cycles as resources
+    // become available.
+    for (std::size_t i = 0; i < l2_accesses.size(); ++i) {
+      l2_accesses[i].assigned_lane =
+          static_cast<std::uint8_t>(i % kLanes);
+    }
+    return;
   }
 
   std::array<std::size_t, kLanes> lane_counts{};
@@ -1223,69 +1010,16 @@ void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
   }
 }
 
-void trafficgen_t::depopulate_target_accesses(
-    const std::vector<trafficgen_issued_access_point_t> &issued_accesses) {
-  std::unordered_set<std::uint64_t> issued_ids;
-  issued_ids.reserve(issued_accesses.size());
-  for (const auto &access : issued_accesses) {
-    issued_ids.insert(access.request_uid);
-  }
-  l2_accesses.erase(
-      std::remove_if(l2_accesses.begin(),
-                     l2_accesses.end(),
-                     [&issued_ids](const trafficgen_l2_access_t &access) {
-                       return issued_ids.find(access.id) != issued_ids.end();
-                     }),
-      l2_accesses.end());
-}
-
-void trafficgen_t::record_issued_bundle_metadata(
-    const trafficgen_l2_access_t &access) {
-  auto &info = outstanding_bundle_info_by_id[access.m_bundle_id];
-  info.wake_relevant = access.m_wake_relevant_bundle;
-  info.sm_id = access.sm_id;
-  info.scheduler_id = access.scheduler_id;
-  info.warp_id = access.warp_id;
-}
-
-bool trafficgen_t::complete_bundle_is_current_wake(
-    std::uint64_t bundle_id) {
-  const auto bundle_it = outstanding_bundle_info_by_id.find(bundle_id);
-  if (bundle_it == outstanding_bundle_info_by_id.end()) {
-    std::cout << "[bridge driver] completed bundle without host metadata: bundle_id="
-              << bundle_id << std::endl;
-    return true;
-  }
-
-  const socket_warp_key_t warp_key{
-      bundle_it->second.sm_id,
-      static_cast<unsigned>(bundle_it->second.scheduler_id),
-      bundle_it->second.warp_id};
-  const bool current_warp_blocked =
-      current_round_blocked_warp_ids.find(warp_key) !=
-      current_round_blocked_warp_ids.end();
-  const bool wake_exit =
-      bundle_it->second.wake_relevant && current_warp_blocked;
-  outstanding_bundle_info_by_id.erase(bundle_it);
-  return wake_exit;
-}
-
-void trafficgen_t::record_completed_bundle_id(std::uint64_t bundle_id) {
-  // Match SimpleTrafficGen semantics: completion is tied to target-issued
-  // outstanding requests, not to future accesses waiting in the host queue.
-  accumulated_completed_bundle_ids.push_back(bundle_id);
-}
-
-void trafficgen_t::log_logical_round_for_compare(
+void trafficgen_t::log_engine_round_for_compare(
     const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
     const std::vector<std::uint64_t> &completed_bundle_ids,
     std::uint64_t current_cycle_after_issue) const {
-  if (logical_round_number == 0) {
+  if (engine_round_number == 0) {
     return;
   }
 
   const std::filesystem::path round_dir =
-      round_log_root / format_round_log_dir(logical_round_number);
+      round_log_root / format_round_log_dir(engine_round_number);
   create_directory_if_needed(round_log_root.string());
   create_directory_if_needed(round_dir.string());
 
@@ -1326,7 +1060,7 @@ void trafficgen_t::log_logical_round_for_compare(
     throw std::runtime_error("failed to write round manifest: " +
                              (round_dir / "manifest.txt").string());
   }
-  manifest << "round=" << logical_round_number << "\n";
+  manifest << "round=" << engine_round_number << "\n";
   manifest << "files=reserved_subpartitions.bin,all_l2_trace_steps.bin,"
            << "blocked_warp_ids.bin,min_issue_cycle.bin,issued_accesses.bin,"
            << "completed_bundle_ids.bin,current_cycle_after_issue.bin\n";
@@ -1352,15 +1086,13 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   const SchedulerRoundMessage message =
       gpu_model_socket_client->recv_message<SchedulerRoundMessage>();
 
-  ++logical_round_number;
+  ++engine_round_number;
   current_round_all_l2_trace_steps = message.allL2TraceSteps;
   current_round_blocked_warp_ids = message.blockedWarpIds;
   log_socket_round_inputs_for_compare(message.allL2TraceSteps,
                                       message.blockedWarpIds);
 
   min_issue_cycle = message.min_issue_cycle;
-  const trafficgen_runtime_config_t runtime_config{
-      std::filesystem::path(trace_root), kernel_name};
   for (const auto &wire_access : message.allL2TraceSteps) {
     trafficgen_l2_access_t access{};
     access.id = wire_access.mUniqueId;
@@ -1385,28 +1117,8 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     access.m_bundle_id = wire_access.mBundleId;
     access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle;
     access.m_is_write = wire_access.mIsWrite;
-    if (!has_first_issue_cycle) {
-      first_issue_cycle = access.cycle_count;
-      has_first_issue_cycle = true;
-    }
-    if (memory_issue_stretch_scale > 1.0 &&
-        access.cycle_count >= first_issue_cycle) {
-      const double issue_cycle_delta =
-          static_cast<double>(access.cycle_count - first_issue_cycle);
-      access.cycle_count =
-          first_issue_cycle +
-          static_cast<std::uint64_t>(
-              std::llround(issue_cycle_delta * memory_issue_stretch_scale));
-    }
-    int access_time = 0;
-    if (find_access_time(runtime_config, access, access_time)) {
-      access.has_timing = true;
-      access.elapsed_cycle =
-          static_cast<std::uint64_t>(std::max(access_time, 0));
-    } else {
-      access.has_timing = false;
-      access.elapsed_cycle = 0;
-    }
+    access.bundle_generation =
+        checked_u32(engine_round_number, "bundle generation");
     if (pending_access_cycle_by_id.emplace(access.id, access.cycle_count).second) {
       pending_accesses_by_cycle[access.cycle_count].push_back(access);
     }
@@ -1415,16 +1127,13 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   accumulated_completed_bundle_ids.clear();
 
   refresh_pending_access_blocked_annotations();
-  build_logical_round_result();
+  build_next_l2_access_chunk();
   assign_replay_lanes_and_bundle_counts();
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
             << " pending_l2_accesses=" << pending_access_cycle_by_id.size()
-            << " logical_issued_accesses=" << l2_accesses.size()
-            << " logical_completed_bundles="
-            << logical_round_completed_bundle_ids.size()
-            << " logical_cycle=" << logical_round_current_cycle_after_issue
+            << " upload_accesses=" << l2_accesses.size()
             << " blocked_warps=" << message.blockedWarpIds.size()
             << " min_issue_cycle=" << min_issue_cycle << std::endl;
 }
@@ -1463,9 +1172,11 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
   completed_bundle_count =
       static_cast<uint32_t>(read(mmio_addrs.completed_bundle_count));
   if (completed_bundle_count > COMPLETED_BUNDLE_ID_COUNT) {
-    std::cout << "[bridge driver] completedBundleIds count exceeds capacity: count="
-              << completed_bundle_count
-              << " capacity=" << COMPLETED_BUNDLE_ID_COUNT << std::endl;
+    std::ostringstream error;
+    error << "TrafficGen completedBundleIds count exceeds capacity: count="
+          << completed_bundle_count
+          << " capacity=" << COMPLETED_BUNDLE_ID_COUNT;
+    throw std::runtime_error(error.str());
   }
 
   std::cout << "[bridge driver] completedBundleIds count="
@@ -1607,11 +1318,16 @@ void trafficgen_t::write_schedule_to_bram() {
           packed_words + idx * STREAM_WORDS_PER_BEAT,
           use_rtl_engine);
     }
+    std::cout << "[bridge driver] uploading L2 access lane=" << lane
+              << " entries=" << lanes[lane].size()
+              << " bytes=" << lane_bytes << std::endl;
     xdma_write_exact(
         xdma,
         bram_base + raw_access_store_offset + lane * bank_stride_bytes,
         packed.get(), lane_bytes,
         "XDMA write while uploading banked TrafficGen L2 accesses");
+    std::cout << "[bridge driver] uploaded L2 access lane=" << lane
+              << std::endl;
   }
 
   // write access meta data into MMIO registers
@@ -1622,6 +1338,8 @@ void trafficgen_t::write_schedule_to_bram() {
         static_cast<uint32_t>(max_cycle & 0xffffffffULL));
   write(mmio_addrs.access_store_max_cycle_high,
         static_cast<uint32_t>(max_cycle >> 32));
+  write(mmio_addrs.access_store_has_more,
+        pending_access_cycle_by_id.size() > l2_accesses.size() ? 1 : 0);
   write(mmio_addrs.commit_upload, 1);
 
   upload_written_to_bram = true;
@@ -1672,11 +1390,10 @@ void trafficgen_t::tick() {
       // Reset upload progress and kick off host->target BRAM upload.
       upload_written_to_bram = false;
 
-      // The host has already selected the exact logical-round issue set.
-      // Let the physical replay consume the complete upload; target cache time
-      // must not impose an additional logical scheduling horizon.
-      write(mmio_addrs.min_issue_cycle_low, std::numeric_limits<std::uint32_t>::max());
-      write(mmio_addrs.min_issue_cycle_high, std::numeric_limits<std::uint32_t>::max());
+      write(mmio_addrs.min_issue_cycle_low,
+            static_cast<uint32_t>(min_issue_cycle & 0xffffffffULL));
+      write(mmio_addrs.min_issue_cycle_high,
+            static_cast<uint32_t>(min_issue_cycle >> 32));
 
       state = trafficgen_state_t::UPLOAD_SCHEDULE;
 
@@ -1758,25 +1475,47 @@ void trafficgen_t::tick() {
         break;
       }
 
-      // Physical cache time is intentionally decoupled from the GPU model's
-      // logical issue time. Remove exactly the accesses confirmed by the
-      // target, then keep replaying this logical round until every selected
-      // request has crossed the target/bridge boundary. Physical completions
-      // are drained above, but only timing-file completion points may be sent
-      // back to the GPU scheduler.
-      depopulate_target_accesses(issued_access_writeback_entries);
-
       const std::uint64_t target_cycle_after_issue =
           (static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue_high)) << 32) |
           static_cast<std::uint64_t>(read(mmio_addrs.current_cycle_after_issue_low));
-      if (!l2_accesses.empty()) {
-        std::cout << "[bridge driver] target exited at physical cycle="
+
+      std::unordered_set<std::uint64_t> uploaded_access_ids;
+      uploaded_access_ids.reserve(l2_accesses.size());
+      for (const auto &access : l2_accesses) {
+        uploaded_access_ids.insert(access.id);
+      }
+      for (const auto &issued : issued_access_writeback_entries) {
+        if (uploaded_access_ids.find(issued.request_uid) ==
+            uploaded_access_ids.end()) {
+          std::ostringstream error;
+          error << "TrafficGen engine reported unknown issued request_uid="
+                << issued.request_uid;
+          throw std::runtime_error(error.str());
+        }
+        accumulated_issued_accesses.push_back(issued);
+      }
+
+      for (size_t i = 0; i < completed_bundle_count; ++i) {
+        accumulated_completed_bundle_ids.push_back(completed_bundle_ids[i]);
+      }
+
+      const std::uint32_t round_exit_reason =
+          static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
+      if (round_exit_reason == kRoundExitCapacity) {
+        depopulate_uploaded_l2_access_chunk();
+        if (pending_accesses_by_cycle.empty()) {
+          throw std::runtime_error(
+              "TrafficGen engine reported a capacity exit without another "
+              "host upload chunk");
+        }
+
+        std::cout << "[bridge driver] capacity exit at cycle="
                   << target_cycle_after_issue
-                  << " before logical replay drained; remaining_accesses="
-                  << l2_accesses.size() << std::endl;
+                  << ", refilling accessStore from pending accesses="
+                  << pending_access_cycle_by_id.size() << std::endl;
+        build_next_l2_access_chunk();
+        assign_replay_lanes_and_bundle_counts();
         upload_written_to_bram = false;
-        write(mmio_addrs.min_issue_cycle_low, std::numeric_limits<std::uint32_t>::max());
-        write(mmio_addrs.min_issue_cycle_high, std::numeric_limits<std::uint32_t>::max());
         issued_access_writeback_entries.clear();
         issued_access_writeback_stream_bytes.clear();
         issued_access_writeback_count = 0;
@@ -1789,29 +1528,30 @@ void trafficgen_t::tick() {
         break;
       }
 
-      const bool logical_has_pending_work =
-          !pending_accesses_by_cycle.empty() ||
-          !logical_inflight_accesses_by_id.empty();
+      depopulate_issued_accesses(issued_access_writeback_entries);
+      const bool engine_has_pending_work =
+          read(mmio_addrs.has_pending_work) != 0;
 
-      // once the entire round is complete, send accumulated issued accesses
-      // and completed bundle IDs to gpu_model via socket
       TrafficGenResultMessage message;
-      message.trafficGenResult.issuedAccesses.reserve(logical_round_issued_accesses.size());
-      for (const auto &logical : logical_round_issued_accesses) {
+      message.trafficGenResult.issuedAccesses.reserve(
+          accumulated_issued_accesses.size());
+      for (const auto &issued : accumulated_issued_accesses) {
         IssuedAccessPoint issued_access_point{};
-        issued_access_point.requestUid = logical.request_uid;
-        issued_access_point.cycleIssued = logical.cycle_issued;
-        issued_access_point.address = logical.address;
-        issued_access_point.isWrite = logical.is_write;
-        message.trafficGenResult.issuedAccesses.push_back(issued_access_point);
+        issued_access_point.requestUid = issued.request_uid;
+        issued_access_point.cycleIssued = issued.cycle_issued;
+        issued_access_point.address = issued.address;
+        issued_access_point.isWrite = issued.is_write;
+        message.trafficGenResult.issuedAccesses.push_back(
+            issued_access_point);
       }
-      message.trafficGenResult.completedBundleIds = logical_round_completed_bundle_ids;
+      message.trafficGenResult.completedBundleIds =
+          accumulated_completed_bundle_ids;
       message.trafficGenResult.currentCycleAfterIssue =
-          logical_round_current_cycle_after_issue;
-      message.hasPendingWork = logical_has_pending_work;
-      log_logical_round_for_compare(logical_round_issued_accesses,
-                                    logical_round_completed_bundle_ids,
-                                    logical_round_current_cycle_after_issue);
+          target_cycle_after_issue;
+      message.hasPendingWork = engine_has_pending_work;
+      log_engine_round_for_compare(accumulated_issued_accesses,
+                                   accumulated_completed_bundle_ids,
+                                   target_cycle_after_issue);
 
       if (!gpu_model_socket_client) {
         throw std::runtime_error(

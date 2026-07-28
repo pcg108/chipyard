@@ -224,6 +224,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessStoreCount = RegInit(0.U(32.W))
     val accessStoreMaxCycle = RegInit(0.U(64.W))
     val accessStoreHasEntries = RegInit(false.B)
+    val accessStoreHasMore = RegInit(false.B)
     val uploadLaneCounts = RegInit(VecInit(Seq.fill(replayLanes)(0.U(32.W))))
 
     val accessStoreWriteEn = Wire(Vec(replayLanes, Bool()))
@@ -240,6 +241,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val uploadMaxCycleLow = RegInit(0.U(32.W))
     val uploadMaxCycleHigh = RegInit(0.U(32.W))
     val uploadMaxCycle = Cat(uploadMaxCycleHigh, uploadMaxCycleLow)
+    val uploadHasMore = RegInit(false.B)
 
     val uploadReady = RegInit(false.B)
     val accessReadPrefillPending = RegInit(false.B)
@@ -364,6 +366,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreCount := uploadCount
       accessStoreMaxCycle := uploadMaxCycle
       accessStoreHasEntries := uploadCount =/= 0.U
+      accessStoreHasMore := uploadHasMore
       accessReadCursors.foreach(_ := 0.U)
       accessReadFetchPending.foreach(_ := false.B)
       accessReadRespId := 0.U
@@ -393,6 +396,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.accessStoreCount := accessStoreCount
     target.accessStoreMaxCycle := accessStoreMaxCycle
     target.accessStoreHasEntries := accessStoreHasEntries
+    target.accessStoreHasMore := accessStoreHasMore
 
     /*
      * Direct CPU-managed XDMA access to TrafficGen BRAM-backed stores.
@@ -660,11 +664,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreCount := 0.U
       accessStoreMaxCycle := 0.U
       accessStoreHasEntries := false.B
+      accessStoreHasMore := false.B
       accessReadPrefillPending := false.B
       accessReplayActive := false.B
       uploadReady := false.B
       uploadMaxCycleLow := 0.U
       uploadMaxCycleHigh := 0.U
+      uploadHasMore := false.B
       completedBundleCount := 0.U
       startRoundPending := false.B
       startTrafficGenLatched := false.B
@@ -699,6 +705,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     genWORegInit(uploadMaxCycleLow, "access_store_max_cycle_low", 0.U)
     genWORegInit(uploadMaxCycleHigh, "access_store_max_cycle_high", 0.U)
+    genWORegInit(uploadHasMore, "access_store_has_more", false.B)
     Pulsify(genWORegInit(commitUpload, "commit_upload", false.B), pulseLength = 1)
 
     genROReg(roundCompleteLatched, "round_complete")

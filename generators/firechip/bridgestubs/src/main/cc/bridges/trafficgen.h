@@ -44,6 +44,7 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t upload_lane_count_15;
   uint64_t access_store_max_cycle_low;
   uint64_t access_store_max_cycle_high;
+  uint64_t access_store_has_more;
   uint64_t commit_upload;
   uint64_t round_complete;
   uint64_t upload_ready;
@@ -82,8 +83,6 @@ struct trafficgen_l2_access_t {
   uint64_t id;
   uint64_t address;
   uint64_t cycle_count;
-  uint64_t elapsed_cycle;
-  bool has_timing;
   uint32_t m_subpartition;
   uint32_t m_set_index;
   uint64_t m_tag;
@@ -96,6 +95,7 @@ struct trafficgen_l2_access_t {
   bool m_is_write;
   bool m_warp_blocked;
   uint16_t bundle_issue_count = 1;
+  uint32_t bundle_generation = 0;
   uint8_t assigned_lane = 0;
 };
 
@@ -104,26 +104,6 @@ struct trafficgen_issued_access_point_t {
   std::uint64_t cycle_issued = 0;
   std::uint64_t address = 0;
   bool is_write = false;
-};
-
-struct trafficgen_outstanding_bundle_info_t {
-  bool wake_relevant = false;
-  uint32_t sm_id = 0;
-  uint8_t scheduler_id = 0;
-  uint32_t warp_id = 0;
-};
-
-struct trafficgen_logical_inflight_access_t {
-  std::uint64_t finish_cycle = 0;
-  std::uint64_t bundle_id = 0;
-};
-
-struct trafficgen_logical_bundle_info_t {
-  std::uint64_t remaining_request_count = 0;
-  bool wake_relevant = false;
-  uint32_t sm_id = 0;
-  uint8_t scheduler_id = 0;
-  uint32_t warp_id = 0;
 };
 
 enum class trafficgen_state_t {
@@ -184,25 +164,12 @@ private:
   const uint64_t completed_window_bytes;
   const bool use_rtl_engine;
   std::uint64_t min_issue_cycle = 0;
-  double memory_issue_stretch_scale = 1.0;
-  bool has_first_issue_cycle = false;
-  std::uint64_t first_issue_cycle = 0;
-  std::string trace_root;
-  std::string kernel_name;
   std::filesystem::path round_log_root;
-  std::uint64_t logical_round_number = 0;
+  std::uint64_t engine_round_number = 0;
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::map<std::uint64_t, std::vector<trafficgen_l2_access_t>>
       pending_accesses_by_cycle;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
-  std::uint64_t logical_issue_cycle = 0;
-  std::unordered_map<std::uint64_t, trafficgen_logical_inflight_access_t>
-      logical_inflight_accesses_by_id;
-  std::unordered_map<std::uint64_t, trafficgen_logical_bundle_info_t>
-      logical_outstanding_bundles_by_id;
-  std::vector<trafficgen_issued_access_point_t> logical_round_issued_accesses;
-  std::vector<std::uint64_t> logical_round_completed_bundle_ids;
-  std::uint64_t logical_round_current_cycle_after_issue = 0;
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -217,10 +184,6 @@ private:
   bool issued_access_writeback_read_issued = false;
   std::vector<trafficgen_issued_access_point_t> accumulated_issued_accesses;
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
-  std::unordered_map<std::uint64_t, trafficgen_outstanding_bundle_info_t>
-      outstanding_bundle_info_by_id;
-  std::vector<std::uint64_t> deferred_completed_bundle_ids;
-  std::unordered_set<std::uint64_t> deferred_completed_bundle_id_set;
 
   bool upload_written_to_bram = false;
   bool round_completion_pause_issued = false;
@@ -243,16 +206,10 @@ private:
   void depopulate_issued_accesses(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
   void depopulate_uploaded_l2_access_chunk();
-  void build_logical_round_result();
   void assign_replay_lanes_and_bundle_counts();
   void write_upload_lane_count(unsigned lane, std::uint32_t count);
   std::uint32_t read_issued_lane_count(unsigned lane);
-  void depopulate_target_accesses(
-      const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
-  void record_issued_bundle_metadata(const trafficgen_l2_access_t &access);
-  bool complete_bundle_is_current_wake(std::uint64_t bundle_id);
-  void record_completed_bundle_id(std::uint64_t bundle_id);
-  void log_logical_round_for_compare(
+  void log_engine_round_for_compare(
       const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
       const std::vector<std::uint64_t> &completed_bundle_ids,
       std::uint64_t current_cycle_after_issue) const;
