@@ -20,6 +20,7 @@ import firechip.bridgeinterfaces.{
   L2Access,
   RTLL2Access,
   TrafficGenAccessBatch,
+  TrafficGenReplaySlots,
   TrafficGenRoundExitReason,
 }
 
@@ -56,6 +57,7 @@ class TrafficGenTopIO(
   val memOutstanding: Int,
   val useRTL: Boolean
 ) extends Bundle {
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL)
 
   //// Target -> Host control/status
 
@@ -109,14 +111,14 @@ class TrafficGenTopIO(
 
   // L2 access returned from access store in bridge module
   val accessReadRespValid = Input(Bool())
-  val accessReadRespId = Input(UInt(32.W))
+  val accessReadRespId = Input(UInt((2 * replaySlots).W))
   private val accessStreamWidth =
     if (useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
-  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, UInt(accessStreamWidth.W)))
-  val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
+  val accessReadData = Input(Vec(replaySlots, UInt(accessStreamWidth.W)))
+  val accessReadDataValid = Input(Vec(replaySlots, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
-  val accessReadConsumeMask = Output(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadConsumeMask = Output(UInt(replaySlots.W))
   val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
   val accessReadPrefetchPauseReq = Input(Bool())
   val accessReadPrefetchPauseAck = Output(Bool())
@@ -430,6 +432,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   val io = IO(new TrafficGenTopIO(
     params.width, params.numGenerators, params.memOutstanding, useRTL = true))
+  private val replaySlotsPerLane = TrafficGenReplaySlots.rtlSlotsPerLane
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL = true)
+  private val replaySlotIdxWidth = log2Ceil(replaySlots)
 
   val rtlStates = Enum(7)
   val sIdle = rtlStates(0)
@@ -448,15 +453,15 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
   val lastHasPendingWork = RegInit(false.B)
 
-  val lastAccessReadRespId = RegInit(0.U(32.W))
-
-  // A consume mask and its replacement lane heads cross HostPort in opposite
-  // directions.  Do not consume another snapshot until the bridge advances
-  // accessReadRespId to acknowledge the previous mask.  Comparing only the
-  // payload UID is insufficient: during HostPort latency a lane can briefly
-  // expose a different head and then replay the already-consumed head, which
-  // double-consumes one BRAM entry and skips the next.
-  val accessReadConsumePending = RegInit(false.B)
+  // Each physical replay lane has three independently acknowledged bridge
+  // slots. The lane rotates through them in strict order so the two other
+  // slots can issue while an earlier consume crosses HostPort.
+  val lastAccessReadRespGenerations =
+    RegInit(VecInit(Seq.fill(replaySlots)(0.U(2.W))))
+  val accessReadConsumePendingMask =
+    RegInit(0.U(replaySlots.W))
+  val accessReadLaneSlot =
+    RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(0.U(2.W))))
 
   val bundleTableEntries = params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes
   val bundleCountWidth = log2Ceil(params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes + 1)
@@ -691,22 +696,35 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val currentIssueValid = Wire(Vec(params.numGenerators, Bool()))
   val roundReachedMin = targetCycle >= io.minIssueCycle
   val issueWindowOpen = !roundReachedMin
+  val accessReadRespGenerations = VecInit((0 until replaySlots).map { slot =>
+    io.accessReadRespId(2 * slot + 1, 2 * slot)
+  })
+  val accessReadGenerationChangedMask =
+    VecInit((0 until replaySlots).map { slot =>
+      accessReadRespGenerations(slot) =/= lastAccessReadRespGenerations(slot)
+    }).asUInt
+  val accessReadAckNowMask = Mux(
+    io.accessReadRespValid,
+    accessReadConsumePendingMask & accessReadGenerationChangedMask,
+    0.U)
+  val accessReadPendingAfterAck =
+    accessReadConsumePendingMask & ~accessReadAckNowMask
+  dontTouch(accessReadAckNowMask)
+  val selectedAccessReadSlot = Wire(Vec(params.numGenerators, UInt(replaySlotIdxWidth.W)))
   for (lane <- 0 until params.numGenerators) {
+    val selectedSlot = Wire(UInt(replaySlotIdxWidth.W))
+    selectedSlot :=
+      (lane * replaySlotsPerLane).U(replaySlotIdxWidth.W) +
+        accessReadLaneSlot(lane)
+    selectedAccessReadSlot(lane) := selectedSlot
     val issuedAccess = Wire(new RTLL2Access)
-    issuedAccess := rtlAccessReadData(lane)
+    issuedAccess := rtlAccessReadData(selectedSlot)
     // Record when this access is actually issued by the target.
     issuedAccess.cycleCount := targetCycle
     currentIssueAccess(lane) := issuedAccess
-    currentIssueValid(lane) := io.accessReadDataValid(lane) &&
-      !accessReadConsumePending &&
-      rtlAccessReadData(lane).cycleCount <= targetCycle
-  }
-
-  when(accessReadConsumePending &&
-       io.accessReadRespValid &&
-       io.accessReadRespId =/= lastAccessReadRespId) {
-    accessReadConsumePending := false.B
-    lastAccessReadRespId := io.accessReadRespId
+    currentIssueValid(lane) := io.accessReadDataValid(selectedSlot) &&
+      (!accessReadConsumePendingMask(selectedSlot) || accessReadAckNowMask(selectedSlot)) &&
+      rtlAccessReadData(selectedSlot).cycleCount <= targetCycle
   }
 
   // Assign every visible lane head to a concrete table entry before driving
@@ -788,10 +806,37 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     }
   })
   issuedBatchQueue.io.enq.bits.accesses := issuedBatchPackedAccesses.asUInt
-  io.accessReadConsumeMask := issuedBatchMask
-  when(issueCanFire) {
-    accessReadConsumePending := true.B
-    lastAccessReadRespId := io.accessReadRespId
+  val accessReadSlotConsumeMask = (0 until params.numGenerators).map { lane =>
+    UIntToOH(selectedAccessReadSlot(lane), replaySlots) &
+      Fill(replaySlots, issueFires(lane))
+  }.reduce(_ | _)
+  io.accessReadConsumeMask := accessReadSlotConsumeMask
+  accessReadConsumePendingMask := accessReadPendingAfterAck | accessReadSlotConsumeMask
+  for (slot <- 0 until replaySlots) {
+    when(accessReadAckNowMask(slot)) {
+      lastAccessReadRespGenerations(slot) := accessReadRespGenerations(slot)
+    }
+  }
+  assert((accessReadAckNowMask & ~accessReadConsumePendingMask) === 0.U,
+    "TrafficGenRTLEngine acknowledged a lane without a pending consume")
+  for (lane <- 0 until params.numGenerators) {
+    val selectedSlot = selectedAccessReadSlot(lane)
+    when(issueFires(lane) && accessReadConsumePendingMask(selectedSlot)) {
+      assert(accessReadAckNowMask(selectedSlot),
+        "TrafficGenRTLEngine issued a pending replay slot without its acknowledgement")
+    }
+    when(issueFires(lane)) {
+      accessReadLaneSlot(lane) :=
+        Mux(accessReadLaneSlot(lane) === (replaySlotsPerLane - 1).U,
+          0.U, accessReadLaneSlot(lane) + 1.U)
+    }
+  }
+  for (lane <- 0 until TrafficGenAccessBatch.lanes) {
+    val laneConsume = io.accessReadConsumeMask(
+      (lane + 1) * replaySlotsPerLane - 1,
+      lane * replaySlotsPerLane)
+    assert(PopCount(laneConsume) <= 1.U,
+      "TrafficGenRTLEngine consumed more than one slot from a replay lane")
   }
   when(roundReachedMin) {
     assert(!issueCanFire,
@@ -916,7 +961,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     io.accessStoreHasMore
   val minExitReady =
     roundReachedMin &&
-    (!accessReadConsumePending || allAccessLanesDone)
+    !accessReadPendingAfterAck.orR
   val acceptingRound =
     state === sIdle && io.startRound && io.uploadReady
   val startingWorkload =
@@ -946,8 +991,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
       completedBundleCount := 0.U
-      accessReadConsumePending := false.B
-      lastAccessReadRespId := io.accessReadRespId
+      accessReadConsumePendingMask := 0.U
+      accessReadLaneSlot.foreach(_ := 0.U)
+      for (slot <- 0 until replaySlots) {
+        lastAccessReadRespGenerations(slot) := accessReadRespGenerations(slot)
+      }
       lastHasPendingWork := false.B
       io.roundStarted := true.B
       state := sDrainCompletions
@@ -973,11 +1021,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
         lastHasPendingWork := pendingAfterExit
         state := sDrainOutputs
-      }.elsewhen(allAccessLanesDone && roundCapacityBounded) {
+      }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && roundCapacityBounded) {
         roundExitReasonReg := TrafficGenRoundExitReason.capacity
         lastHasPendingWork := true.B
         state := sDrainOutputs
-      }.elsewhen(allAccessLanesDone && !roundMemoryHasWork) {
+      }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork) {
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
         lastHasPendingWork := pendingAfterExit
         state := sDrainOutputs
@@ -1019,11 +1067,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       lastHasPendingWork := pendingAfterExit
       state := sDrainOutputs
-    }.elsewhen(allAccessLanesDone && roundCapacityBounded) {
+    }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && roundCapacityBounded) {
       roundExitReasonReg := TrafficGenRoundExitReason.capacity
       lastHasPendingWork := true.B
         state := sDrainOutputs
-    }.elsewhen(allAccessLanesDone && !roundMemoryHasWork) {
+    }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork) {
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       lastHasPendingWork := pendingAfterExit
       state := sDrainOutputs
@@ -1056,8 +1104,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     wakeExitPending := false.B
     roundExitReasonReg := TrafficGenRoundExitReason.scheduling
     lastHasPendingWork := false.B
-    lastAccessReadRespId := io.accessReadRespId
-    accessReadConsumePending := false.B
+    accessReadConsumePendingMask := 0.U
+    accessReadLaneSlot.foreach(_ := 0.U)
+    for (slot <- 0 until replaySlots) {
+      lastAccessReadRespGenerations(slot) := accessReadRespGenerations(slot)
+    }
     issuedBatchId := 0.U
     completedBundleCount := 0.U
     for (e <- 0 until bundleTableEntries) {

@@ -160,6 +160,19 @@ object TrafficGenAccessBatch {
   val lanes = 16
 }
 
+object TrafficGenReplaySlots {
+  val rtlSlotsPerLane = 3
+
+  def slotsPerLane(useRTL: Boolean): Int =
+    if (useRTL) rtlSlotsPerLane else 1
+
+  def totalSlots(useRTL: Boolean): Int =
+    TrafficGenAccessBatch.lanes * slotsPerLane(useRTL)
+
+  def flatIndex(lane: Int, slot: Int, useRTL: Boolean): Int =
+    lane * slotsPerLane(useRTL) + slot
+}
+
 class IssuedAccessBatch extends Bundle {
   val batchId = UInt(32.W)
   val validMask = UInt(TrafficGenAccessBatch.lanes.W)
@@ -185,6 +198,7 @@ object TrafficGenRoundExitReason {
 }
 
 class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL)
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -206,14 +220,14 @@ class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val accessReadEn = Output(Bool())
   val accessReadBatchReady = Output(Bool())
   val accessReadRespValid = Input(Bool())
-  val accessReadRespId = Input(UInt(32.W))
+  val accessReadRespId = Input(UInt((2 * replaySlots).W))
   private val accessStreamWidth =
     if (useRTL) RTLL2Access.streamWidthBits else L2Access.streamWidthBits
-  val accessReadData = Input(Vec(TrafficGenAccessBatch.lanes, UInt(accessStreamWidth.W)))
-  val accessReadDataValid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
+  val accessReadData = Input(Vec(replaySlots, UInt(accessStreamWidth.W)))
+  val accessReadDataValid = Input(Vec(replaySlots, Bool()))
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
-  val accessReadConsumeMask = Output(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadConsumeMask = Output(UInt(replaySlots.W))
   val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
   val accessReadPrefetchPauseReq = Input(Bool())
   val accessReadPrefetchPauseAck = Output(Bool())

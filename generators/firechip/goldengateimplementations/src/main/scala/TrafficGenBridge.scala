@@ -105,19 +105,27 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val completedBundleIdBeats = CompletedBundleIds.beats
     val completedBundleBeatIdxWidth = log2Ceil(completedBundleIdBeats)
 
+    // bridge protocol width for parallelism (i.e. 16)
     private val replayLanes = TrafficGenAccessBatch.lanes
+    private val replaySlotsPerLane = TrafficGenReplaySlots.slotsPerLane(key.useRTL)
+    private val replaySlots = TrafficGenReplaySlots.totalSlots(key.useRTL)
+    private val replaySlotSelectWidth = log2Ceil(replaySlotsPerLane max 2)
+    private val replaySlotIdxWidth = log2Ceil(replaySlots)
     require(key.maxL2AccessEntries % replayLanes == 0,
       "TrafficGen banked replay requires maxL2AccessEntries to divide evenly across lanes")
+    // how many entries per lane bank
     private val laneBankDepth = key.maxL2AccessEntries / replayLanes
     private val laneBankIdxWidth = log2Ceil(laneBankDepth max 2)
     private val laneBankCountWidth = log2Ceil(laneBankDepth + 1)
 
     /*
+
+      ISSUED ACCESS WRITEBACK
+
       Target-issued accesses are buffered into issuedAccessWritebackStore for logging in the GPU model
     */
 
-    // Each target issue lane owns one writeback bank.  A masked issued batch
-    // can therefore commit every firing lane in one bridge cycle.
+    // 16 SyncReadMem banks, one per lane, to store issued-access batches from target
     val issuedAccessWritebackStores = Seq.fill(replayLanes) {
       val mem = SyncReadMem(laneBankDepth, UInt(issuedStreamWidth.W))
       RAMStyleHint(mem, RAMStyles.BLOCK)
@@ -125,10 +133,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     val issuedAccessWritebackCount = RegInit(0.U(32.W))
     val issuedAccessWritebackLaneCounts = RegInit(VecInit(Seq.fill(replayLanes)(0.U(32.W))))
+
+    // set a monotonically increasing expected batch ID that tracks the batchID set in the target
+    // to ensure that we don't drop issued-access batches
     val issuedBatchExpectedId = RegInit(0.U(32.W))
+
+    // convert the flat 3088-bit UInt into a Vec of 16x193 bit IssuedAccesses
     val issuedBatchPackedLanes =
       target.issuedAccessBatch.bits.accesses.asTypeOf(Vec(replayLanes, UInt(issuedStreamWidth.W)))
     val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
+
+    // check that every valid lane in incoming issued batch has space in corresponding writeback lane bank
+    // e.g. batch doesn't contain that lane, or lane write-back bank not full
     val issuedBatchFits = VecInit((0 until replayLanes).map { lane =>
       !target.issuedAccessBatch.bits.validMask(lane) ||
         issuedAccessWritebackLaneCounts(lane) < laneBankDepth.U
@@ -157,6 +173,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
 
+    // read path for bridge driver to read issuedAccessWritebackStores through XDMA/AXI interface
+
     // SyncReadMem writes commit on the bridge edge after capture.  Keep an
     // explicit one-cycle fence for round-completion visibility.
     val issuedWriteCommitPending = RegNext(issuedBatchCapture, false.B)
@@ -172,13 +190,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     })
 
     /*
+
+      COMPLETED BUNDLE IDs
+
       * completed bundle IDs are written by the target during/after traffic generator, and used for scheduling next batch of accesses
+
     */
 
     // Store completed bundle IDs completed by target, to be streamed back to the bridge driver.
     val completedBundleIds = SyncReadMem(completedBundleIdBeats, Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
-    // This Vec memory lowers to one physical memory per lane. A single RAMStyleHint
-    // on the aggregate fans out during FIRRTL renaming, which Golden Gate rejects.
+
     val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
     val completedBundleIdsWriteEn = WireDefault(false.B)
     val completedBundleIdsWriteAddr = WireDefault(0.U(completedBundleBeatIdxWidth.W))
@@ -211,11 +232,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val completedBundleReadBits = completedBundleIds.read(axiRawCompletedReadIdx, axiRawCompletedReadEn)
 
     /*
-     * Raw XDMA-uploaded L2 accesses from the bridge driver.
+
+      L2 ACCESS UPLOAD AND READ
+
+     * Raw XDMA-uploaded L2 accesses from the bridge driver
+     * 16-parallel independent read lanes from bridge module to target
+
      */
 
-    // Store uploaded accesses lane-major.  Every bank has its own read port and
-    // a two-entry target-facing prefetch FIFO.
+    // Store uploaded accesses lane-major
+    // Every bank has its own read port and a two-entry target-facing prefetch FIFO
     val accessStores = Seq.fill(replayLanes) {
       val mem = SyncReadMem(laneBankDepth, UInt(accessStreamWidth.W))
       RAMStyleHint(mem, RAMStyles.BLOCK)
@@ -227,6 +253,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val accessStoreHasMore = RegInit(false.B)
     val uploadLaneCounts = RegInit(VecInit(Seq.fill(replayLanes)(0.U(32.W))))
 
+    // enable, address, and data for each lane's SyncReadMem write from XDMA/AXI
     val accessStoreWriteEn = Wire(Vec(replayLanes, Bool()))
     val accessStoreWriteAddr = Wire(Vec(replayLanes, UInt(laneBankIdxWidth.W)))
     val accessStoreWriteData = Wire(Vec(replayLanes, UInt(accessStreamWidth.W)))
@@ -244,65 +271,180 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val uploadHasMore = RegInit(false.B)
 
     val uploadReady = RegInit(false.B)
+    // prefetch FIFOs have not been sufficiently filled for target to start replay
     val accessReadPrefillPending = RegInit(false.B)
     val accessReplayActive = RegInit(false.B)
 
     // reset the target-side access-read response state when a fresh upload begins
     val accessReadReset = WireDefault(false.B)
 
-    val accessReadQueues = Seq.fill(replayLanes) {
+    // Three independently consumable two-entry prefetch FIFOs per RTL replay
+    // lane. The DPI backend retains one FIFO per lane.
+    val accessReadQueues = Seq.fill(replaySlots) {
       withReset(reset.asBool || accessReadReset) {
         Module(new Queue(UInt(accessStreamWidth.W), 2, pipe = true, flow = false))
       }
     }
-    val accessReadCursors = RegInit(VecInit(Seq.fill(replayLanes)(0.U(laneBankCountWidth.W))))
+
+    // Slot s reads lane-bank entries s, s + slotsPerLane, ... . One bank read
+    // pipeline per physical lane round-robins among the slot FIFOs.
+    val accessReadCursors = RegInit(VecInit(Seq.tabulate(replaySlots) { flat =>
+      (flat % replaySlotsPerLane).U(laneBankCountWidth.W)
+    }))
     val accessReadFetchPending = RegInit(VecInit(Seq.fill(replayLanes)(false.B)))
+    val accessReadFetchPendingSlot =
+      RegInit(VecInit(Seq.fill(replayLanes)(0.U(replaySlotSelectWidth.W))))
+    val accessReadFetchRoundRobin =
+      RegInit(VecInit(Seq.fill(replayLanes)(0.U(replaySlotSelectWidth.W))))
+    val accessReadExpectedConsumeSlot =
+      RegInit(VecInit(Seq.fill(replayLanes)(0.U(replaySlotSelectWidth.W))))
+
+    // read enable, address, bits for each lane's bank read
     val accessReadBankReadEn = Wire(Vec(replayLanes, Bool()))
     val accessReadBankReadAddr = Wire(Vec(replayLanes, UInt(laneBankIdxWidth.W)))
     val accessReadBankReadBits = Wire(Vec(replayLanes, UInt(accessStreamWidth.W)))
-    val accessReadConsume = Wire(Vec(replayLanes, Bool()))
+
+    // per-slot pulse that removes a prefetched head
+    val accessReadConsume = Wire(Vec(replaySlots, Bool()))
+    val accessReadSlotDone = Wire(Vec(replaySlots, Bool()))
 
     for (lane <- 0 until replayLanes) {
-      val queue = accessReadQueues(lane)
-      val canFetch = accessReadCursors(lane) < uploadLaneCounts(lane) &&
-        queue.io.enq.ready && !accessReadReset &&
-        (accessReadPrefillPending || accessReplayActive)
-      accessReadBankReadEn(lane) := canFetch
-      accessReadBankReadAddr(lane) := accessReadCursors(lane)(laneBankIdxWidth - 1, 0)
-      accessReadBankReadBits(lane) := accessStores(lane).read(
-        accessReadBankReadAddr(lane), accessReadBankReadEn(lane))
-
-      queue.io.enq.valid := accessReadFetchPending(lane)
-      queue.io.enq.bits := accessReadBankReadBits(lane)
-      when(canFetch) {
-        accessReadCursors(lane) := accessReadCursors(lane) + 1.U
+      val laneBase = lane * replaySlotsPerLane
+      val pendingResponseAccepted = WireDefault(false.B)
+      for (slot <- 0 until replaySlotsPerLane) {
+        val flat = laneBase + slot
+        val queue = accessReadQueues(flat)
+        queue.io.enq.valid :=
+          accessReadFetchPending(lane) &&
+            accessReadFetchPendingSlot(lane) === slot.U
+        queue.io.enq.bits := accessReadBankReadBits(lane)
+        when(queue.io.enq.fire) {
+          pendingResponseAccepted := true.B
+        }
       }
-      // SyncReadMem is a one-cycle pipeline, not a request/response transaction.
-      // Accept the previous response and launch the next bank read on the same
-      // bridge edge whenever the FIFO can take it.  Serializing those actions
-      // created a refill bubble after two consecutive target consumes, so the
-      // target could observe and re-present a consume mask after the FIFO had
-      // already become empty.
-      accessReadFetchPending(lane) :=
-        (accessReadFetchPending(lane) && !queue.io.enq.fire) || canFetch
 
-      accessReadConsume(lane) := fire && target.accessReadConsumeMask(lane)
-      queue.io.deq.ready := accessReadConsume(lane)
-      when(accessReadConsume(lane)) {
-        assert(queue.io.deq.valid,
-          "TrafficGenBridge consumed an invalid prefetched lane head")
-        assert(queue.io.deq.bits(191, 128) <= target.accessReadCycle,
-          "TrafficGenBridge consumed a lane head before its scheduled cycle")
+      val pipelineCanLaunch =
+        !accessReadFetchPending(lane) || pendingResponseAccepted
+      val slotCanFetch = Wire(Vec(replaySlotsPerLane, Bool()))
+      for (slot <- 0 until replaySlotsPerLane) {
+        val flat = laneBase + slot
+        slotCanFetch(slot) :=
+          pipelineCanLaunch &&
+            accessReadCursors(flat) < uploadLaneCounts(lane) &&
+            accessReadQueues(flat).io.enq.ready &&
+            !accessReadReset &&
+            (accessReadPrefillPending || accessReplayActive)
+      }
+
+      val selectedFetchValid = WireDefault(false.B)
+      val selectedFetchSlot = WireDefault(0.U(replaySlotSelectWidth.W))
+      if (replaySlotsPerLane == 1) {
+        selectedFetchValid := slotCanFetch(0)
+      } else {
+        switch(accessReadFetchRoundRobin(lane)) {
+          is(0.U) {
+            when(slotCanFetch(0)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 0.U
+            }.elsewhen(slotCanFetch(1)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 1.U
+            }.elsewhen(slotCanFetch(2)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 2.U
+            }
+          }
+          is(1.U) {
+            when(slotCanFetch(1)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 1.U
+            }.elsewhen(slotCanFetch(2)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 2.U
+            }.elsewhen(slotCanFetch(0)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 0.U
+            }
+          }
+          is(2.U) {
+            when(slotCanFetch(2)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 2.U
+            }.elsewhen(slotCanFetch(0)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 0.U
+            }.elsewhen(slotCanFetch(1)) {
+              selectedFetchValid := true.B
+              selectedFetchSlot := 1.U
+            }
+          }
+        }
+      }
+
+      val selectedFetchFlat = Wire(UInt(replaySlotIdxWidth.W))
+      selectedFetchFlat :=
+        laneBase.U(replaySlotIdxWidth.W) + selectedFetchSlot
+      accessReadBankReadEn(lane) := selectedFetchValid
+      accessReadBankReadAddr(lane) :=
+        accessReadCursors(selectedFetchFlat)(laneBankIdxWidth - 1, 0)
+      accessReadBankReadBits(lane) := accessStores(lane).read(accessReadBankReadAddr(lane), accessReadBankReadEn(lane))
+
+      when(selectedFetchValid) {
+        accessReadCursors(selectedFetchFlat) :=
+          accessReadCursors(selectedFetchFlat) + replaySlotsPerLane.U
+        accessReadFetchPendingSlot(lane) := selectedFetchSlot
+        accessReadFetchRoundRobin(lane) :=
+          Mux(selectedFetchSlot === (replaySlotsPerLane - 1).U,
+            0.U, selectedFetchSlot + 1.U)
+      }
+      accessReadFetchPending(lane) :=
+        (accessReadFetchPending(lane) && !pendingResponseAccepted) ||
+          selectedFetchValid
+
+      val laneConsumeMask =
+        target.accessReadConsumeMask(laneBase + replaySlotsPerLane - 1, laneBase)
+      when(fire) {
+        assert(PopCount(laneConsumeMask) <= 1.U,
+          "TrafficGenBridge consumed more than one slot from a replay lane")
+      }
+      when(fire && laneConsumeMask.orR) {
+        assert(laneConsumeMask ===
+          UIntToOH(accessReadExpectedConsumeSlot(lane), replaySlotsPerLane),
+          "TrafficGenBridge consumed replay slots out of lane order")
+        accessReadExpectedConsumeSlot(lane) :=
+          Mux(accessReadExpectedConsumeSlot(lane) === (replaySlotsPerLane - 1).U,
+            0.U, accessReadExpectedConsumeSlot(lane) + 1.U)
+      }
+      for (slot <- 0 until replaySlotsPerLane) {
+        val flat = laneBase + slot
+        val queue = accessReadQueues(flat)
+        accessReadConsume(flat) := fire && target.accessReadConsumeMask(flat)
+        queue.io.deq.ready := accessReadConsume(flat)
+        when(accessReadConsume(flat)) {
+          assert(queue.io.deq.valid,
+            "TrafficGenBridge consumed an invalid prefetched replay slot")
+          assert(queue.io.deq.bits(191, 128) <= target.accessReadCycle,
+            "TrafficGenBridge consumed a replay slot before its scheduled cycle")
+        }
+        accessReadSlotDone(flat) :=
+          accessReadCursors(flat) >= uploadLaneCounts(lane) &&
+            !(accessReadFetchPending(lane) &&
+              accessReadFetchPendingSlot(lane) === slot.U) &&
+            !queue.io.deq.valid
       }
     }
 
+    // A physical lane is complete only after all three striped slot streams
+    // have drained.
     val accessReadLaneDone = VecInit((0 until replayLanes).map { lane =>
-      accessReadCursors(lane) >= uploadLaneCounts(lane) &&
-        !accessReadFetchPending(lane) && !accessReadQueues(lane).io.deq.valid
+      val laneBase = lane * replaySlotsPerLane
+      accessReadSlotDone.slice(laneBase, laneBase + replaySlotsPerLane).reduce(_ && _)
     })
-    val accessReadHeadMissing = VecInit((0 until replayLanes).map { lane =>
-      !accessReadLaneDone(lane) && !accessReadQueues(lane).io.deq.valid
+    val accessReadHeadMissing = VecInit((0 until replaySlots).map { flat =>
+      !accessReadSlotDone(flat) && !accessReadQueues(flat).io.deq.valid
     })
+
+    // active lane is temporarily empty, but lane is not finished, so pause the target until the lane can be refilled
     val accessReadNeedsPause =
       (accessReadPrefillPending || accessReplayActive) && accessReadHeadMissing.asUInt.orR
     val issuedBatchSafeToPause = !target.issuedAccessBatch.valid || issuedBatchCapture
@@ -312,14 +454,33 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.accessReadData := VecInit(accessReadQueues.map(_.io.deq.bits))
     target.accessReadDataValid := VecInit(accessReadQueues.map(_.io.deq.valid))
     target.accessReadRespValid := target.accessReadDataValid.asUInt.orR || accessReadLaneDone.asUInt.andR
-    val accessReadRespId = RegInit(0.U(32.W))
-    when(accessReadConsume.asUInt.orR) {
-      accessReadRespId := accessReadRespId + 1.U
+    // Every replay slot has an independent two-bit consume generation.
+    val accessReadRespGenerations =
+      RegInit(VecInit(Seq.fill(replaySlots)(0.U(2.W))))
+    for (slot <- 0 until replaySlots) {
+      when(accessReadConsume(slot)) {
+        accessReadRespGenerations(slot) := accessReadRespGenerations(slot) + 1.U
+      }
     }
-    target.accessReadRespId := accessReadRespId
+    target.accessReadRespId := accessReadRespGenerations.asUInt
+
+    val accessReadGenerationsPrev = RegNext(accessReadRespGenerations.asUInt)
+    val accessReadConsumePrev = RegNext(accessReadConsume.asUInt, 0.U)
+    val accessReadGenerationCheckValid = RegNext(
+      !(accessReadReset || trafficGenDonePulse), false.B)
+    when(accessReadGenerationCheckValid) {
+      for (slot <- 0 until replaySlots) {
+        assert(
+          (accessReadRespGenerations(slot) =/=
+            accessReadGenerationsPrev(2 * slot + 1, 2 * slot)) ===
+            accessReadConsumePrev(slot),
+          "TrafficGenBridge slot generation change did not match its consume")
+      }
+    }
     target.accessReadBucketDone := accessReadLaneDone.asUInt.andR
     target.accessReadReady := true.B
 
+    // pause the target
     when(accessReadNeedsPause && fire && target.accessReadPrefetchPauseAck && issuedBatchSafeToPause) {
       assert(!target.issuedAccessBatch.valid || issuedBatchCapture,
         "TrafficGenBridge paused before capturing a pending issued-access batch")
@@ -336,11 +497,16 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         "TrafficGenBridge target cycle advanced during prefetch quiescence")
     }
 
-    val accessReadPrefillComplete = VecInit((0 until replayLanes).map { lane =>
-      uploadLaneCounts(lane) === 0.U ||
-        accessReadQueues(lane).io.count === 2.U ||
-        (accessReadCursors(lane) >= uploadLaneCounts(lane) &&
-          !accessReadFetchPending(lane) && accessReadQueues(lane).io.deq.valid)
+    // check that the prefill FIFOs have been filled for all lanes before allowing the target to start replaying
+    val accessReadPrefillComplete = VecInit((0 until replaySlots).map { flat =>
+      val lane = flat / replaySlotsPerLane
+      val slot = flat % replaySlotsPerLane
+      uploadLaneCounts(lane) <= slot.U ||
+        accessReadQueues(flat).io.count === 2.U ||
+        (accessReadCursors(flat) >= uploadLaneCounts(lane) &&
+          !(accessReadFetchPending(lane) &&
+            accessReadFetchPendingSlot(lane) === slot.U) &&
+          accessReadQueues(flat).io.deq.valid)
     }).asUInt.andR
 
     // Once driver indicates the uploads to XDMA are ready,
@@ -367,9 +533,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreMaxCycle := uploadMaxCycle
       accessStoreHasEntries := uploadCount =/= 0.U
       accessStoreHasMore := uploadHasMore
-      accessReadCursors.foreach(_ := 0.U)
+      for (flat <- 0 until replaySlots) {
+        accessReadCursors(flat) := (flat % replaySlotsPerLane).U
+      }
       accessReadFetchPending.foreach(_ := false.B)
-      accessReadRespId := 0.U
+      accessReadFetchPendingSlot.foreach(_ := 0.U)
+      accessReadFetchRoundRobin.foreach(_ := 0.U)
+      accessReadExpectedConsumeSlot.foreach(_ := 0.U)
+      accessReadRespGenerations.foreach(_ := 0.U)
     }
 
     when(accessReadPrefillPending && accessReadPrefillComplete && !accessReadReset) {
@@ -399,6 +570,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     target.accessStoreHasMore := accessStoreHasMore
 
     /*
+
+      XDMA/AXI READ/WRITE PATH FROM BRIDGE DRIVER
+
      * Direct CPU-managed XDMA access to TrafficGen BRAM-backed stores.
      * Upload writes directly access the physical SyncReadMems.
     */
@@ -655,9 +829,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(targetReset) {
       accessReadReset := true.B
       accessReadTargetPaused := false.B
-      accessReadCursors.foreach(_ := 0.U)
+      for (flat <- 0 until replaySlots) {
+        accessReadCursors(flat) := (flat % replaySlotsPerLane).U
+      }
       accessReadFetchPending.foreach(_ := false.B)
-      accessReadRespId := 0.U
+      accessReadFetchPendingSlot.foreach(_ := 0.U)
+      accessReadFetchRoundRobin.foreach(_ := 0.U)
+      accessReadExpectedConsumeSlot.foreach(_ := 0.U)
+      accessReadRespGenerations.foreach(_ := 0.U)
       issuedAccessWritebackCount := 0.U
       issuedAccessWritebackLaneCounts.foreach(_ := 0.U)
       issuedBatchExpectedId := 0.U
@@ -678,6 +857,22 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       roundCompletePending := false.B
       trafficGenDone := false.B
       currentRound := 0.U
+    }
+
+    when(trafficGenDonePulse) {
+      accessReadReset := true.B
+      accessReadTargetPaused := false.B
+      accessReplayActive := false.B
+      accessReadPrefillPending := false.B
+      uploadReady := false.B
+      for (flat <- 0 until replaySlots) {
+        accessReadCursors(flat) := (flat % replaySlotsPerLane).U
+      }
+      accessReadFetchPending.foreach(_ := false.B)
+      accessReadFetchPendingSlot.foreach(_ := 0.U)
+      accessReadFetchRoundRobin.foreach(_ := 0.U)
+      accessReadExpectedConsumeSlot.foreach(_ := 0.U)
+      accessReadRespGenerations.foreach(_ := 0.U)
     }
 
     /////////// MMIO registers for bridge driver interaction ///////////
