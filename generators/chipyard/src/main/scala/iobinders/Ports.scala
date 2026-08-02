@@ -25,7 +25,6 @@ import firechip.bridgeinterfaces.{
   IssuedAccessBatch,
   L2Access,
   RTLL2Access,
-  TrafficGenAccessBatch,
   TrafficGenReplaySlots,
 }
 
@@ -128,8 +127,9 @@ case class OffchipSelPort  (val getIO: () => UInt)
 case class CTCPort (val getIO: () => Data, val portId: Int) 
     extends Port[Data]
 
-class TrafficGenPortPeripheralIO(useRTL: Boolean) extends Bundle {
-  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL)
+class TrafficGenPortPeripheralIO(numLanes: Int, useRTL: Boolean) extends Bundle {
+  require(numLanes >= 1, "TrafficGenPortPeripheralIO requires at least one lane")
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(numLanes, useRTL)
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -138,7 +138,7 @@ class TrafficGenPortPeripheralIO(useRTL: Boolean) extends Bundle {
   val roundExitReason = Output(UInt(2.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch(numLanes))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
@@ -159,7 +159,7 @@ class TrafficGenPortPeripheralIO(useRTL: Boolean) extends Bundle {
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
   val accessReadConsumeMask = Output(UInt(replaySlots.W))
-  val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadLaneDoneMask = Input(UInt(numLanes.W))
   val accessReadPrefetchPauseReq = Input(Bool())
   val accessReadPrefetchPauseAck = Output(Bool())
   val accessStoreCount = Input(UInt(32.W))

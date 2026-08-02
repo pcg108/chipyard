@@ -13,14 +13,16 @@ import firechip.bridgeinterfaces._
 class TrafficGenBridge()(implicit p: Parameters) extends BlackBox
     with Bridge[HostPortIO[TrafficGenBridgeTargetIO]] {
   val moduleName = "firechip.goldengateimplementations.TrafficGenBridgeModule"
+  private val trafficGenParams = p(chipyard.example.TrafficGenKey).get
   private val useRTL =
-    p(chipyard.example.TrafficGenKey).get.backend == chipyard.example.TrafficGenRTLBackend
+    trafficGenParams.backend == chipyard.example.TrafficGenRTLBackend
   private val bridgeKey = TrafficGenBridgeKey(
-    p(chipyard.example.TrafficGenKey).get.maxL2AccessEntries,
+    trafficGenParams.maxL2AccessEntries,
+    trafficGenParams.numGenerators,
     useRTL,
   )
 
-  val io = IO(new TrafficGenBridgeTargetIO(useRTL))
+  val io = IO(new TrafficGenBridgeTargetIO(trafficGenParams.numGenerators, useRTL))
   val bridgeIO = HostPort(io)
   val constructorArg = Some(bridgeKey)
 

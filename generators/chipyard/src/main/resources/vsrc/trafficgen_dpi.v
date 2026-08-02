@@ -1,40 +1,5 @@
-`define TG_ACCESS_READ_PORTS(idx) \
-  input  logic        access_read_data_valid_``idx, \
-  input  logic [63:0] access_read_id_``idx, \
-  input  logic [63:0] access_read_address_``idx, \
-  input  logic [63:0] access_read_cycle_count_``idx, \
-  input  logic [31:0] access_read_subpartition_``idx, \
-  input  logic [31:0] access_read_set_index_``idx, \
-  input  logic [63:0] access_read_tag_``idx, \
-  input  logic [31:0] access_read_mask_``idx, \
-  input  logic [31:0] access_read_sm_id_``idx, \
-  input  logic [7:0]  access_read_scheduler_id_``idx, \
-  input  logic [31:0] access_read_warp_id_``idx, \
-  input  logic [63:0] access_read_bundle_id_``idx, \
-  input  logic        access_read_wake_relevant_bundle_``idx, \
-  input  logic        access_read_is_write_``idx, \
-  input  logic        access_read_warp_blocked_``idx,
-
-`define TG_ACCESS_READ_ASSIGN(idx) \
-  assign access_read_data_valid_batch[idx] = access_read_data_valid_``idx; \
-  assign access_read_id_batch[idx] = access_read_id_``idx; \
-  assign access_read_address_batch[idx] = access_read_address_``idx; \
-  assign access_read_cycle_count_batch[idx] = access_read_cycle_count_``idx; \
-  assign access_read_subpartition_batch[idx] = access_read_subpartition_``idx; \
-  assign access_read_set_index_batch[idx] = access_read_set_index_``idx; \
-  assign access_read_tag_batch[idx] = access_read_tag_``idx; \
-  assign access_read_mask_batch[idx] = access_read_mask_``idx; \
-  assign access_read_sm_id_batch[idx] = access_read_sm_id_``idx; \
-  assign access_read_scheduler_id_batch[idx] = access_read_scheduler_id_``idx; \
-  assign access_read_warp_id_batch[idx] = access_read_warp_id_``idx; \
-  assign access_read_bundle_id_batch[idx] = access_read_bundle_id_``idx; \
-  assign access_read_wake_relevant_bundle_batch[idx] = access_read_wake_relevant_bundle_``idx; \
-  assign access_read_is_write_batch[idx] = access_read_is_write_``idx; \
-  assign access_read_warp_blocked_batch[idx] = access_read_warp_blocked_``idx;
-
 module TrafficGenDPIBlackBox #(
-  parameter int NGENERATORS = 1,
-  parameter int ACCESS_READ_BATCH_LANES = 16
+  parameter int NGENERATORS = 1
 ) (
   input  logic        clock,
   input  logic        reset,
@@ -49,22 +14,21 @@ module TrafficGenDPIBlackBox #(
   input  logic [31:0] access_read_resp_id,
   input  logic        access_read_bucket_done,
   input  logic        access_read_ready,
-  `TG_ACCESS_READ_PORTS(0)
-  `TG_ACCESS_READ_PORTS(1)
-  `TG_ACCESS_READ_PORTS(2)
-  `TG_ACCESS_READ_PORTS(3)
-  `TG_ACCESS_READ_PORTS(4)
-  `TG_ACCESS_READ_PORTS(5)
-  `TG_ACCESS_READ_PORTS(6)
-  `TG_ACCESS_READ_PORTS(7)
-  `TG_ACCESS_READ_PORTS(8)
-  `TG_ACCESS_READ_PORTS(9)
-  `TG_ACCESS_READ_PORTS(10)
-  `TG_ACCESS_READ_PORTS(11)
-  `TG_ACCESS_READ_PORTS(12)
-  `TG_ACCESS_READ_PORTS(13)
-  `TG_ACCESS_READ_PORTS(14)
-  `TG_ACCESS_READ_PORTS(15)
+  input  logic [NGENERATORS-1:0]    access_read_data_valid,
+  input  logic [NGENERATORS*64-1:0] access_read_id,
+  input  logic [NGENERATORS*64-1:0] access_read_address,
+  input  logic [NGENERATORS*64-1:0] access_read_cycle_count,
+  input  logic [NGENERATORS*32-1:0] access_read_subpartition,
+  input  logic [NGENERATORS*32-1:0] access_read_set_index,
+  input  logic [NGENERATORS*64-1:0] access_read_tag,
+  input  logic [NGENERATORS*32-1:0] access_read_mask,
+  input  logic [NGENERATORS*32-1:0] access_read_sm_id,
+  input  logic [NGENERATORS*8-1:0]  access_read_scheduler_id,
+  input  logic [NGENERATORS*32-1:0] access_read_warp_id,
+  input  logic [NGENERATORS*64-1:0] access_read_bundle_id,
+  input  logic [NGENERATORS-1:0]    access_read_wake_relevant_bundle,
+  input  logic [NGENERATORS-1:0]    access_read_is_write,
+  input  logic [NGENERATORS-1:0]    access_read_warp_blocked,
   input  logic        issued_access_writeback_ready,
   output logic        target_busy,
   output logic        has_pending_work,
@@ -153,38 +117,39 @@ module TrafficGenDPIBlackBox #(
   logic [31:0] debug_completion_event_warp_id_dpi;
   logic [63:0] debug_completion_event_cycle_dpi;
 
-  bit              access_read_data_valid_batch [ACCESS_READ_BATCH_LANES];
-  longint unsigned access_read_id_batch [ACCESS_READ_BATCH_LANES];
-  longint unsigned access_read_address_batch [ACCESS_READ_BATCH_LANES];
-  longint unsigned access_read_cycle_count_batch [ACCESS_READ_BATCH_LANES];
-  int unsigned     access_read_subpartition_batch [ACCESS_READ_BATCH_LANES];
-  int unsigned     access_read_set_index_batch [ACCESS_READ_BATCH_LANES];
-  longint unsigned access_read_tag_batch [ACCESS_READ_BATCH_LANES];
-  int unsigned     access_read_mask_batch [ACCESS_READ_BATCH_LANES];
-  int unsigned     access_read_sm_id_batch [ACCESS_READ_BATCH_LANES];
-  byte unsigned    access_read_scheduler_id_batch [ACCESS_READ_BATCH_LANES];
-  int unsigned     access_read_warp_id_batch [ACCESS_READ_BATCH_LANES];
-  longint unsigned access_read_bundle_id_batch [ACCESS_READ_BATCH_LANES];
-  bit              access_read_wake_relevant_bundle_batch [ACCESS_READ_BATCH_LANES];
-  bit              access_read_is_write_batch [ACCESS_READ_BATCH_LANES];
-  bit              access_read_warp_blocked_batch [ACCESS_READ_BATCH_LANES];
+  bit              access_read_data_valid_batch [NGENERATORS];
+  longint unsigned access_read_id_batch [NGENERATORS];
+  longint unsigned access_read_address_batch [NGENERATORS];
+  longint unsigned access_read_cycle_count_batch [NGENERATORS];
+  int unsigned     access_read_subpartition_batch [NGENERATORS];
+  int unsigned     access_read_set_index_batch [NGENERATORS];
+  longint unsigned access_read_tag_batch [NGENERATORS];
+  int unsigned     access_read_mask_batch [NGENERATORS];
+  int unsigned     access_read_sm_id_batch [NGENERATORS];
+  byte unsigned    access_read_scheduler_id_batch [NGENERATORS];
+  int unsigned     access_read_warp_id_batch [NGENERATORS];
+  longint unsigned access_read_bundle_id_batch [NGENERATORS];
+  bit              access_read_wake_relevant_bundle_batch [NGENERATORS];
+  bit              access_read_is_write_batch [NGENERATORS];
+  bit              access_read_warp_blocked_batch [NGENERATORS];
 
-  `TG_ACCESS_READ_ASSIGN(0)
-  `TG_ACCESS_READ_ASSIGN(1)
-  `TG_ACCESS_READ_ASSIGN(2)
-  `TG_ACCESS_READ_ASSIGN(3)
-  `TG_ACCESS_READ_ASSIGN(4)
-  `TG_ACCESS_READ_ASSIGN(5)
-  `TG_ACCESS_READ_ASSIGN(6)
-  `TG_ACCESS_READ_ASSIGN(7)
-  `TG_ACCESS_READ_ASSIGN(8)
-  `TG_ACCESS_READ_ASSIGN(9)
-  `TG_ACCESS_READ_ASSIGN(10)
-  `TG_ACCESS_READ_ASSIGN(11)
-  `TG_ACCESS_READ_ASSIGN(12)
-  `TG_ACCESS_READ_ASSIGN(13)
-  `TG_ACCESS_READ_ASSIGN(14)
-  `TG_ACCESS_READ_ASSIGN(15)
+  for (genvar lane = 0; lane < NGENERATORS; lane++) begin : gen_access_read_unpack
+    assign access_read_data_valid_batch[lane] = access_read_data_valid[lane];
+    assign access_read_id_batch[lane] = access_read_id[lane*64 +: 64];
+    assign access_read_address_batch[lane] = access_read_address[lane*64 +: 64];
+    assign access_read_cycle_count_batch[lane] = access_read_cycle_count[lane*64 +: 64];
+    assign access_read_subpartition_batch[lane] = access_read_subpartition[lane*32 +: 32];
+    assign access_read_set_index_batch[lane] = access_read_set_index[lane*32 +: 32];
+    assign access_read_tag_batch[lane] = access_read_tag[lane*64 +: 64];
+    assign access_read_mask_batch[lane] = access_read_mask[lane*32 +: 32];
+    assign access_read_sm_id_batch[lane] = access_read_sm_id[lane*32 +: 32];
+    assign access_read_scheduler_id_batch[lane] = access_read_scheduler_id[lane*8 +: 8];
+    assign access_read_warp_id_batch[lane] = access_read_warp_id[lane*32 +: 32];
+    assign access_read_bundle_id_batch[lane] = access_read_bundle_id[lane*64 +: 64];
+    assign access_read_wake_relevant_bundle_batch[lane] = access_read_wake_relevant_bundle[lane];
+    assign access_read_is_write_batch[lane] = access_read_is_write[lane];
+    assign access_read_warp_blocked_batch[lane] = access_read_warp_blocked[lane];
+  end
 
   import "DPI-C" function void trafficgen_dpi_step(
     input  bit                reset,
@@ -197,23 +162,24 @@ module TrafficGenDPIBlackBox #(
     input  longint unsigned   min_issue_cycle,
     input  bit                access_read_resp_valid,
     input  int unsigned       access_read_resp_id,
-    input  bit                access_read_data_valid [ACCESS_READ_BATCH_LANES],
+    input  int unsigned       access_read_batch_lanes,
+    input  bit                access_read_data_valid [NGENERATORS],
     input  bit                access_read_bucket_done,
     input  bit                access_read_ready,
-    input  longint unsigned   access_read_id [ACCESS_READ_BATCH_LANES],
-    input  longint unsigned   access_read_address [ACCESS_READ_BATCH_LANES],
-    input  longint unsigned   access_read_cycle_count [ACCESS_READ_BATCH_LANES],
-    input  int unsigned       access_read_subpartition [ACCESS_READ_BATCH_LANES],
-    input  int unsigned       access_read_set_index [ACCESS_READ_BATCH_LANES],
-    input  longint unsigned   access_read_tag [ACCESS_READ_BATCH_LANES],
-    input  int unsigned       access_read_mask [ACCESS_READ_BATCH_LANES],
-    input  int unsigned       access_read_sm_id [ACCESS_READ_BATCH_LANES],
-    input  byte unsigned      access_read_scheduler_id [ACCESS_READ_BATCH_LANES],
-    input  int unsigned       access_read_warp_id [ACCESS_READ_BATCH_LANES],
-    input  longint unsigned   access_read_bundle_id [ACCESS_READ_BATCH_LANES],
-    input  bit                access_read_wake_relevant_bundle [ACCESS_READ_BATCH_LANES],
-    input  bit                access_read_is_write [ACCESS_READ_BATCH_LANES],
-    input  bit                access_read_warp_blocked [ACCESS_READ_BATCH_LANES],
+    input  longint unsigned   access_read_id [NGENERATORS],
+    input  longint unsigned   access_read_address [NGENERATORS],
+    input  longint unsigned   access_read_cycle_count [NGENERATORS],
+    input  int unsigned       access_read_subpartition [NGENERATORS],
+    input  int unsigned       access_read_set_index [NGENERATORS],
+    input  longint unsigned   access_read_tag [NGENERATORS],
+    input  int unsigned       access_read_mask [NGENERATORS],
+    input  int unsigned       access_read_sm_id [NGENERATORS],
+    input  byte unsigned      access_read_scheduler_id [NGENERATORS],
+    input  int unsigned       access_read_warp_id [NGENERATORS],
+    input  longint unsigned   access_read_bundle_id [NGENERATORS],
+    input  bit                access_read_wake_relevant_bundle [NGENERATORS],
+    input  bit                access_read_is_write [NGENERATORS],
+    input  bit                access_read_warp_blocked [NGENERATORS],
     input  bit                issued_access_writeback_ready,
     output bit                target_busy,
     output bit                has_pending_work,
@@ -269,6 +235,7 @@ module TrafficGenDPIBlackBox #(
       min_issue_cycle,
       access_read_resp_valid,
       access_read_resp_id,
+      NGENERATORS,
       access_read_data_valid_batch,
       access_read_bucket_done,
       access_read_ready,
@@ -372,6 +339,3 @@ module TrafficGenDPIBlackBox #(
   end
 
 endmodule
-
-`undef TG_ACCESS_READ_PORTS
-`undef TG_ACCESS_READ_ASSIGN

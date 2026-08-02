@@ -231,11 +231,17 @@ class FireSimRocketWithRTLTrafficGenL2Config extends Config(
   new WithGPGPUSimLikeInclusiveL2 ++
   new FireSimRocketWithRTLTrafficGenConfig)
 
-class FireSimRocketWithRTLTrafficGenL2NoTracerVConfig extends Config(
+class FireSimRocketWithRTLTrafficGenL2NoTracerVConfig
+  extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(16)
+
+class FireSimRocketWithRTLTrafficGenL2NoTracerV8Config
+  extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(8)
+
+class FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(numGenerators: Int) extends Config(
   new chipyard.config.WithNoTraceIO ++
   new chipyard.example.WithTrafficGenMemL2 ++
   new WithGPGPUSimLikeInclusiveL2 ++
-  new chipyard.example.WithRTLTrafficGen ++
+  new chipyard.example.WithRTLTrafficGen(numGenerators) ++
   new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
   new WithTrafficGenBridge ++
   new freechips.rocketchip.subsystem.WithExtMemSize((1L << 30) * 8) ++

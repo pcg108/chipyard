@@ -62,7 +62,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
   lazy val module = new BridgeModuleImp(this) {
     val io = IO(new WidgetIO())
-    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key.useRTL)))
+    val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key.numLanes, key.useRTL)))
     val target = hPort.hBits.trafficgen
 
     /*
@@ -105,10 +105,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val completedBundleIdBeats = CompletedBundleIds.beats
     val completedBundleBeatIdxWidth = log2Ceil(completedBundleIdBeats)
 
-    // bridge protocol width for parallelism (i.e. 16)
-    private val replayLanes = TrafficGenAccessBatch.lanes
+    // Bridge protocol width and number of independent access-store banks.
+    private val replayLanes = key.numLanes
     private val replaySlotsPerLane = TrafficGenReplaySlots.slotsPerLane(key.useRTL)
-    private val replaySlots = TrafficGenReplaySlots.totalSlots(key.useRTL)
+    private val replaySlots = TrafficGenReplaySlots.totalSlots(replayLanes, key.useRTL)
+    private val replayLaneIdxWidth = log2Ceil(replayLanes max 2)
     private val replaySlotSelectWidth = log2Ceil(replaySlotsPerLane max 2)
     private val replaySlotIdxWidth = log2Ceil(replaySlots)
     require(key.maxL2AccessEntries % replayLanes == 0,
@@ -125,7 +126,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       Target-issued accesses are buffered into issuedAccessWritebackStore for logging in the GPU model
     */
 
-    // 16 SyncReadMem banks, one per lane, to store issued-access batches from target
+    // One SyncReadMem bank per lane to store issued-access batches from target
     val issuedAccessWritebackStores = Seq.fill(replayLanes) {
       val mem = SyncReadMem(laneBankDepth, UInt(issuedStreamWidth.W))
       RAMStyleHint(mem, RAMStyles.BLOCK)
@@ -138,7 +139,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // to ensure that we don't drop issued-access batches
     val issuedBatchExpectedId = RegInit(0.U(32.W))
 
-    // convert the flat 3088-bit UInt into a Vec of 16x193 bit IssuedAccesses
+    // Convert the packed target batch into one issued-access record per lane.
     val issuedBatchPackedLanes =
       target.issuedAccessBatch.bits.accesses.asTypeOf(Vec(replayLanes, UInt(issuedStreamWidth.W)))
     val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
@@ -179,10 +180,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // explicit one-cycle fence for round-completion visibility.
     val issuedWriteCommitPending = RegNext(issuedBatchCapture, false.B)
 
-    val axiRawIssuedReadLane = WireDefault(0.U(log2Ceil(replayLanes).W))
+    val axiRawIssuedReadLane = WireDefault(0.U(replayLaneIdxWidth.W))
     val axiRawIssuedReadIdx = WireDefault(0.U(laneBankIdxWidth.W))
     val axiRawIssuedReadEn = WireDefault(false.B)
-    val axiRawIssuedReadLaneReg = RegInit(0.U(log2Ceil(replayLanes).W))
+    val axiRawIssuedReadLaneReg = RegInit(0.U(replayLaneIdxWidth.W))
     val issuedAccessReadBits = VecInit((0 until replayLanes).map { lane =>
       issuedAccessWritebackStores(lane).read(
         axiRawIssuedReadIdx,
@@ -236,7 +237,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       L2 ACCESS UPLOAD AND READ
 
      * Raw XDMA-uploaded L2 accesses from the bridge driver
-     * 16-parallel independent read lanes from bridge module to target
+     * Parameter-sized independent read lanes from bridge module to target
 
      */
 
@@ -434,8 +435,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       }
     }
 
-    // A physical lane is complete only after all three striped slot streams
-    // have drained.
+    // A physical lane is complete only after all three striped slot streams have drained.
     val accessReadLaneDone = VecInit((0 until replayLanes).map { lane =>
       val laneBase = lane * replaySlotsPerLane
       accessReadSlotDone.slice(laneBase, laneBase + replaySlotsPerLane).reduce(_ && _)
@@ -722,7 +722,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val axiIssuedFlatIdx = beatIndex(
       axiReadAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset)
     val laneDepthForRead = laneBankDepth.U(axiIssuedFlatIdx.getWidth.W)
-    axiRawIssuedReadLane := (axiIssuedFlatIdx / laneDepthForRead)(log2Ceil(replayLanes) - 1, 0)
+    axiRawIssuedReadLane := (axiIssuedFlatIdx / laneDepthForRead)(replayLaneIdxWidth - 1, 0)
     axiRawIssuedReadIdx := (axiIssuedFlatIdx % laneDepthForRead)(laneBankIdxWidth - 1, 0)
     axiRawIssuedReadEn := axiReadIssue && readRawIssued
     when(axiRawIssuedReadEn) {
@@ -895,8 +895,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // bridge driver commits the uploaded L2 accesses
     genWORegInit(uploadCount, "upload_count", 0.U)
-    for (lane <- 0 until replayLanes) {
-      genWORegInit(uploadLaneCounts(lane), s"upload_lane_count_$lane", 0.U)
+    val uploadLaneCountIndex = Wire(UInt(replayLaneIdxWidth.W))
+    val uploadLaneCountValue = Wire(UInt(32.W))
+    val uploadLaneCountWrite = Wire(Bool())
+    genWORegInit(uploadLaneCountIndex, "upload_lane_count_index", 0.U)
+    genWORegInit(uploadLaneCountValue, "upload_lane_count_value", 0.U)
+    Pulsify(genWORegInit(uploadLaneCountWrite, "upload_lane_count_write", false.B), pulseLength = 1)
+    when(uploadLaneCountWrite) {
+      assert(uploadLaneCountIndex < replayLanes.U,
+        "TrafficGenBridge upload lane-count index out of range")
+      when(uploadLaneCountIndex < replayLanes.U) {
+        uploadLaneCounts(uploadLaneCountIndex) := uploadLaneCountValue
+      }
     }
     genWORegInit(uploadMaxCycleLow, "access_store_max_cycle_low", 0.U)
     genWORegInit(uploadMaxCycleHigh, "access_store_max_cycle_high", 0.U)
@@ -915,9 +925,13 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(target.roundExitReason, "round_exit_reason")
     genROReg(target.dpiState, "dpi_state")
     genROReg(issuedAccessWritebackCount, "issued_access_writeback_count")
-    for (lane <- 0 until replayLanes) {
-      genROReg(issuedAccessWritebackLaneCounts(lane), s"issued_lane_count_$lane")
-    }
+    val issuedLaneCountIndex = Wire(UInt(replayLaneIdxWidth.W))
+    genWORegInit(issuedLaneCountIndex, "issued_lane_count_index", 0.U)
+    val issuedLaneCountValue = Mux(
+      issuedLaneCountIndex < replayLanes.U,
+      issuedAccessWritebackLaneCounts(issuedLaneCountIndex),
+      0.U)
+    genROReg(issuedLaneCountValue, "issued_lane_count_value")
 
 
     genROReg(completedBundleCount, "completed_bundle_count")
@@ -941,6 +955,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           UInt64(accessWindowBytes),
           UInt64(completedWindowBytes),
           UInt64(if (key.useRTL) 1 else 0),
+          UInt64(key.numLanes),
         ),
       )
     }

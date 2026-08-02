@@ -19,7 +19,6 @@ import firechip.bridgeinterfaces.{
   IssuedAccessBatch,
   L2Access,
   RTLL2Access,
-  TrafficGenAccessBatch,
   TrafficGenReplaySlots,
   TrafficGenRoundExitReason,
 }
@@ -47,7 +46,11 @@ case class TrafficGenParams(
   remapTraceAddresses: Boolean = false,
   remapBase: BigInt = 0x80000000L,
   remapSize: BigInt = 1L << 32
-)
+) {
+  require(numGenerators >= 1, "TrafficGen requires at least one generator")
+  require(maxL2AccessEntries % numGenerators == 0,
+    "TrafficGen requires maxL2AccessEntries to divide evenly across generators")
+}
 
 case object TrafficGenKey extends Field[Option[TrafficGenParams]](None)
 
@@ -57,7 +60,7 @@ class TrafficGenTopIO(
   val memOutstanding: Int,
   val useRTL: Boolean
 ) extends Bundle {
-  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL)
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(nGenerators, useRTL)
 
   //// Target -> Host control/status
 
@@ -90,7 +93,7 @@ class TrafficGenTopIO(
   //// Target -> Host execution data
 
   // TG issue logic will enqueue the actual issued L2 accesses here with cycleCount updated to the real issue cycle.
-  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch(nGenerators))
 
   // query the L2 access store for an L2 access
   val accessReadCycle = Output(UInt(64.W))
@@ -119,7 +122,7 @@ class TrafficGenTopIO(
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
   val accessReadConsumeMask = Output(UInt(replaySlots.W))
-  val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadLaneDoneMask = Input(UInt(nGenerators.W))
   val accessReadPrefetchPauseReq = Input(Bool())
   val accessReadPrefetchPauseAck = Output(Bool())
   val accessStoreCount = Input(UInt(32.W))
@@ -155,23 +158,23 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
 
     val access_read_resp_valid = Input(Bool())
     val access_read_resp_id = Input(UInt(32.W))
-    val access_read_data_valid = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
+    val access_read_data_valid = Input(UInt(nGenerators.W))
     val access_read_bucket_done = Input(Bool())
     val access_read_ready = Input(Bool())
-    val access_read_id = Input(Vec(TrafficGenAccessBatch.lanes, UInt(64.W)))
-    val access_read_address = Input(Vec(TrafficGenAccessBatch.lanes, UInt(64.W)))
-    val access_read_cycle_count = Input(Vec(TrafficGenAccessBatch.lanes, UInt(64.W)))
-    val access_read_subpartition = Input(Vec(TrafficGenAccessBatch.lanes, UInt(32.W)))
-    val access_read_set_index = Input(Vec(TrafficGenAccessBatch.lanes, UInt(32.W)))
-    val access_read_tag = Input(Vec(TrafficGenAccessBatch.lanes, UInt(64.W)))
-    val access_read_mask = Input(Vec(TrafficGenAccessBatch.lanes, UInt(32.W)))
-    val access_read_sm_id = Input(Vec(TrafficGenAccessBatch.lanes, UInt(32.W)))
-    val access_read_scheduler_id = Input(Vec(TrafficGenAccessBatch.lanes, UInt(8.W)))
-    val access_read_warp_id = Input(Vec(TrafficGenAccessBatch.lanes, UInt(32.W)))
-    val access_read_bundle_id = Input(Vec(TrafficGenAccessBatch.lanes, UInt(64.W)))
-    val access_read_wake_relevant_bundle = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
-    val access_read_is_write = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
-    val access_read_warp_blocked = Input(Vec(TrafficGenAccessBatch.lanes, Bool()))
+    val access_read_id = Input(UInt((nGenerators * 64).W))
+    val access_read_address = Input(UInt((nGenerators * 64).W))
+    val access_read_cycle_count = Input(UInt((nGenerators * 64).W))
+    val access_read_subpartition = Input(UInt((nGenerators * 32).W))
+    val access_read_set_index = Input(UInt((nGenerators * 32).W))
+    val access_read_tag = Input(UInt((nGenerators * 64).W))
+    val access_read_mask = Input(UInt((nGenerators * 32).W))
+    val access_read_sm_id = Input(UInt((nGenerators * 32).W))
+    val access_read_scheduler_id = Input(UInt((nGenerators * 8).W))
+    val access_read_warp_id = Input(UInt((nGenerators * 32).W))
+    val access_read_bundle_id = Input(UInt((nGenerators * 64).W))
+    val access_read_wake_relevant_bundle = Input(UInt(nGenerators.W))
+    val access_read_is_write = Input(UInt(nGenerators.W))
+    val access_read_warp_blocked = Input(UInt(nGenerators.W))
 
     val issued_access_writeback_ready = Input(Bool())
 
@@ -225,32 +228,33 @@ class TrafficGenDPIBlackBox(val nGenerators: Int) extends BlackBox(Map("NGENERAT
   addResource("/vsrc/trafficgen_dpi.v")
 }
 
-/** Adapts the legacy DPI single-record writeback contract to the target-wide
-  * batch protocol without changing the SystemVerilog or C++ ABI.
+/** Adapts the DPI single-record writeback contract to the target-wide batch
+  * protocol. The surrounding DPI ABI carries a parameter-sized lane vector.
   */
-class LegacyIssuedAccessBatchAdapter extends Module {
+class LegacyIssuedAccessBatchAdapter(numLanes: Int) extends Module {
+  require(numLanes >= 1, "LegacyIssuedAccessBatchAdapter requires at least one lane")
   val io = IO(new Bundle {
     val legacy = Flipped(Decoupled(new IssuedAccess))
-    val batch = Decoupled(new IssuedAccessBatch)
+    val batch = Decoupled(new IssuedAccessBatch(numLanes))
   })
 
-  val queue = Module(new Queue(new IssuedAccessBatch, 2))
+  val queue = Module(new Queue(new IssuedAccessBatch(numLanes), 2))
   val nextBatchId = RegInit(0.U(32.W))
-  val nextLane = RegInit(0.U(log2Ceil(TrafficGenAccessBatch.lanes).W))
-  val packedLanes = Wire(Vec(TrafficGenAccessBatch.lanes, UInt(IssuedAccess.streamWidthBits.W)))
+  val nextLane = RegInit(0.U(log2Ceil(numLanes max 2).W))
+  val packedLanes = Wire(Vec(numLanes, UInt(IssuedAccess.streamWidthBits.W)))
   packedLanes.foreach(_ := 0.U)
   packedLanes(nextLane) := IssuedAccess.pack(io.legacy.bits)
   queue.io.enq.valid := io.legacy.valid
-  queue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch)
+  queue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch(numLanes))
   queue.io.enq.bits.batchId := nextBatchId
-  queue.io.enq.bits.validMask := UIntToOH(nextLane, TrafficGenAccessBatch.lanes)
+  queue.io.enq.bits.validMask := UIntToOH(nextLane, numLanes)
   queue.io.enq.bits.accesses := packedLanes.asUInt
   io.legacy.ready := queue.io.enq.ready
   io.batch <> queue.io.deq
 
   when(queue.io.enq.fire) {
     nextBatchId := nextBatchId + 1.U
-    nextLane := nextLane + 1.U
+    nextLane := Mux(nextLane === (numLanes - 1).U, 0.U, nextLane + 1.U)
   }
 
   val batchStalled = RegNext(io.batch.valid && !io.batch.ready, false.B)
@@ -298,13 +302,13 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   dpi.io.access_read_resp_valid := dpiCompatRespValid
   dpi.io.access_read_resp_id := io.accessReadRespId
   val dpiAccessReadData = VecInit(io.accessReadData.map(L2Access.unpack))
-  val dpiDueLaneMask = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
+  val dpiDueLaneMask = VecInit((0 until params.numGenerators).map { lane =>
     io.accessReadDataValid(lane) && dpiAccessReadData(lane).cycleCount <= dpi.io.access_read_cycle
   }).asUInt
-  dpi.io.access_read_data_valid := VecInit(dpiDueLaneMask.asBools)
-  // The legacy engine treats bucket_done as "no more accesses are due for
+  dpi.io.access_read_data_valid := dpiDueLaneMask
+  // The DPI engine treats bucket_done as "no more accesses are due for
   // this query".  Repeated accepted snapshots expose additional overdue heads
-  // without changing the DPI ABI.
+  // through additional calls using the same parameter-sized ABI.
   dpi.io.access_read_bucket_done := !dpiDueLaneMask.orR
   val dpiCompatRespFire = dpiCompatRespValid && dpi.io.access_read_batch_ready
   when(dpiCompatRespFire && !dpiDueLaneMask.orR) {
@@ -319,28 +323,25 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   // banked bridge continuously exposes lane heads instead of accepting a
   // discrete query transaction.
   dpi.io.access_read_ready := io.accessReadReady && !dpiCompatRequestActive
-  for (i <- 0 until TrafficGenAccessBatch.lanes) {
-    val access = dpiAccessReadData(i)
-    dpi.io.access_read_id(i) := access.id
-    dpi.io.access_read_address(i) := access.address
-    dpi.io.access_read_cycle_count(i) := access.cycleCount
-    dpi.io.access_read_subpartition(i) := access.mSubpartition
-    dpi.io.access_read_set_index(i) := access.mSetIndex
-    dpi.io.access_read_tag(i) := access.mTag
-    dpi.io.access_read_mask(i) := access.mMask
-    dpi.io.access_read_sm_id(i) := access.smId
-    dpi.io.access_read_scheduler_id(i) := access.schedulerId
-    dpi.io.access_read_warp_id(i) := access.warpId
-    dpi.io.access_read_bundle_id(i) := access.mBundleId
-    dpi.io.access_read_wake_relevant_bundle(i) := access.mWakeRelevantBundle
-    dpi.io.access_read_is_write(i) := access.mIsWrite
-    dpi.io.access_read_warp_blocked(i) := access.mWarpBlocked
-  }
+  dpi.io.access_read_id := VecInit(dpiAccessReadData.map(_.id)).asUInt
+  dpi.io.access_read_address := VecInit(dpiAccessReadData.map(_.address)).asUInt
+  dpi.io.access_read_cycle_count := VecInit(dpiAccessReadData.map(_.cycleCount)).asUInt
+  dpi.io.access_read_subpartition := VecInit(dpiAccessReadData.map(_.mSubpartition)).asUInt
+  dpi.io.access_read_set_index := VecInit(dpiAccessReadData.map(_.mSetIndex)).asUInt
+  dpi.io.access_read_tag := VecInit(dpiAccessReadData.map(_.mTag)).asUInt
+  dpi.io.access_read_mask := VecInit(dpiAccessReadData.map(_.mMask)).asUInt
+  dpi.io.access_read_sm_id := VecInit(dpiAccessReadData.map(_.smId)).asUInt
+  dpi.io.access_read_scheduler_id := VecInit(dpiAccessReadData.map(_.schedulerId)).asUInt
+  dpi.io.access_read_warp_id := VecInit(dpiAccessReadData.map(_.warpId)).asUInt
+  dpi.io.access_read_bundle_id := VecInit(dpiAccessReadData.map(_.mBundleId)).asUInt
+  dpi.io.access_read_wake_relevant_bundle := VecInit(dpiAccessReadData.map(_.mWakeRelevantBundle)).asUInt
+  dpi.io.access_read_is_write := VecInit(dpiAccessReadData.map(_.mIsWrite)).asUInt
+  dpi.io.access_read_warp_blocked := VecInit(dpiAccessReadData.map(_.mWarpBlocked)).asUInt
 
   // Preserve the legacy single-access DPI contract by adapting each record to
   // a one-valid-lane issued batch. The external target/bridge interface remains
   // uniformly batch based for both backends.
-  val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter)
+  val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter(params.numGenerators))
   val dpiIssuedAccess = Wire(new IssuedAccess)
   dpiIssuedAccess.requestUid := dpi.io.issued_access_writeback_id
   dpiIssuedAccess.address := dpi.io.issued_access_writeback_address
@@ -427,13 +428,11 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
 
 class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTrafficGenTopIO {
   require(params.numGenerators >= 1, "TrafficGenRTLEngine requires at least one generator")
-  require(params.numGenerators <= TrafficGenAccessBatch.lanes,
-    "TrafficGenRTLEngine cannot issue more lanes than the bridge access-read batch returns")
 
   val io = IO(new TrafficGenTopIO(
     params.width, params.numGenerators, params.memOutstanding, useRTL = true))
   private val replaySlotsPerLane = TrafficGenReplaySlots.rtlSlotsPerLane
-  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL = true)
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(params.numGenerators, useRTL = true)
   private val replaySlotIdxWidth = log2Ceil(replaySlots)
 
   val rtlStates = Enum(7)
@@ -461,10 +460,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val accessReadConsumePendingMask =
     RegInit(0.U(replaySlots.W))
   val accessReadLaneSlot =
-    RegInit(VecInit(Seq.fill(TrafficGenAccessBatch.lanes)(0.U(2.W))))
+    RegInit(VecInit(Seq.fill(params.numGenerators)(0.U(2.W))))
 
-  val bundleTableEntries = params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes
-  val bundleCountWidth = log2Ceil(params.numGenerators * params.memOutstanding * 2 + TrafficGenAccessBatch.lanes + 1)
+  val bundleTableEntries = params.numGenerators * params.memOutstanding * 2 + params.numGenerators
+  val bundleCountWidth = log2Ceil(params.numGenerators * params.memOutstanding * 2 + params.numGenerators + 1)
   val bundleValid = RegInit(VecInit(Seq.fill(bundleTableEntries)(false.B)))
   val bundleIds = Reg(Vec(bundleTableEntries, UInt(64.W)))
   val bundleRemainingToIssue = RegInit(VecInit(Seq.fill(bundleTableEntries)(0.U(16.W))))
@@ -478,10 +477,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val bundleIssueRound = RegInit(VecInit(Seq.fill(bundleTableEntries)(0.U(32.W))))
   val bundleEntryIdxWidth = log2Ceil(bundleTableEntries max 2)
 
-  val issuedBatchQueue = Module(new Queue(new IssuedAccessBatch, 2))
+  val issuedBatchQueue = Module(new Queue(new IssuedAccessBatch(params.numGenerators), 2))
   val issuedBatchId = RegInit(0.U(32.W))
   val completedBundleQueues = Seq.fill(params.numGenerators) {
-    Module(new Queue(UInt(64.W), params.memOutstanding * 2 + TrafficGenAccessBatch.lanes))
+    Module(new Queue(UInt(64.W), params.memOutstanding * 2 + params.numGenerators))
   }
   val completedBundleArb = Module(new RRArbiter(UInt(64.W), params.numGenerators))
   val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
@@ -500,7 +499,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   }
 
   issuedBatchQueue.io.enq.valid := false.B
-  issuedBatchQueue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch)
+  issuedBatchQueue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch(params.numGenerators))
   io.issuedAccessBatch <> issuedBatchQueue.io.deq
 
   io.accessReadCycle := 0.U
@@ -784,26 +783,20 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     io.issue(lane).bits.mBundleId := issueAssignedEntry(lane)
     issueFires(lane) := io.issue(lane).valid && io.issue(lane).ready
   }
-  val issuedBatchMask = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
-    if (lane < params.numGenerators) issueFires(lane) else false.B
-  }).asUInt
+  val issuedBatchMask = issueFires.asUInt
   val issueCanFire = issueFires.asUInt.orR
   issueCanFireForReducer := issueCanFire
   drainCompletionsThisCycle := state === sDrainCompletions || state === sIssueBatch
   issuedBatchQueue.io.enq.valid := issueCanFire
   issuedBatchQueue.io.enq.bits.batchId := issuedBatchId
   issuedBatchQueue.io.enq.bits.validMask := issuedBatchMask
-  val issuedBatchPackedAccesses = VecInit((0 until TrafficGenAccessBatch.lanes).map { lane =>
-    if (lane < params.numGenerators) {
-      val issued = Wire(new IssuedAccess)
-      issued.requestUid := currentIssueAccess(lane).id
-      issued.cycleIssued := currentIssueAccess(lane).cycleCount
-      issued.address := currentIssueAccess(lane).address
-      issued.isWrite := currentIssueAccess(lane).mIsWrite
-      IssuedAccess.pack(issued)
-    } else {
-      0.U(IssuedAccess.streamWidthBits.W)
-    }
+  val issuedBatchPackedAccesses = VecInit((0 until params.numGenerators).map { lane =>
+    val issued = Wire(new IssuedAccess)
+    issued.requestUid := currentIssueAccess(lane).id
+    issued.cycleIssued := currentIssueAccess(lane).cycleCount
+    issued.address := currentIssueAccess(lane).address
+    issued.isWrite := currentIssueAccess(lane).mIsWrite
+    IssuedAccess.pack(issued)
   })
   issuedBatchQueue.io.enq.bits.accesses := issuedBatchPackedAccesses.asUInt
   val accessReadSlotConsumeMask = (0 until params.numGenerators).map { lane =>
@@ -831,7 +824,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
           0.U, accessReadLaneSlot(lane) + 1.U)
     }
   }
-  for (lane <- 0 until TrafficGenAccessBatch.lanes) {
+  for (lane <- 0 until params.numGenerators) {
     val laneConsume = io.accessReadConsumeMask(
       (lane + 1) * replaySlotsPerLane - 1,
       lane * replaySlotsPerLane)
@@ -1712,7 +1705,7 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
 
     InModuleBody {
       val outerIO = IO(new ClockedIO(new TrafficGenPortPeripheralIO(
-        params.backend == TrafficGenRTLBackend))).suggestName("trafficgen")
+        params.numGenerators, params.backend == TrafficGenRTLBackend))).suggestName("trafficgen")
       dontTouch(outerIO)
 
       outerIO.clock := trafficGenTL.module.clock
@@ -1765,18 +1758,18 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
   }
 }
 
-class WithTrafficGen extends Config((site, here, up) => {
-  case TrafficGenKey => Some(TrafficGenParams())
+class WithTrafficGen(numGenerators: Int = 1) extends Config((site, here, up) => {
+  case TrafficGenKey => Some(TrafficGenParams(numGenerators = numGenerators))
 })
 
 class WithTrafficGenMemL2 extends Config((site, here, up) => {
   case TrafficGenKey => up(TrafficGenKey, site).map(_.copy(memBackend = TrafficGenL2MemBackend))
 })
 
-class WithRTLTrafficGen extends Config((site, here, up) => {
+class WithRTLTrafficGen(numGenerators: Int = 16) extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams(
-    numGenerators = 16,
-    memOutstanding = 4,
+    numGenerators = numGenerators,
+    memOutstanding = 8,
     backend = TrafficGenRTLBackend,
     remapTraceAddresses = true,
     remapBase = 0x100000000L,

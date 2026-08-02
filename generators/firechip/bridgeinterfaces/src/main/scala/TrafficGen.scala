@@ -156,30 +156,27 @@ object IssuedAccess {
   }
 }
 
-object TrafficGenAccessBatch {
-  val lanes = 16
-}
-
 object TrafficGenReplaySlots {
   val rtlSlotsPerLane = 3
 
   def slotsPerLane(useRTL: Boolean): Int =
     if (useRTL) rtlSlotsPerLane else 1
 
-  def totalSlots(useRTL: Boolean): Int =
-    TrafficGenAccessBatch.lanes * slotsPerLane(useRTL)
+  def totalSlots(numLanes: Int, useRTL: Boolean): Int =
+    numLanes * slotsPerLane(useRTL)
 
   def flatIndex(lane: Int, slot: Int, useRTL: Boolean): Int =
     lane * slotsPerLane(useRTL) + slot
 }
 
-class IssuedAccessBatch extends Bundle {
+class IssuedAccessBatch(val numLanes: Int) extends Bundle {
+  require(numLanes >= 1, "IssuedAccessBatch requires at least one lane")
   val batchId = UInt(32.W)
-  val validMask = UInt(TrafficGenAccessBatch.lanes.W)
+  val validMask = UInt(numLanes.W)
   // Golden Gate's bridge extraction cannot lower aggregate fields nested
   // inside Decoupled[IssuedAccessBatch], so the compact issued records cross
   // HostPort as one ground UInt.
-  val accesses = UInt((TrafficGenAccessBatch.lanes * IssuedAccess.streamWidthBits).W)
+  val accesses = UInt((numLanes * IssuedAccess.streamWidthBits).W)
 }
 
 object CompletedBundleIds {
@@ -197,8 +194,9 @@ object TrafficGenRoundExitReason {
   val capacity = 1.U(2.W)
 }
 
-class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
-  private val replaySlots = TrafficGenReplaySlots.totalSlots(useRTL)
+class TrafficGenPortIO(numLanes: Int, useRTL: Boolean) extends Bundle {
+  require(numLanes >= 1, "TrafficGenPortIO requires at least one lane")
+  private val replaySlots = TrafficGenReplaySlots.totalSlots(numLanes, useRTL)
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
@@ -207,7 +205,7 @@ class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val roundExitReason = Output(UInt(2.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
-  val issuedAccessBatch = Decoupled(new IssuedAccessBatch)
+  val issuedAccessBatch = Decoupled(new IssuedAccessBatch(numLanes))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
@@ -228,7 +226,7 @@ class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val accessReadBucketDone = Input(Bool())
   val accessReadReady = Input(Bool())
   val accessReadConsumeMask = Output(UInt(replaySlots.W))
-  val accessReadLaneDoneMask = Input(UInt(TrafficGenAccessBatch.lanes.W))
+  val accessReadLaneDoneMask = Input(UInt(numLanes.W))
   val accessReadPrefetchPauseReq = Input(Bool())
   val accessReadPrefetchPauseAck = Output(Bool())
   val accessStoreCount = Input(UInt(32.W))
@@ -238,10 +236,14 @@ class TrafficGenPortIO(useRTL: Boolean) extends Bundle {
   val uploadReady = Input(Bool())
 }
 
-case class TrafficGenBridgeKey(maxL2AccessEntries: Int, useRTL: Boolean)
+case class TrafficGenBridgeKey(maxL2AccessEntries: Int, numLanes: Int, useRTL: Boolean) {
+  require(numLanes >= 1, "TrafficGen bridge requires at least one lane")
+  require(maxL2AccessEntries % numLanes == 0,
+    "TrafficGen bridge requires maxL2AccessEntries to divide evenly across lanes")
+}
 
-class TrafficGenBridgeTargetIO(useRTL: Boolean) extends Bundle {
+class TrafficGenBridgeTargetIO(numLanes: Int, useRTL: Boolean) extends Bundle {
   val clock = Input(Clock())
-  val trafficgen = Flipped(new TrafficGenPortIO(useRTL))
+  val trafficgen = Flipped(new TrafficGenPortIO(numLanes, useRTL))
   val reset = Input(Bool())
 }

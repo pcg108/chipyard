@@ -5,7 +5,6 @@ import chiseltest._
 import firechip.bridgeinterfaces.{
   IssuedAccess,
   RTLL2Access,
-  TrafficGenAccessBatch,
   TrafficGenRoundExitReason,
 }
 import org.scalatest.flatspec.AnyFlatSpec
@@ -14,20 +13,21 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "TrafficGenRTLEngine banked replay"
 
   private val slotsPerLane = 3
-  private val totalSlots = TrafficGenAccessBatch.lanes * slotsPerLane
-  private val allLanes = (BigInt(1) << TrafficGenAccessBatch.lanes) - 1
+  private def totalSlots(numGenerators: Int): Int = numGenerators * slotsPerLane
+  private def allLanes(dut: TrafficGenRTLEngine): BigInt =
+    (BigInt(1) << dut.io.issue.length) - 1
   private def replaySlot(lane: Int, slot: Int = 0): Int =
     lane * slotsPerLane + slot
   private def replaySlotMask(entries: (Int, Int)*): BigInt =
     entries.foldLeft(BigInt(0)) {
       case (packed, (lane, slot)) => packed | (BigInt(1) << replaySlot(lane, slot))
     }
-  private val allLaneSlotZeroMask =
-    (0 until TrafficGenAccessBatch.lanes).foldLeft(BigInt(0)) {
+  private def allLaneSlotZeroMask(dut: TrafficGenRTLEngine): BigInt =
+    (0 until dut.io.issue.length).foldLeft(BigInt(0)) {
       case (packed, lane) => packed | (BigInt(1) << replaySlot(lane))
     }
-  private val allLaneSlotZeroGenerationOne =
-    (0 until TrafficGenAccessBatch.lanes).foldLeft(BigInt(0)) {
+  private def allLaneSlotZeroGenerationOne(dut: TrafficGenRTLEngine): BigInt =
+    (0 until dut.io.issue.length).foldLeft(BigInt(0)) {
       case (packed, lane) => packed | (BigInt(1) << (2 * replaySlot(lane)))
     }
 
@@ -104,7 +104,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     dut.io.accessReadBucketDone.poke(false.B)
     dut.io.accessReadReady.poke(true.B)
     dut.io.accessReadPrefetchPauseReq.poke(false.B)
-    dut.io.accessReadLaneDoneMask.poke((allLanes ^ ((BigInt(1) << numGenerators) - 1)).U)
+    dut.io.accessReadLaneDoneMask.poke(0.U)
     dut.io.accessStoreCount.poke(numGenerators.U)
     dut.io.accessStoreMaxCycle.poke(1000.U)
     dut.io.accessStoreHasEntries.poke(true.B)
@@ -116,7 +116,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.completion(lane).valid.poke(false.B)
       pokeAccess(dut.io.completion(lane).bits)
     }
-    for (slot <- 0 until totalSlots) {
+    for (slot <- 0 until totalSlots(numGenerators)) {
       dut.io.accessReadDataValid(slot).poke(false.B)
       pokePackedAccess(dut.io.accessReadData(slot), id = 0)
     }
@@ -156,7 +156,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.issuedAccessBatch.bits.validMask.expect(1.U)
 
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ (BigInt(1) << 1)).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ (BigInt(1) << 1)).U)
       dut.io.issue(1).ready.poke(true.B)
       // Lane 1 never consumed the first snapshot, so it remains independently
       // eligible without an acknowledgement for lane 0.
@@ -166,18 +166,19 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "pipeline three slots and issue slot-zero replacements at N plus three" in {
-    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 16, memOutstanding = 2))) { dut =>
-      initialize(dut, 16)
+  for (numGenerators <- Seq(8, 16)) {
+    it should s"pipeline three slots across $numGenerators lanes and issue slot-zero replacements at N plus three" in {
+      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = numGenerators, memOutstanding = 2))) { dut =>
+      initialize(dut, numGenerators)
       dut.io.minIssueCycle.poke(100.U)
-      for (lane <- 0 until 16; slot <- 0 until slotsPerLane) {
+      for (lane <- 0 until numGenerators; slot <- 0 until slotsPerLane) {
         dut.io.accessReadDataValid(replaySlot(lane, slot)).poke(true.B)
         pokePackedAccess(dut.io.accessReadData(replaySlot(lane, slot)),
           id = 1000 * slot + lane, bundleId = 1000 * slot + lane)
       }
 
       startRound(dut)
-      waitFor(dut.io.accessReadConsumeMask.peek().litValue == allLaneSlotZeroMask, dut)
+      waitFor(dut.io.accessReadConsumeMask.peek().litValue == allLaneSlotZeroMask(dut), dut)
       val firstIssueCycle = dut.io.issue(0).bits.cycleCount.peek().litValue
       dut.io.issue(0).bits.id.expect(0.U)
       dut.clock.step()
@@ -186,29 +187,30 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.issue(0).bits.id.expect(1000.U)
       dut.io.issue(0).bits.cycleCount.expect((firstIssueCycle + 1).U)
       dut.io.accessReadConsumeMask.expect(
-        (allLaneSlotZeroMask << 1).U)
+        (allLaneSlotZeroMask(dut) << 1).U)
       dut.clock.step()
 
       dut.io.issue.foreach(_.valid.expect(true.B))
       dut.io.issue(0).bits.id.expect(2000.U)
       dut.io.issue(0).bits.cycleCount.expect((firstIssueCycle + 2).U)
       dut.io.accessReadConsumeMask.expect(
-        (allLaneSlotZeroMask << 2).U)
+        (allLaneSlotZeroMask(dut) << 2).U)
       dut.clock.step()
 
       // The lane pointers are back at slot zero, whose stale snapshot remains
       // blocked until the matching generations and replacement heads arrive.
       dut.io.issue.foreach(_.valid.expect(false.B))
       dut.io.accessReadConsumeMask.expect(0.U)
-      for (lane <- 0 until 16) {
+      for (lane <- 0 until numGenerators) {
         pokePackedAccess(dut.io.accessReadData(replaySlot(lane)),
           id = 3000 + lane, bundleId = 3000 + lane)
       }
-      dut.io.accessReadRespId.poke(allLaneSlotZeroGenerationOne.U)
+      dut.io.accessReadRespId.poke(allLaneSlotZeroGenerationOne(dut).U)
       dut.io.issue.foreach(_.valid.expect(true.B))
       dut.io.issue(0).bits.id.expect(3000.U)
       dut.io.issue(0).bits.cycleCount.expect((firstIssueCycle + 3).U)
-      dut.io.accessReadConsumeMask.expect(allLaneSlotZeroMask.U)
+      dut.io.accessReadConsumeMask.expect(allLaneSlotZeroMask(dut).U)
+      }
     }
   }
 
@@ -359,7 +361,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.accessReadBatchReady.expect(false.B)
 
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 2).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ 2).U)
       dut.io.accessReadRespId.poke(1.U)
       waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
       dut.io.hasPendingWork.expect(true.B)
@@ -401,7 +403,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val firstTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
 
       // Return the only resident member. The bundle-table entry remains valid
@@ -434,7 +436,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       // prior workload's incomplete table entry survived, this single member
       // would incorrectly finish that old bundle.
       dut.io.trafficGenDone.poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 1).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ 1).U)
       dut.io.accessReadDataValid(replaySlot(0)).poke(true.B)
       // Give the second round a finite scheduling boundary. The purpose of
       // this phase is to prove that the old bundle entry was cleared; it must
@@ -453,7 +455,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val secondTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(2.U)
 
       pokeAccess(
@@ -514,7 +516,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val trackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
       waitFor(dut.io.currentCycleAfterIssue.peek().litValue >= minCycle, dut)
 
@@ -543,7 +545,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
       waitFor(
         dut.io.currentCycleAfterIssue.peek().litValue >= minCycle &&
@@ -574,7 +576,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.issue(0).valid.peek().litToBoolean, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ (BigInt(1) << 1)).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ (BigInt(1) << 1)).U)
       dut.io.accessReadRespId.poke(1.U)
       dut.clock.step()
 
@@ -589,7 +591,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.step()
       dut.io.completion(0).valid.poke(false.B)
       dut.io.accessReadDataValid(replaySlot(1)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(laneGenerations(0 -> 1, 1 -> 1).U)
       dut.io.completedBundleIdWriteEn.expect(false.B)
 
@@ -616,7 +618,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val firstCycle = dut.io.currentCycleAfterIssue.peek().litValue
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 2).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ 2).U)
       dut.io.accessReadRespId.poke(1.U)
       dut.clock.step()
       dut.clock.step(3)
@@ -713,7 +715,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val firstTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
       dut.clock.step()
       for (lane <- 0 until 2) dut.io.accessReadDataValid(replaySlot(lane)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(laneGenerations(0 -> 1, 1 -> 1).U)
       withClue("first round did not reach its min-cycle boundary: ") {
         waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
@@ -723,7 +725,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       // The old tranche is fully issued but its two returns are still
       // outstanding.  A later scheduler round may add more accesses to the
       // same intentionally aliased bundle ID.
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 3).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ 3).U)
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(replaySlot(lane)).poke(true.B)
         pokePackedAccess(dut.io.accessReadData(replaySlot(lane)), id = 300 + lane,
@@ -757,14 +759,14 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       val firstTrackingToken = dut.io.issue(0).bits.mBundleId.peek().litValue
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
       waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
       dut.io.roundExitReason.expect(TrafficGenRoundExitReason.capacity)
       dut.clock.step()
 
       dut.io.accessStoreHasMore.poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes ^ 1).U)
+      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ 1).U)
       dut.io.accessReadDataValid(replaySlot(0)).poke(true.B)
       pokePackedAccess(dut.io.accessReadData(replaySlot(0)), id = 351, bundleId = 66,
         bundleCount = 1, generation = 7)
@@ -774,7 +776,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       assert(secondTrackingToken == firstTrackingToken)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(2.U)
 
       for (id <- Seq(350, 351)) {
@@ -804,7 +806,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
 
       val cycleAfterIssue = dut.io.currentCycleAfterIssue.peek().litValue
       dut.clock.step(3)
@@ -841,7 +843,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       for (lane <- 0 until 2) {
         dut.io.accessReadDataValid(replaySlot(lane)).poke(false.B)
       }
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(laneGenerations(0 -> 1, 1 -> 1).U)
 
       pokeAccess(dut.io.completion(0).bits, id = 500, bundleId = 0)
@@ -868,7 +870,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
 
       waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
@@ -883,7 +885,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.accessStoreCount.poke(0.U)
       dut.io.accessStoreMaxCycle.poke(0.U)
       dut.io.accessStoreHasEntries.poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       startRound(dut)
 
       waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
@@ -907,7 +909,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       waitFor(dut.io.accessReadConsumeMask.peek().litValue == 1, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke(allLanes.U)
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
       dut.io.accessReadRespId.poke(1.U)
 
       // The only issued member returns, leaving a valid bundle-table entry
@@ -944,34 +946,44 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "adapt legacy DPI writebacks to consecutive round-robin banks" in {
-    test(new LegacyIssuedAccessBatchAdapter) { dut =>
+  it should "adapt legacy DPI writebacks to parameterized round-robin banks" in {
+    test(new LegacyIssuedAccessBatchAdapter(8)) { dut =>
       dut.io.legacy.valid.poke(false.B)
       pokeIssued(dut.io.legacy.bits)
       dut.io.batch.ready.poke(true.B)
 
-      for (lane <- 0 until 3) {
+      for (record <- 0 until 9) {
+        val lane = record % 8
         pokeIssued(
           dut.io.legacy.bits,
-          id = 70 + lane,
-          cycle = 120 + lane,
-          address = 0x1000 + lane,
-          isWrite = lane == 1,
+          id = 70 + record,
+          cycle = 120 + record,
+          address = 0x1000 + record,
+          isWrite = record == 1,
         )
         dut.io.legacy.valid.poke(true.B)
         dut.clock.step()
         dut.io.legacy.valid.poke(false.B)
         dut.io.batch.valid.expect(true.B)
-        dut.io.batch.bits.batchId.expect(lane.U)
+        dut.io.batch.bits.batchId.expect(record.U)
         dut.io.batch.bits.validMask.expect((BigInt(1) << lane).U)
         val packed = packedLane(dut.io.batch.bits.accesses, lane)
-        assert(packedId(packed) == 70 + lane)
-        assert(packedCycle(packed) == 120 + lane)
-        assert(packedAddress(packed) == 0x1000 + lane)
-        assert(packedIsWrite(packed) == (lane == 1))
+        assert(packedId(packed) == 70 + record)
+        assert(packedCycle(packed) == 120 + record)
+        assert(packedAddress(packed) == 0x1000 + record)
+        assert(packedIsWrite(packed) == (record == 1))
         dut.clock.step()
       }
       dut.io.legacy.valid.poke(false.B)
+    }
+  }
+
+  it should "reject zero generators and generator counts that do not divide the access store" in {
+    intercept[IllegalArgumentException] {
+      TrafficGenParams(numGenerators = 0)
+    }
+    intercept[IllegalArgumentException] {
+      TrafficGenParams(numGenerators = 3, maxL2AccessEntries = 32768)
     }
   }
 }

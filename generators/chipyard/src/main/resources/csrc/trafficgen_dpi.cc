@@ -42,7 +42,6 @@ constexpr std::uint32_t kDpiStateFatalConfigError = 0xdead0001;
 constexpr std::uint32_t kRoundExitScheduling = 0;
 constexpr std::uint32_t kRoundExitCapacity = 1;
 constexpr std::size_t kMaxCompletedBundleIds = 4096;
-constexpr int kAccessReadBatchLanes = 16;
 
 struct WarpKey {
   std::uint32_t smId = 0;
@@ -1304,6 +1303,7 @@ extern "C" void trafficgen_dpi_step(
     unsigned long long min_issue_cycle,
     svBit access_read_resp_valid,
     unsigned int access_read_resp_id,
+    unsigned int access_read_batch_lanes,
     const svBit *access_read_data_valid,
     svBit access_read_bucket_done,
     svBit access_read_ready,
@@ -1367,9 +1367,9 @@ extern "C" void trafficgen_dpi_step(
   }
 
   std::vector<Access> accessReadBatch;
-  accessReadBatch.reserve(kAccessReadBatchLanes);
+  accessReadBatch.reserve(access_read_batch_lanes);
   if (access_read_resp_valid) {
-    for (int i = 0; i < kAccessReadBatchLanes; ++i) {
+    for (unsigned int i = 0; i < access_read_batch_lanes; ++i) {
       if (!dpiArrayBit(access_read_data_valid, i)) {
         continue;
       }
