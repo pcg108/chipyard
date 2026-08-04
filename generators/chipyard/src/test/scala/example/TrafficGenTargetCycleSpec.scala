@@ -168,7 +168,8 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
 
   for (numGenerators <- Seq(8, 16)) {
     it should s"pipeline three slots across $numGenerators lanes and issue slot-zero replacements at N plus three" in {
-      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = numGenerators, memOutstanding = 2))) { dut =>
+      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = numGenerators, memOutstanding = 2)))
+        .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       initialize(dut, numGenerators)
       dut.io.minIssueCycle.poke(100.U)
       for (lane <- 0 until numGenerators; slot <- 0 until slotsPerLane) {
@@ -788,6 +789,131 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       }
       waitFor(dut.io.completedBundleIdWriteEn.peek().litToBoolean, dut)
       dut.io.completedBundleIdWriteData.expect(66.U)
+    }
+  }
+
+  it should "handle same-entry and distinct-entry completions in one cycle" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 4, memOutstanding = 2))) { dut =>
+      initialize(dut, 4)
+      val bundleIds = Seq(90, 90, 91, 92)
+      val bundleCounts = Seq(2, 2, 1, 1)
+      for (lane <- 0 until 4) {
+        dut.io.accessReadDataValid(replaySlot(lane)).poke(true.B)
+        pokePackedAccess(
+          dut.io.accessReadData(replaySlot(lane)),
+          id = 900 + lane,
+          bundleId = bundleIds(lane),
+          bundleCount = bundleCounts(lane),
+        )
+      }
+
+      startRound(dut)
+      waitFor(
+        dut.io.accessReadConsumeMask.peek().litValue ==
+          replaySlotMask((0, 0), (1, 0), (2, 0), (3, 0)),
+        dut,
+      )
+      val tokens = (0 until 4).map(lane =>
+        dut.io.issue(lane).bits.mBundleId.peek().litValue)
+      assert(tokens(0) == tokens(1))
+      assert(tokens(0) != tokens(2))
+      assert(tokens(2) != tokens(3))
+      dut.clock.step()
+
+      for (lane <- 0 until 4) {
+        dut.io.accessReadDataValid(replaySlot(lane)).poke(false.B)
+      }
+      dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
+      dut.io.accessReadRespId.poke(laneGenerations(
+        0 -> 1, 1 -> 1, 2 -> 1, 3 -> 1).U)
+
+      // Lanes zero and one retire the two members of bundle 90 while lane two
+      // independently retires bundle 91 on the same target edge.
+      for (lane <- 0 until 3) {
+        pokeAccess(
+          dut.io.completion(lane).bits,
+          id = 900 + lane,
+          bundleId = tokens(lane),
+        )
+        dut.io.completion(lane).valid.poke(true.B)
+      }
+      waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+      dut.clock.step()
+      for (lane <- 0 until 3) {
+        dut.io.completion(lane).valid.poke(false.B)
+      }
+
+      val completed = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      var cycles = 0
+      while (completed.size < 2 && cycles < 20) {
+        if (dut.io.completedBundleIdWriteEn.peek().litToBoolean) {
+          completed += dut.io.completedBundleIdWriteData.peek().litValue
+        }
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(completed.toSeq == Seq(BigInt(90), BigInt(91)))
+
+      pokeAccess(dut.io.completion(3).bits, id = 903, bundleId = tokens(3))
+      dut.io.completion(3).valid.poke(true.B)
+      waitFor(dut.io.completion(3).ready.peek().litToBoolean, dut)
+      dut.clock.step()
+      dut.io.completion(3).valid.poke(false.B)
+      waitFor(dut.io.completedBundleIdWriteEn.peek().litToBoolean, dut)
+      dut.io.completedBundleIdWriteData.expect(92.U)
+    }
+  }
+
+  it should "assert on an out-of-range completion table index" in {
+    assertThrows[Exception] {
+      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 1))) { dut =>
+        initialize(dut, 1)
+        dut.io.accessReadDataValid(replaySlot(0)).poke(true.B)
+        pokePackedAccess(dut.io.accessReadData(replaySlot(0)), id = 950, bundleId = 95)
+        startRound(dut)
+        waitFor(dut.io.issue(0).valid.peek().litToBoolean, dut)
+        dut.clock.step()
+
+        // One lane and one outstanding request create three table entries, so
+        // index three is the first invalid private token.
+        pokeAccess(dut.io.completion(0).bits, id = 950, bundleId = 3)
+        dut.io.completion(0).valid.poke(true.B)
+        waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+        dut.clock.step()
+      }
+    }
+  }
+
+  it should "assert when a completion underflows an incomplete bundle" in {
+    assertThrows[Exception] {
+      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 1))) { dut =>
+        initialize(dut, 1)
+        dut.io.accessReadDataValid(replaySlot(0)).poke(true.B)
+        pokePackedAccess(
+          dut.io.accessReadData(replaySlot(0)),
+          id = 960,
+          bundleId = 96,
+          bundleCount = 2,
+        )
+        startRound(dut)
+        waitFor(dut.io.issue(0).valid.peek().litToBoolean, dut)
+        val token = dut.io.issue(0).bits.mBundleId.peek().litValue
+        dut.clock.step()
+
+        // The first return leaves a valid entry with zero outstanding accesses
+        // and one member still expected in a future scheduler round.
+        pokeAccess(dut.io.completion(0).bits, id = 960, bundleId = token)
+        dut.io.completion(0).valid.poke(true.B)
+        waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+        dut.clock.step()
+        dut.io.completion(0).valid.poke(false.B)
+        dut.clock.step()
+
+        pokeAccess(dut.io.completion(0).bits, id = 961, bundleId = token)
+        dut.io.completion(0).valid.poke(true.B)
+        waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
+        dut.clock.step()
+      }
     }
   }
 

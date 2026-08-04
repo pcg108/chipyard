@@ -581,71 +581,93 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issueBundleBlockedNext = Wire(Vec(bundleTableEntries, Bool()))
   val issueBundleRoundNext = Wire(Vec(bundleTableEntries, UInt(32.W)))
 
-  var completionValidExpr: Seq[Bool] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleValidNext(e), bundleValid(e))
-  }
-  var completionCountExpr: Seq[UInt] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleCountNext(e), bundleOutstanding(e))
-  }
-  var completionRemainingExpr: Seq[UInt] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleRemainingNext(e), bundleRemainingToIssue(e))
-  }
-  var completionIdExpr: Seq[UInt] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleIdNext(e), bundleIds(e))
-  }
-  var completionWakeExpr: Seq[Bool] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleWakeNext(e), bundleWakeRelevant(e))
-  }
-  var completionBlockedExpr: Seq[Bool] = (0 until bundleTableEntries).map { e =>
-    Mux(issueCanFireForReducer, issueBundleBlockedNext(e), bundleWarpBlocked(e))
-  }
-
+  // Completion tags are target-private table indices. Aggregate all returning
+  // lanes by entry, then update each entry once.  The reduction starts from
+  // the issue result to retain simultaneous issue-before-completion ordering.
+  val completionEntry = Wire(Vec(params.numGenerators, UInt(bundleEntryIdxWidth.W)))
+  val completionEntryInRange = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
-    val active = completionFires(lane)
-    // The memory engines carry a target-private bundle-table index in
-    // mBundleId.  The bridge-visible, scheduler-owned ID remains in bundleIds.
-    val bundleEntry = io.completion(lane).bits.mBundleId(bundleEntryIdxWidth - 1, 0)
-    val bundleEntryInRange = io.completion(lane).bits.mBundleId < bundleTableEntries.U
-    val matchVec = (0 until bundleTableEntries).map { e =>
-      bundleEntryInRange && completionValidExpr(e) && bundleEntry === e.U
-    }
-    val matchAny = VecInit(matchVec).asUInt.orR
-    val oldCount = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionCountExpr(e)
-    } :+ (true.B -> 0.U(bundleCountWidth.W)))
-    val oldWakeRelevant = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionWakeExpr(e)
-    } :+ (true.B -> false.B))
-    val oldWarpBlocked = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionBlockedExpr(e)
-    } :+ (true.B -> false.B))
-    val oldRemaining = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionRemainingExpr(e)
-    } :+ (true.B -> 0.U(16.W)))
-    val oldBundleId = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> completionIdExpr(e)
-    } :+ (true.B -> 0.U(64.W)))
-    val willComplete = active && matchAny && oldCount === 1.U && oldRemaining === 0.U
-
-    completeEventValid(lane) := willComplete
-    completeEventId(lane) := oldBundleId
-    completeEventWakeExit(lane) := willComplete && oldWakeRelevant && oldWarpBlocked
-    completeEventWakeRelevant(lane) := oldWakeRelevant
-    completeEventWarpBlocked(lane) := oldWarpBlocked
-
-    completionCountExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && matchVec(e), oldCount - 1.U, completionCountExpr(e))
-    }
-    completionValidExpr = (0 until bundleTableEntries).map { e =>
-      Mux(willComplete && matchVec(e), false.B, completionValidExpr(e))
-    }
-
-    when(active) {
-      assert(bundleEntryInRange,
+    completionEntry(lane) :=
+      io.completion(lane).bits.mBundleId(bundleEntryIdxWidth - 1, 0)
+    // Check the complete tag before narrowing it to the table-index width.
+    completionEntryInRange(lane) :=
+      io.completion(lane).bits.mBundleId < bundleTableEntries.U
+    when(completionFires(lane)) {
+      assert(completionEntryInRange(lane),
         "TrafficGenRTLEngine completed an access with an invalid bundle-table index")
-      assert(matchAny, "TrafficGenRTLEngine completed an access for an unknown bundle")
-      assert(oldCount =/= 0.U, "TrafficGenRTLEngine bundle outstanding count underflow")
     }
+  }
+
+  val completionBundleValidNext = Wire(Vec(bundleTableEntries, Bool()))
+  val completionBundleCountNext = Wire(Vec(bundleTableEntries, UInt(bundleCountWidth.W)))
+  val completionBundleRemainingNext = Wire(Vec(bundleTableEntries, UInt(16.W)))
+  val completionEntryTerminal = Wire(Vec(bundleTableEntries, Bool()))
+  val completionEntryId = Wire(Vec(bundleTableEntries, UInt(64.W)))
+  val completionEntryWake = Wire(Vec(bundleTableEntries, Bool()))
+  val completionEntryBlocked = Wire(Vec(bundleTableEntries, Bool()))
+  val completionUnknownViolation = Wire(Vec(bundleTableEntries, Bool()))
+  val completionUnderflowViolation = Wire(Vec(bundleTableEntries, Bool()))
+
+  for (e <- 0 until bundleTableEntries) {
+    val baseValid = Mux(issueCanFireForReducer,
+      issueBundleValidNext(e), bundleValid(e))
+    val baseCount = Mux(issueCanFireForReducer,
+      issueBundleCountNext(e), bundleOutstanding(e))
+    val baseRemaining = Mux(issueCanFireForReducer,
+      issueBundleRemainingNext(e), bundleRemainingToIssue(e))
+    val baseId = Mux(issueCanFireForReducer,
+      issueBundleIdNext(e), bundleIds(e))
+    val baseWake = Mux(issueCanFireForReducer,
+      issueBundleWakeNext(e), bundleWakeRelevant(e))
+    val baseBlocked = Mux(issueCanFireForReducer,
+      issueBundleBlockedNext(e), bundleWarpBlocked(e))
+    val entryHits = VecInit((0 until params.numGenerators).map { lane =>
+      completionFires(lane) && completionEntryInRange(lane) &&
+        completionEntry(lane) === e.U
+    })
+    val hitCountWide = Wire(UInt(bundleCountWidth.W))
+    hitCountWide := PopCount(entryHits)
+    val anyHit = entryHits.asUInt.orR
+    val terminal = anyHit && baseValid && baseRemaining === 0.U &&
+      baseCount === hitCountWide
+
+    completionBundleValidNext(e) := baseValid && !terminal
+    completionBundleCountNext(e) := baseCount - hitCountWide
+    completionBundleRemainingNext(e) := baseRemaining
+    completionEntryTerminal(e) := terminal
+    completionEntryId(e) := baseId
+    completionEntryWake(e) := baseWake
+    completionEntryBlocked(e) := baseBlocked
+    completionUnknownViolation(e) := anyHit && !baseValid
+    completionUnderflowViolation(e) := anyHit && baseCount < hitCountWide
+  }
+  assert(!completionUnknownViolation.asUInt.orR,
+    "TrafficGenRTLEngine completed an access for an unknown bundle")
+  assert(!completionUnderflowViolation.asUInt.orR,
+    "TrafficGenRTLEngine bundle outstanding count underflow")
+
+  // In the old ascending lane-serial reducer, the highest-numbered lane that
+  // exhausts an entry emits its terminal event. Preserve that selection when
+  // several lanes complete the same entry in one cycle.
+  for (lane <- 0 until params.numGenerators) {
+    val entry = completionEntry(lane)
+    val activeInRange = completionFires(lane) && completionEntryInRange(lane)
+    val higherLaneHitsSameEntry =
+      (lane + 1 until params.numGenerators).map { higher =>
+        completionFires(higher) && completionEntryInRange(higher) &&
+          completionEntry(higher) === entry
+      }.foldLeft(false.B)(_ || _)
+    val terminal = activeInRange && !higherLaneHitsSameEntry &&
+      completionEntryTerminal(entry)
+    val publicId = Mux(activeInRange, completionEntryId(entry), 0.U(64.W))
+    val wakeRelevant = Mux(activeInRange, completionEntryWake(entry), false.B)
+    val warpBlocked = Mux(activeInRange, completionEntryBlocked(entry), false.B)
+
+    completeEventValid(lane) := terminal
+    completeEventId(lane) := publicId
+    completeEventWakeExit(lane) := terminal && wakeRelevant && warpBlocked
+    completeEventWakeRelevant(lane) := wakeRelevant
+    completeEventWarpBlocked(lane) := warpBlocked
   }
 
   val debugRtlCompletionEventValid = Wire(Bool())
@@ -675,15 +697,6 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   dontTouch(debugRtlCompletionEventWakeRelevant)
   dontTouch(debugRtlCompletionEventWarpBlocked)
   dontTouch(debugRtlCompletionEventCycle)
-
-  val completionBundleValidNext = Wire(Vec(bundleTableEntries, Bool()))
-  val completionBundleCountNext = Wire(Vec(bundleTableEntries, UInt(bundleCountWidth.W)))
-  val completionBundleRemainingNext = Wire(Vec(bundleTableEntries, UInt(16.W)))
-  for (e <- 0 until bundleTableEntries) {
-    completionBundleValidNext(e) := completionValidExpr(e)
-    completionBundleCountNext(e) := completionCountExpr(e)
-    completionBundleRemainingNext(e) := completionRemainingExpr(e)
-  }
 
   for (lane <- 0 until params.numGenerators) {
     completedBundleQueues(lane).io.enq.valid := completeEventValid(lane)
@@ -859,88 +872,108 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       "TrafficGenRTLEngine changed an issued batch under backpressure")
   }
 
-  var issueValidExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleValid(_))
-  var issueCountExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleOutstanding(_))
-  var issueRemainingExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleRemainingToIssue(_))
-  var issueIdExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIds(_))
-  var issueWakeExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWakeRelevant(_))
-  var issueBlockedExpr: Seq[Bool] = (0 until bundleTableEntries).map(bundleWarpBlocked(_))
-  var issueRoundExpr: Seq[UInt] = (0 until bundleTableEntries).map(bundleIssueRound(_))
-
   for (lane <- 0 until params.numGenerators) {
-    val active = issueFires(lane)
-    val access = currentIssueAccess(lane)
-    val assignedEntry = issueAssignedEntry(lane)
-    val matchVec = (0 until bundleTableEntries).map { e =>
-      issueValidExpr(e) && assignedEntry === e.U
-    }
-    val matchAny = VecInit(matchVec).asUInt.orR
-    val allocOH = UIntToOH(assignedEntry, bundleTableEntries).asUInt &
-      Fill(bundleTableEntries, active && !matchAny)
-    val oldRemaining = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> issueRemainingExpr(e)
-    } :+ (true.B -> 0.U(16.W)))
-    val oldWakeRelevant = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> issueWakeExpr(e)
-    } :+ (true.B -> false.B))
-    val oldWarpBlocked = PriorityMux((0 until bundleTableEntries).map { e =>
-      matchVec(e) -> issueBlockedExpr(e)
-    } :+ (true.B -> false.B))
-
-    when(active) {
-      assert(access.bundleIssueCount =/= 0.U,
+    when(issueFires(lane)) {
+      assert(currentIssueAccess(lane).bundleIssueCount =/= 0.U,
         "TrafficGenRTLEngine issued an access with zero bundleIssueCount")
-      assert(assignedEntry < bundleTableEntries.U,
+      assert(issueAssignedEntry(lane) < bundleTableEntries.U,
         "TrafficGenRTLEngine assigned an invalid bundle-table index")
-      when(matchAny) {
-        assert(VecInit(issueIdExpr)(assignedEntry) === access.mBundleId,
-          "TrafficGenRTLEngine bundle-table ID mismatch")
-        assert(VecInit(issueRoundExpr)(assignedEntry) === access.bundleGeneration,
-          "TrafficGenRTLEngine bundle-table generation mismatch")
-        assert(oldRemaining =/= 0.U,
-          "TrafficGenRTLEngine issued more members than bundleIssueCount in one round")
-      }
-    }
-
-    issueValidExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && (matchVec(e) || allocOH(e)), true.B, issueValidExpr(e))
-    }
-    issueCountExpr = (0 until bundleTableEntries).map { e =>
-      val priorCount = Mux(matchVec(e), issueCountExpr(e), 0.U)
-      Mux(active && (matchVec(e) || allocOH(e)), priorCount + 1.U, issueCountExpr(e))
-    }
-    issueRemainingExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && allocOH(e), access.bundleIssueCount - 1.U,
-        Mux(active && matchVec(e),
-          issueRemainingExpr(e) - 1.U,
-          issueRemainingExpr(e)))
-    }
-    issueIdExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && allocOH(e), access.mBundleId, issueIdExpr(e))
-    }
-    issueWakeExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && allocOH(e), access.mWakeRelevantBundle,
-        Mux(active && matchVec(e), oldWakeRelevant || access.mWakeRelevantBundle,
-          issueWakeExpr(e)))
-    }
-    issueBlockedExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && allocOH(e), access.mWarpBlocked,
-        Mux(active && matchVec(e), oldWarpBlocked || access.mWarpBlocked,
-          issueBlockedExpr(e)))
-    }
-    issueRoundExpr = (0 until bundleTableEntries).map { e =>
-      Mux(active && allocOH(e), access.bundleGeneration, issueRoundExpr(e))
     }
   }
 
+  // Aggregate all issuing lanes by their already-assigned entry. The virtual
+  // assignment above remains lane-serial; only the table state update becomes
+  // entry-major, with one final value produced per entry.
+  val issueEntryAllocates = Wire(Vec(bundleTableEntries, Bool()))
+  val issueEntryFirstPublicId = Wire(Vec(bundleTableEntries, UInt(64.W)))
+  val issueEntryFirstGeneration = Wire(Vec(bundleTableEntries, UInt(32.W)))
+  val issueEntryFirstBundleCount = Wire(Vec(bundleTableEntries, UInt(16.W)))
+  val issueExistingUnderflowViolation = Wire(Vec(bundleTableEntries, Bool()))
+  val issueAllocationUnderflowViolation = Wire(Vec(bundleTableEntries, Bool()))
   for (e <- 0 until bundleTableEntries) {
-    issueBundleValidNext(e) := issueValidExpr(e)
-    issueBundleCountNext(e) := issueCountExpr(e)
-    issueBundleRemainingNext(e) := issueRemainingExpr(e)
-    issueBundleIdNext(e) := issueIdExpr(e)
-    issueBundleWakeNext(e) := issueWakeExpr(e)
-    issueBundleBlockedNext(e) := issueBlockedExpr(e)
-    issueBundleRoundNext(e) := issueRoundExpr(e)
+    val entryHits = VecInit((0 until params.numGenerators).map { lane =>
+      issueFires(lane) && issueAssignedEntry(lane) === e.U
+    })
+    val hitCount = PopCount(entryHits)
+    val hitCountForOutstanding = Wire(UInt(bundleCountWidth.W))
+    val hitCountForRemaining = Wire(UInt(16.W))
+    hitCountForOutstanding := hitCount
+    hitCountForRemaining := hitCount
+    val anyHit = entryHits.asUInt.orR
+    val firstHitOH = PriorityEncoderOH(entryHits.asUInt)
+    val firstPublicId = Mux1H(firstHitOH,
+      (0 until params.numGenerators).map(currentIssueAccess(_).mBundleId))
+    val firstGeneration = Mux1H(firstHitOH,
+      (0 until params.numGenerators).map(currentIssueAccess(_).bundleGeneration))
+    val firstBundleIssueCount = Mux1H(firstHitOH,
+      (0 until params.numGenerators).map(currentIssueAccess(_).bundleIssueCount))
+    val hitWakeRelevant = VecInit((0 until params.numGenerators).map { lane =>
+      entryHits(lane) && currentIssueAccess(lane).mWakeRelevantBundle
+    }).asUInt.orR
+    val hitWarpBlocked = VecInit((0 until params.numGenerators).map { lane =>
+      entryHits(lane) && currentIssueAccess(lane).mWarpBlocked
+    }).asUInt.orR
+    val allocates = anyHit && !bundleValid(e)
+    val priorCount = Mux(bundleValid(e), bundleOutstanding(e), 0.U)
+
+    issueEntryAllocates(e) := allocates
+    issueEntryFirstPublicId(e) := firstPublicId
+    issueEntryFirstGeneration(e) := firstGeneration
+    issueEntryFirstBundleCount(e) := firstBundleIssueCount
+    issueExistingUnderflowViolation(e) :=
+      anyHit && bundleValid(e) &&
+        bundleRemainingToIssue(e) < hitCountForRemaining
+    issueAllocationUnderflowViolation(e) :=
+      allocates && firstBundleIssueCount < hitCountForRemaining
+
+    issueBundleValidNext(e) := bundleValid(e) || anyHit
+    issueBundleCountNext(e) := Mux(anyHit,
+      priorCount + hitCountForOutstanding, bundleOutstanding(e))
+    issueBundleRemainingNext(e) := Mux(allocates,
+      firstBundleIssueCount - hitCountForRemaining,
+      Mux(anyHit,
+        bundleRemainingToIssue(e) - hitCountForRemaining,
+        bundleRemainingToIssue(e)))
+    issueBundleIdNext(e) := Mux(allocates, firstPublicId, bundleIds(e))
+    issueBundleWakeNext(e) := Mux(allocates,
+      hitWakeRelevant,
+      bundleWakeRelevant(e) || hitWakeRelevant)
+    issueBundleBlockedNext(e) := Mux(allocates,
+      hitWarpBlocked,
+      bundleWarpBlocked(e) || hitWarpBlocked)
+    issueBundleRoundNext(e) :=
+      Mux(allocates, firstGeneration, bundleIssueRound(e))
+
+  }
+  assert(!issueExistingUnderflowViolation.asUInt.orR,
+    "TrafficGenRTLEngine issued more members than bundleIssueCount in one round")
+  assert(!issueAllocationUnderflowViolation.asUInt.orR,
+    "TrafficGenRTLEngine issued more members than bundleIssueCount in one round")
+
+  // Check coalesced-allocation metadata once per firing lane. Keeping these
+  // checks lane-major avoids replicating assertion hardware for every
+  // entry/lane pair while enforcing the same agreement property.
+  for (lane <- 0 until params.numGenerators) {
+    val assignedInRange = issueAssignedEntry(lane) < bundleTableEntries.U
+    val safeAssignedEntry = Mux(assignedInRange, issueAssignedEntry(lane), 0.U)
+    when(issueFires(lane) && bundleValid(safeAssignedEntry)) {
+      assert(currentIssueAccess(lane).mBundleId === bundleIds(safeAssignedEntry),
+        "TrafficGenRTLEngine bundle-table ID mismatch")
+      assert(currentIssueAccess(lane).bundleGeneration ===
+        bundleIssueRound(safeAssignedEntry),
+        "TrafficGenRTLEngine bundle-table generation mismatch")
+    }
+    when(issueFires(lane) && issueEntryAllocates(safeAssignedEntry)) {
+      assert(currentIssueAccess(lane).mBundleId ===
+        issueEntryFirstPublicId(safeAssignedEntry),
+        "TrafficGenRTLEngine newly allocated bundle ID disagreement")
+      assert(currentIssueAccess(lane).bundleGeneration ===
+        issueEntryFirstGeneration(safeAssignedEntry),
+        "TrafficGenRTLEngine newly allocated bundle generation disagreement")
+      assert(currentIssueAccess(lane).bundleIssueCount ===
+        issueEntryFirstBundleCount(safeAssignedEntry),
+        "TrafficGenRTLEngine newly allocated bundle count disagreement")
+    }
   }
 
   val outputQueuesEmpty =
@@ -1766,10 +1799,10 @@ class WithTrafficGenMemL2 extends Config((site, here, up) => {
   case TrafficGenKey => up(TrafficGenKey, site).map(_.copy(memBackend = TrafficGenL2MemBackend))
 })
 
-class WithRTLTrafficGen(numGenerators: Int = 16) extends Config((site, here, up) => {
+class WithRTLTrafficGen(numGenerators: Int = 16, memOutstanding: Int = 8) extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams(
     numGenerators = numGenerators,
-    memOutstanding = 8,
+    memOutstanding = memOutstanding,
     backend = TrafficGenRTLBackend,
     remapTraceAddresses = true,
     remapBase = 0x100000000L,
