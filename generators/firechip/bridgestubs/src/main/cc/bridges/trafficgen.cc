@@ -1,6 +1,7 @@
 // See LICENSE for license details
 
 #include "trafficgen.h"
+#include "trafficgen_lane_assignment.h"
 #include "bridges/cpu_managed_stream.h"
 #include "core/simif.h"
 
@@ -748,8 +749,10 @@ void trafficgen_t::reset_workload_state() {
   l2_accesses.clear();
   pending_accesses_by_cycle.clear();
   pending_access_cycle_by_id.clear();
+  bundle_lane_owners.clear();
+  bundle_member_counts.clear();
+  bundle_assignment_by_request_uid.clear();
   upload_written_to_bram = false;
-  round_completion_pause_issued = false;
   round_input_reserved_subpartitions.clear();
   state = trafficgen_state_t::IDLE;
 }
@@ -848,24 +851,74 @@ void trafficgen_t::build_next_l2_access_chunk() {
     throw std::runtime_error("TrafficGen L2 access BRAM window has zero entry capacity");
   }
 
-  const auto &first_bucket = pending_accesses_by_cycle.begin()->second;
-  if (first_bucket.size() > max_entries) {
-    std::ostringstream oss;
-    oss << "TrafficGen cycle bucket exceeds maxL2AccessEntries: cycle="
-        << pending_accesses_by_cycle.begin()->first
-        << " bucket_entries=" << first_bucket.size()
-        << " capacity=" << max_entries;
-    throw std::runtime_error(oss.str());
-  }
+  if (use_rtl_engine) {
+    const size_t bank_stride_bytes = access_window_bytes / lane_count;
+    if (bank_stride_bytes % L2_ACCESS_STREAM_BYTES != 0) {
+      throw std::runtime_error("TrafficGen access lane bank is not entry aligned");
+    }
+    const size_t lane_capacity = bank_stride_bytes / L2_ACCESS_STREAM_BYTES;
+    if (lane_capacity == 0) {
+      throw std::runtime_error("TrafficGen access lane bank has zero entry capacity");
+    }
 
-  size_t chunk_entries = 0;
-  for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
-    (void)cycle;
-    if (chunk_entries + accesses.size() > max_entries) {
+    std::vector<size_t> lane_entries(lane_count, 0);
+    for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
+      (void)cycle;
+      std::vector<size_t> bucket_lane_entries(lane_count, 0);
+      for (const auto &access : accesses) {
+        if (access.assigned_lane >= lane_count) {
+          throw std::runtime_error("TrafficGen pending access has invalid replay lane");
+        }
+        ++bucket_lane_entries[access.assigned_lane];
+      }
+
+      bool bucket_fits = true;
+      for (size_t lane = 0; lane < lane_count; ++lane) {
+        bucket_fits &= lane_entries[lane] + bucket_lane_entries[lane] <= lane_capacity;
+      }
+      if (bucket_fits) {
+        l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.end());
+        for (size_t lane = 0; lane < lane_count; ++lane) {
+          lane_entries[lane] += bucket_lane_entries[lane];
+        }
+        continue;
+      }
+
+      // Stop at the first cycle that does not fit.  A fitting prefix from that
+      // cycle is still useful, and the remainder is replayed by the next
+      // capacity refill before any later-cycle access is uploaded.
+      std::vector<size_t> access_lanes;
+      access_lanes.reserve(accesses.size());
+      for (const auto &access : accesses) access_lanes.push_back(access.assigned_lane);
+      const size_t prefix = trafficgen_lane_assignment::fitting_lane_prefix(
+          access_lanes, lane_entries, lane_capacity);
+      l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.begin() + prefix);
       break;
     }
-    l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.end());
-    chunk_entries += accesses.size();
+
+    if (l2_accesses.empty()) {
+      throw std::runtime_error("TrafficGen could not fit a pending access in any lane bank");
+    }
+  } else {
+    const auto &first_bucket = pending_accesses_by_cycle.begin()->second;
+    if (first_bucket.size() > max_entries) {
+      std::ostringstream oss;
+      oss << "TrafficGen cycle bucket exceeds maxL2AccessEntries: cycle="
+          << pending_accesses_by_cycle.begin()->first
+          << " bucket_entries=" << first_bucket.size()
+          << " capacity=" << max_entries;
+      throw std::runtime_error(oss.str());
+    }
+
+    size_t chunk_entries = 0;
+    for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
+      (void)cycle;
+      if (chunk_entries + accesses.size() > max_entries) {
+        break;
+      }
+      l2_accesses.insert(l2_accesses.end(), accesses.begin(), accesses.end());
+      chunk_entries += accesses.size();
+    }
   }
 
   std::cout << "[bridge driver] built L2 access chunk: chunk_entries="
@@ -951,7 +1004,7 @@ void trafficgen_t::depopulate_uploaded_l2_access_chunk() {
 }
 
 void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
-  std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> bundle_counts;
+  std::map<bundle_key_t, std::size_t> pending_bundle_counts;
   // Count the entire currently available GPU schedule, not just this BRAM
   // chunk.  The first member tells the RTL engine how many members remain in
   // this scheduler generation; capacity refills then continue that same
@@ -959,31 +1012,56 @@ void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
   for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
     (void)cycle;
     for (const auto &access : accesses) {
-      ++bundle_counts[{access.bundle_generation, access.m_bundle_id}];
+      ++pending_bundle_counts[{access.bundle_generation, access.m_bundle_id}];
     }
   }
-  for (auto &access : l2_accesses) {
-    const auto count =
-        bundle_counts.at({access.bundle_generation, access.m_bundle_id});
-    if (count == 0 || count > std::numeric_limits<std::uint16_t>::max()) {
-      throw std::runtime_error("TrafficGen bundle member count exceeds packed width");
-    }
-    access.bundle_issue_count = static_cast<std::uint16_t>(count);
+
+  for (const auto &[key, count] : pending_bundle_counts) {
+    trafficgen_lane_assignment::remember_member_count(
+        bundle_member_counts, key, count);
   }
 
   if (use_rtl_engine) {
-    // The RTL engine accepts an ordered stream per lane and applies the real
-    // L2 backpressure when a lane's head becomes eligible.  The socket
-    // schedule can therefore contain more accesses than there are lanes with the same
-    // requested cycle (and repeated subpartitions); distribute that stream
-    // evenly without rewriting its cycles.  Any excess same-cycle accesses
-    // remain at the lane heads and issue on later target cycles as resources
-    // become available.
-    for (std::size_t i = 0; i < l2_accesses.size(); ++i) {
-      l2_accesses[i].assigned_lane =
-          i % lane_count;
+    const auto balance = trafficgen_lane_assignment::assign_bundles(
+        pending_bundle_counts, lane_count, bundle_lane_owners);
+
+    for (auto &[cycle, accesses] : pending_accesses_by_cycle) {
+      (void)cycle;
+      for (auto &access : accesses) {
+        const bundle_key_t key{access.bundle_generation, access.m_bundle_id};
+        access.assigned_lane = bundle_lane_owners.at(key);
+        access.bundle_issue_count = bundle_member_counts.at(key);
+        const trafficgen_bundle_assignment_t assignment{
+            access.bundle_generation,
+            access.m_bundle_id,
+            access.assigned_lane,
+            access.bundle_issue_count};
+        const auto [it, inserted] =
+            bundle_assignment_by_request_uid.emplace(access.id, assignment);
+        if (!inserted &&
+            (it->second.generation != assignment.generation ||
+             it->second.bundle_id != assignment.bundle_id ||
+             it->second.lane != assignment.lane ||
+             it->second.member_count != assignment.member_count)) {
+          throw std::runtime_error(
+              "TrafficGen request UID changed bundle assignment across refills");
+        }
+      }
     }
+
+    std::cout << "[bridge driver] bundle lane balance";
+    for (size_t lane = 0; lane < lane_count; ++lane) {
+      std::cout << " lane" << lane << "=" << balance.bundle_counts[lane]
+                << "b/" << balance.access_counts[lane] << "a";
+    }
+    std::cout << std::endl;
     return;
+  }
+
+  for (auto &access : l2_accesses) {
+    const auto count = pending_bundle_counts.at(
+        {access.bundle_generation, access.m_bundle_id});
+    access.bundle_issue_count = static_cast<std::uint16_t>(count);
   }
 
   std::vector<std::size_t> lane_counts(lane_count, 0);
@@ -1067,6 +1145,26 @@ void trafficgen_t::log_engine_round_for_compare(
   write_socket_snapshot((round_dir / "current_cycle_after_issue.bin").string(),
                         CurrentCycleAfterIssueSnapshot{current_cycle_after_issue});
 
+  std::ofstream lane_assignments(round_dir / "lane_assignments.csv");
+  if (!lane_assignments.is_open()) {
+    throw std::runtime_error("failed to write lane assignment snapshot: " +
+                             (round_dir / "lane_assignments.csv").string());
+  }
+  lane_assignments << "request_uid,bundle_generation,bundle_id,lane,member_count\n";
+  for (const auto &access : current_round_all_l2_trace_steps) {
+    const auto assignment =
+        bundle_assignment_by_request_uid.find(access.mUniqueId);
+    if (assignment == bundle_assignment_by_request_uid.end()) {
+      throw std::runtime_error(
+          "TrafficGen missing bundle lane assignment while logging round");
+    }
+    lane_assignments << access.mUniqueId << ','
+                     << assignment->second.generation << ','
+                     << assignment->second.bundle_id << ','
+                     << assignment->second.lane << ','
+                     << assignment->second.member_count << '\n';
+  }
+
   std::size_t reserved_subpartition_count = 0;
   for (const auto &[cycle, subpartitions] : round_input_reserved_subpartitions) {
     (void)cycle;
@@ -1080,7 +1178,8 @@ void trafficgen_t::log_engine_round_for_compare(
   manifest << "round=" << engine_round_number << "\n";
   manifest << "files=reserved_subpartitions.bin,all_l2_trace_steps.bin,"
            << "blocked_warp_ids.bin,min_issue_cycle.bin,issued_accesses.bin,"
-           << "completed_bundle_ids.bin,current_cycle_after_issue.bin\n";
+           << "completed_bundle_ids.bin,current_cycle_after_issue.bin,"
+           << "lane_assignments.csv\n";
   manifest << "reserved_cycle_count=" << round_input_reserved_subpartitions.size() << "\n";
   manifest << "reserved_subpartition_count=" << reserved_subpartition_count << "\n";
   manifest << "all_l2_trace_steps_count=" << current_round_all_l2_trace_steps.size() << "\n";
@@ -1144,8 +1243,13 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   accumulated_completed_bundle_ids.clear();
 
   refresh_pending_access_blocked_annotations();
-  build_next_l2_access_chunk();
-  assign_replay_lanes_and_bundle_counts();
+  if (use_rtl_engine) {
+    assign_replay_lanes_and_bundle_counts();
+    build_next_l2_access_chunk();
+  } else {
+    build_next_l2_access_chunk();
+    assign_replay_lanes_and_bundle_counts();
+  }
 
   std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
@@ -1296,9 +1400,28 @@ void trafficgen_t::write_schedule_to_bram() {
   }
   const std::size_t bank_stride_bytes = access_window_bytes / lane_count;
   std::vector<std::vector<const trafficgen_l2_access_t *>> lanes(lane_count);
+  std::map<bundle_key_t, std::size_t> upload_bundle_owners;
   for (const auto &access : l2_accesses) {
     if (access.assigned_lane >= lane_count) {
       throw std::runtime_error("TrafficGen access has invalid replay lane");
+    }
+    if (use_rtl_engine) {
+      const bundle_key_t key{access.bundle_generation, access.m_bundle_id};
+      const auto persistent_owner = bundle_lane_owners.find(key);
+      if (persistent_owner == bundle_lane_owners.end() ||
+          persistent_owner->second != access.assigned_lane) {
+        throw std::runtime_error("TrafficGen access disagrees with bundle lane owner");
+      }
+      const auto [owner, inserted] =
+          upload_bundle_owners.emplace(key, access.assigned_lane);
+      if (!inserted && owner->second != access.assigned_lane) {
+        throw std::runtime_error("TrafficGen upload splits a bundle across lanes");
+      }
+      const auto member_count = bundle_member_counts.find(key);
+      if (member_count == bundle_member_counts.end() ||
+          member_count->second != access.bundle_issue_count) {
+        throw std::runtime_error("TrafficGen access has inconsistent bundle member count");
+      }
     }
     lanes[access.assigned_lane].push_back(&access);
   }
@@ -1354,11 +1477,9 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::IDLE:
 
     // Wait for the traffic generator to be kicked off.
-    if (read(mmio_addrs.start_trafficgen)) {
+    if (read(mmio_addrs.start_trafficgen) &&
+        read(mmio_addrs.target_paused)) {
       std::cout << "[bridge driver] start signal received, starting traffic generation" << std::endl;
-      
-      // pause the target clock 
-      write(mmio_addrs.pause_target, 1);
 
       // The first workload is connected during init. Later workloads reconnect
       // to a freshly launched one-kernel scheduler after the prior scheduler
@@ -1371,7 +1492,7 @@ void trafficgen_t::tick() {
       // if the full kernel scheduling is complete, then return to IDLE
       if (receive_main_loop_complete_from_gpu_model()) {
         write(mmio_addrs.trafficgen_done, 1);
-        write(mmio_addrs.pause_target, 1);
+        write(mmio_addrs.resume_target, 1);
         gpu_model_socket_client->disconnect();
         reset_workload_state();
         break;
@@ -1419,8 +1540,7 @@ void trafficgen_t::tick() {
       std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
 
       write(mmio_addrs.start_round, 1);
-      write(mmio_addrs.pause_target, 1);
-      round_completion_pause_issued = false;
+      write(mmio_addrs.resume_target, 1);
       state = trafficgen_state_t::ISSUING_TRAFFIC;
     }
 
@@ -1428,17 +1548,11 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::ISSUING_TRAFFIC:
     // Wait for the target to finish generating memory traffic for the current round.
 
-    // pause target while we read back the results from this round and prepare for the next round
-    if (read(mmio_addrs.round_complete) && !round_completion_pause_issued) {
-      write(mmio_addrs.pause_target, 1);
-      round_completion_pause_issued = true;
-    }
-
-    // Once round_complete is latched in the bridge, the target-visible round
-    // outputs are stable. Do not wait for target_busy to fall after pausing:
-    // the pause can otherwise prevent the target from taking the cycle that
-    // presents the idle value to the bridge.
-    if (round_completion_pause_issued && read(mmio_addrs.round_complete)) {
+    // The target is already stopped at the token containing roundComplete.
+    // Begin readback only once both the stable output and pause acknowledgement
+    // are visible to the driver.
+    if (read(mmio_addrs.round_complete) &&
+        read(mmio_addrs.target_paused)) {
 
       // prepare to read back traffic generator outputs
       issued_access_writeback_entries.clear();
@@ -1522,8 +1636,13 @@ void trafficgen_t::tick() {
                   << target_cycle_after_issue
                   << ", refilling accessStore from pending accesses="
                   << pending_access_cycle_by_id.size() << std::endl;
-        build_next_l2_access_chunk();
-        assign_replay_lanes_and_bundle_counts();
+        if (use_rtl_engine) {
+          assign_replay_lanes_and_bundle_counts();
+          build_next_l2_access_chunk();
+        } else {
+          build_next_l2_access_chunk();
+          assign_replay_lanes_and_bundle_counts();
+        }
         upload_written_to_bram = false;
         issued_access_writeback_entries.clear();
         issued_access_writeback_stream_bytes.clear();
@@ -1578,7 +1697,7 @@ void trafficgen_t::tick() {
               "pending work");
         }
         write(mmio_addrs.trafficgen_done, 1);
-        write(mmio_addrs.pause_target, 1);
+        write(mmio_addrs.resume_target, 1);
         gpu_model_socket_client->disconnect();
         reset_workload_state();
       } else {

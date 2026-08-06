@@ -68,37 +68,38 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     /*
      * Bridge-driver control and target clock gating.
      */
-    val pauseTarget = RegInit(false.B)
-    val targetPaused = RegInit(false.B)
+    val resumeTarget = RegInit(false.B)
+    val boundaryPaused = RegInit(false.B)
     val accessReadTargetPaused = RegInit(false.B)
     val trafficGenDone = RegInit(false.B)
     val trafficGenDonePulse = Wire(Bool())
     trafficGenDonePulse := false.B
-    when(pauseTarget.asBool) {
-      targetPaused := ~targetPaused
+
+    val fire = hPort.toHost.hValid &&
+      hPort.fromHost.hReady &&
+      !boundaryPaused &&
+      !accessReadTargetPaused
+
+    when(resumeTarget) {
+      boundaryPaused := false.B
     }
 
-    // Latch the target's start doorbell until the host acknowledges it by
-    // pausing the target clock. This keeps the MMIO-visible start bit high long
-    // enough for the bridge driver to observe it even though the target write is
-    // only a one-cycle pulse.
+    // Latch the target's start doorbell and synchronously stop the target on the
+    // token that contains it. The driver explicitly resumes after it has
+    // prepared the first round, so host timing cannot change the boundary.
     val startTrafficGenLatched = RegInit(false.B)
-    when(target.startTrafficGen) {
+    when(resumeTarget) {
+      startTrafficGenLatched := false.B
+    }
+    when(fire && target.startTrafficGen) {
       startTrafficGenLatched := true.B
       trafficGenDone := false.B
-    }
-    when(pauseTarget.asBool) {
-      startTrafficGenLatched := false.B
+      boundaryPaused := true.B
     }
     when(trafficGenDonePulse) {
       trafficGenDone := true.B
     }
     target.trafficGenDone := trafficGenDone
-
-    val fire = hPort.toHost.hValid &&
-      hPort.fromHost.hReady &&
-      !targetPaused &&
-      !accessReadTargetPaused
 
     // completedBundleIds will be streamed back from traffic generator to bridge driver.
     // Each 512-bit beat carries eight 64-bit bundle IDs.
@@ -512,7 +513,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // Once driver indicates the uploads to XDMA are ready,
     // bridge module can indicate to target that data is ready
     when(commitUpload) {
-      assert(!target.issuedAccessBatch.valid && !issuedWriteCommitPending,
+      assert(!issuedWriteCommitPending,
         "TrafficGenBridge started a new round before issued batches committed")
       assert(uploadLaneCounts.reduce(_ +& _) === uploadCount,
         "TrafficGenBridge upload lane counts did not equal total upload count")
@@ -551,7 +552,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     target.uploadReady := uploadReady
 
-    when(target.roundStarted) {
+    when(fire && target.roundStarted) {
       uploadReady := false.B
       accessReplayActive := true.B
     }
@@ -798,7 +799,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       startRoundPending := true.B
       currentRound := currentRound + 1.U
     }
-    when(target.roundStarted) {
+    when(fire && target.roundStarted) {
       startRoundPending := false.B
     }
     target.startRound := startRoundPending
@@ -807,16 +808,32 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // and all lane-bank writes from that batch have committed.
     val roundCompleteLatched = RegInit(false.B)
     val roundCompletePending = RegInit(false.B)
-    when(target.roundStarted) {
+    val roundStopCycle = RegInit(0.U(64.W))
+    val roundStopCycleValid = RegInit(false.B)
+    when(fire && target.roundStarted) {
       roundCompleteLatched := false.B
       roundCompletePending := false.B
-    }.elsewhen(roundCompletePending &&
-               !target.issuedAccessBatch.valid &&
-               !issuedWriteCommitPending) {
+      roundStopCycleValid := false.B
+    }.elsewhen(roundCompletePending && !issuedWriteCommitPending) {
       roundCompleteLatched := true.B
       roundCompletePending := false.B
     }.elsewhen(fire && target.roundComplete) {
       roundCompletePending := true.B
+      roundStopCycle := target.currentCycleAfterIssue
+      roundStopCycleValid := true.B
+      boundaryPaused := true.B
+    }
+
+    val boundaryPausedPrev = RegNext(boundaryPaused, false.B)
+    val roundStopCycleValidPrev = RegNext(roundStopCycleValid, false.B)
+    val roundStopCyclePrev = RegNext(roundStopCycle, 0.U)
+    when(boundaryPaused) {
+      assert(!fire, "TrafficGenBridge target token fired while boundary-paused")
+    }
+    when(boundaryPaused && boundaryPausedPrev &&
+         roundStopCycleValid && roundStopCycleValidPrev && !resumeTarget) {
+      assert(roundStopCycle === roundStopCyclePrev,
+        "TrafficGenBridge round stop cycle changed while boundary-paused")
     }
 
 
@@ -855,6 +872,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       startTrafficGenLatched := false.B
       roundCompleteLatched := false.B
       roundCompletePending := false.B
+      roundStopCycle := 0.U
+      roundStopCycleValid := false.B
+      boundaryPaused := false.B
       trafficGenDone := false.B
       currentRound := 0.U
     }
@@ -865,6 +885,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReplayActive := false.B
       accessReadPrefillPending := false.B
       uploadReady := false.B
+      roundStopCycleValid := false.B
       for (flat <- 0 until replaySlots) {
         accessReadCursors(flat) := (flat % replaySlotsPerLane).U
       }
@@ -885,8 +906,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genROReg(target.hasPendingWork, "has_pending_work")
     Pulsify(genWORegInit(trafficGenDonePulse, "trafficgen_done", false.B), pulseLength = 1)
 
-    // bridge driver toggles to pause/resume target while generating traffic patterns
-    Pulsify(genWORegInit(pauseTarget, "pause_target", false.B), pulseLength = 1)
+    // Boundary pauses are entered synchronously from target tokens and exited
+    // only by this idempotent host command.
+    Pulsify(genWORegInit(resumeTarget, "resume_target", false.B), pulseLength = 1)
+    genROReg(boundaryPaused, "target_paused")
 
     // bridge driver pulses this when a freshly uploaded scheduling round is ready to issue
     Pulsify(genWORegInit(startRoundPulse, "start_round", false.B), pulseLength = 1)
@@ -920,8 +943,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genWORegInit(minIssueCycleLow, "min_issue_cycle_low", 0.U)
     genWORegInit(minIssueCycleHigh, "min_issue_cycle_high", 0.U)
 
-    genROReg(target.currentCycleAfterIssue(31, 0), "current_cycle_after_issue_low")
-    genROReg(target.currentCycleAfterIssue(63, 32), "current_cycle_after_issue_high")
+    val reportedCycleAfterIssue = Mux(
+      roundStopCycleValid, roundStopCycle, target.currentCycleAfterIssue)
+    genROReg(reportedCycleAfterIssue(31, 0), "current_cycle_after_issue_low")
+    genROReg(reportedCycleAfterIssue(63, 32), "current_cycle_after_issue_high")
     genROReg(target.roundExitReason, "round_exit_reason")
     genROReg(target.dpiState, "dpi_state")
     genROReg(issuedAccessWritebackCount, "issued_access_writeback_count")

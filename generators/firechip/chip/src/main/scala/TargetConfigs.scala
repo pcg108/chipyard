@@ -240,14 +240,28 @@ class FireSimRocketWithRTLTrafficGenL2NoTracerV8Config
 class FireSimRocketWithRTLTrafficGenL2NoTracerVM4Config
   extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(16, 4)
 
+class FireSimRocketWithRTLTrafficGenL2NoTracerVBoundaryOnlyConfig
+  extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
+    numGenerators = 16,
+    memOutstanding = 8,
+    serializeSameLine = false)
+
+class FireSimRocketWithRTLTrafficGenL2NoTracerVDeterministicConfig
+  extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
+    numGenerators = 16,
+    memOutstanding = 8,
+    serializeSameLine = true)
+
 class FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
   numGenerators: Int,
   memOutstanding: Int = 8,
+  serializeSameLine: Boolean = true,
 ) extends Config(
   new chipyard.config.WithNoTraceIO ++
   new chipyard.example.WithTrafficGenMemL2 ++
   new WithGPGPUSimLikeInclusiveL2 ++
-  new chipyard.example.WithRTLTrafficGen(numGenerators, memOutstanding) ++
+  new chipyard.example.WithRTLTrafficGen(
+    numGenerators, memOutstanding, serializeSameLine) ++
   new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
   new WithTrafficGenBridge ++
   new freechips.rocketchip.subsystem.WithExtMemSize((1L << 30) * 8) ++

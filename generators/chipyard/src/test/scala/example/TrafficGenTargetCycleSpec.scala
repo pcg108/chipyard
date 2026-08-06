@@ -566,41 +566,38 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
   }
 
   it should "apply issues before returns and retain a bundle until every member issued" in {
-    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 2, memOutstanding = 2))) { dut =>
-      initialize(dut, 2)
-      for (lane <- 0 until 2) {
-        dut.io.accessReadDataValid(replaySlot(lane)).poke(true.B)
-        pokePackedAccess(dut.io.accessReadData(replaySlot(lane)), id = lane + 1, bundleId = 77, bundleCount = 2)
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 2))) { dut =>
+      initialize(dut, 1)
+      for (slot <- 0 until 2) {
+        dut.io.accessReadDataValid(replaySlot(0, slot)).poke(true.B)
+        pokePackedAccess(dut.io.accessReadData(replaySlot(0, slot)),
+          id = slot + 1, bundleId = 77, bundleCount = 2)
       }
-      dut.io.issue(1).ready.poke(false.B)
       startRound(dut)
       waitFor(dut.io.issue(0).valid.peek().litToBoolean, dut)
       dut.clock.step()
       dut.io.accessReadDataValid(replaySlot(0)).poke(false.B)
-      dut.io.accessReadLaneDoneMask.poke((allLanes(dut) ^ (BigInt(1) << 1)).U)
-      dut.io.accessReadRespId.poke(1.U)
-      dut.clock.step()
+      dut.io.accessReadRespId.poke(slotGenerations((0, 0, 1)).U)
 
       // The second member issues in the same cycle that the first returns.
-      dut.io.issue(1).ready.poke(true.B)
       // The cache returns the engine-private bundle-table token carried on
       // io.issue, not the scheduler-owned bundle ID.
       pokeAccess(dut.io.completion(0).bits, id = 1, bundleId = 0, bundleCount = 2)
       dut.io.completion(0).valid.poke(true.B)
       waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
-      dut.io.accessReadConsumeMask.expect(replaySlotMask((1, 0)).U)
+      dut.io.accessReadConsumeMask.expect(replaySlotMask((0, 1)).U)
       dut.clock.step()
       dut.io.completion(0).valid.poke(false.B)
-      dut.io.accessReadDataValid(replaySlot(1)).poke(false.B)
+      dut.io.accessReadDataValid(replaySlot(0, 1)).poke(false.B)
       dut.io.accessReadLaneDoneMask.poke(allLanes(dut).U)
-      dut.io.accessReadRespId.poke(laneGenerations(0 -> 1, 1 -> 1).U)
+      dut.io.accessReadRespId.poke(slotGenerations((0, 0, 1), (0, 1, 1)).U)
       dut.io.completedBundleIdWriteEn.expect(false.B)
 
-      pokeAccess(dut.io.completion(1).bits, id = 2, bundleId = 0, bundleCount = 2)
-      dut.io.completion(1).valid.poke(true.B)
-      waitFor(dut.io.completion(1).ready.peek().litToBoolean, dut)
+      pokeAccess(dut.io.completion(0).bits, id = 2, bundleId = 0, bundleCount = 2)
+      dut.io.completion(0).valid.poke(true.B)
+      waitFor(dut.io.completion(0).ready.peek().litToBoolean, dut)
       dut.clock.step()
-      dut.io.completion(1).valid.poke(false.B)
+      dut.io.completion(0).valid.poke(false.B)
       waitFor(dut.io.completedBundleIdWriteEn.peek().litToBoolean, dut)
       dut.io.completedBundleIdWriteData.expect(77.U)
     }
@@ -792,11 +789,54 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "handle same-entry and distinct-entry completions in one cycle" in {
+  it should "stall only the lane whose local bundle table is full" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 2, memOutstanding = 1))) { dut =>
+      initialize(dut, 2)
+      for (slot <- 0 until slotsPerLane) {
+        dut.io.accessReadDataValid(replaySlot(0, slot)).poke(true.B)
+        pokePackedAccess(
+          dut.io.accessReadData(replaySlot(0, slot)),
+          id = 100 + slot,
+          bundleId = 100 + slot,
+        )
+      }
+
+      startRound(dut)
+      waitFor(dut.io.accessReadConsumeMask.peek().litValue == replaySlotMask((0, 0)), dut)
+      dut.clock.step()
+      dut.io.accessReadConsumeMask.expect(replaySlotMask((0, 1)).U)
+      dut.clock.step()
+      dut.io.accessReadConsumeMask.expect(replaySlotMask((0, 2)).U)
+      dut.clock.step()
+
+      // Lane zero now occupies all three of its private entries.  A new head
+      // on lane one must still allocate its own local entry zero.
+      pokePackedAccess(dut.io.accessReadData(replaySlot(0)), id = 103, bundleId = 103)
+      dut.io.accessReadRespId.poke(slotGenerations((0, 0, 1)).U)
+      dut.io.accessReadDataValid(replaySlot(1)).poke(true.B)
+      pokePackedAccess(dut.io.accessReadData(replaySlot(1)), id = 200, bundleId = 200)
+      dut.io.issue(0).valid.expect(false.B)
+      dut.io.issue(1).valid.expect(true.B)
+      dut.io.issue(1).bits.mBundleId.expect(0.U)
+      dut.io.accessReadConsumeMask.expect(replaySlotMask((1, 0)).U)
+
+      // Retiring lane zero's local entry zero frees it after this edge; the
+      // blocked lane-zero access then allocates that index on the next cycle.
+      pokeAccess(dut.io.completion(0).bits, id = 100, bundleId = 0)
+      dut.io.completion(0).valid.poke(true.B)
+      dut.clock.step()
+      dut.io.completion(0).valid.poke(false.B)
+      dut.io.issue(0).valid.expect(true.B)
+      dut.io.issue(0).bits.id.expect(103.U)
+      dut.io.issue(0).bits.mBundleId.expect(0.U)
+    }
+  }
+
+  it should "handle independent lane-local completions in one cycle" in {
     test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 4, memOutstanding = 2))) { dut =>
       initialize(dut, 4)
-      val bundleIds = Seq(90, 90, 91, 92)
-      val bundleCounts = Seq(2, 2, 1, 1)
+      val bundleIds = Seq(90, 91, 92, 93)
+      val bundleCounts = Seq(1, 1, 1, 1)
       for (lane <- 0 until 4) {
         dut.io.accessReadDataValid(replaySlot(lane)).poke(true.B)
         pokePackedAccess(
@@ -815,9 +855,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       )
       val tokens = (0 until 4).map(lane =>
         dut.io.issue(lane).bits.mBundleId.peek().litValue)
-      assert(tokens(0) == tokens(1))
-      assert(tokens(0) != tokens(2))
-      assert(tokens(2) != tokens(3))
+      assert(tokens.distinct == Seq(BigInt(0)))
       dut.clock.step()
 
       for (lane <- 0 until 4) {
@@ -827,8 +865,8 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.accessReadRespId.poke(laneGenerations(
         0 -> 1, 1 -> 1, 2 -> 1, 3 -> 1).U)
 
-      // Lanes zero and one retire the two members of bundle 90 while lane two
-      // independently retires bundle 91 on the same target edge.
+      // Identical local indices refer to independent tables, so all three
+      // lanes can retire their entry zero on the same target edge.
       for (lane <- 0 until 3) {
         pokeAccess(
           dut.io.completion(lane).bits,
@@ -845,14 +883,14 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
 
       val completed = scala.collection.mutable.ArrayBuffer.empty[BigInt]
       var cycles = 0
-      while (completed.size < 2 && cycles < 20) {
+      while (completed.size < 3 && cycles < 20) {
         if (dut.io.completedBundleIdWriteEn.peek().litToBoolean) {
           completed += dut.io.completedBundleIdWriteData.peek().litValue
         }
         dut.clock.step()
         cycles += 1
       }
-      assert(completed.toSeq == Seq(BigInt(90), BigInt(91)))
+      assert(completed.toSeq.sorted == Seq(BigInt(90), BigInt(91), BigInt(92)))
 
       pokeAccess(dut.io.completion(3).bits, id = 903, bundleId = tokens(3))
       dut.io.completion(3).valid.poke(true.B)
@@ -860,7 +898,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.clock.step()
       dut.io.completion(3).valid.poke(false.B)
       waitFor(dut.io.completedBundleIdWriteEn.peek().litToBoolean, dut)
-      dut.io.completedBundleIdWriteData.expect(92.U)
+      dut.io.completedBundleIdWriteData.expect(93.U)
     }
   }
 

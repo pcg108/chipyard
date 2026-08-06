@@ -22,7 +22,8 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t target_busy;
   uint64_t has_pending_work;
   uint64_t trafficgen_done;
-  uint64_t pause_target;
+  uint64_t resume_target;
+  uint64_t target_paused;
   uint64_t start_round;
   uint64_t current_round_low;
   uint64_t current_round_high;
@@ -78,6 +79,13 @@ struct trafficgen_issued_access_point_t {
   std::uint64_t cycle_issued = 0;
   std::uint64_t address = 0;
   bool is_write = false;
+};
+
+struct trafficgen_bundle_assignment_t {
+  std::uint32_t generation = 0;
+  std::uint64_t bundle_id = 0;
+  std::size_t lane = 0;
+  std::uint16_t member_count = 0;
 };
 
 enum class trafficgen_state_t {
@@ -145,6 +153,11 @@ private:
   std::map<std::uint64_t, std::vector<trafficgen_l2_access_t>>
       pending_accesses_by_cycle;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
+  using bundle_key_t = std::pair<std::uint32_t, std::uint64_t>;
+  std::map<bundle_key_t, std::size_t> bundle_lane_owners;
+  std::map<bundle_key_t, std::uint16_t> bundle_member_counts;
+  std::unordered_map<std::uint64_t, trafficgen_bundle_assignment_t>
+      bundle_assignment_by_request_uid;
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -161,7 +174,6 @@ private:
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
 
   bool upload_written_to_bram = false;
-  bool round_completion_pause_issued = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
   std::unique_ptr<socket_client_t> gpu_model_socket_client;
 
