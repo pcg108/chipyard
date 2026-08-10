@@ -3,6 +3,7 @@
 package firechip.chip
 
 import chisel3._
+import chisel3.util.experimental.BoringUtils
 
 import org.chipsalliance.cde.config.{Config}
 import freechips.rocketchip.diplomacy.{LazyModule}
@@ -20,6 +21,7 @@ import firechip.bridgestubs._
 
 import firesim.lib.bridges.{FASEDBridge, CompleteConfig}
 import firesim.lib.nasti.{NastiIO, NastiParameters}
+import sifive.blocks.inclusivecache.InclusiveCacheTrafficGenTraceCycles
 
 object MainMemoryConsts {
   val regionNamePrefix = "MainMemory"
@@ -125,6 +127,31 @@ class WithFASEDBridge extends HarnessBinder({
                                    port.io.bits.ar.bits.id.getWidth)
     val nastiIo = Wire(new NastiIO(nastiParams))
     AXI4NastiAssigner.toNasti(nastiIo, port.io.bits)
+    if (th.p(InclusiveCacheTrafficGenTraceCycles) > 0) {
+      // chipId identifies the chip, not the independently striped memory port.
+      // Use the port's lowest address as a stable, unambiguous trace label.
+      val tracePortBase = port.edge.slave.slaves.flatMap(_.address).map(_.base).min
+      val traceActive = Wire(Bool())
+      val traceCycle = Wire(UInt(64.W))
+      traceActive := false.B
+      traceCycle := 0.U
+      BoringUtils.addSink(traceActive, "trafficgen_trace_active")
+      BoringUtils.addSink(traceCycle, "trafficgen_trace_cycle")
+      when(traceActive) {
+        when(nastiIo.aw.fire) {
+          printf(p"[TGTRACE][FASED@0x${tracePortBase.toString(16)}][AW] cycle=${traceCycle} id=${nastiIo.aw.bits.id} addr=0x${Hexadecimal(nastiIo.aw.bits.addr)} len=${nastiIo.aw.bits.len}\n")
+        }
+        when(nastiIo.ar.fire) {
+          printf(p"[TGTRACE][FASED@0x${tracePortBase.toString(16)}][AR] cycle=${traceCycle} id=${nastiIo.ar.bits.id} addr=0x${Hexadecimal(nastiIo.ar.bits.addr)} len=${nastiIo.ar.bits.len}\n")
+        }
+        when(nastiIo.b.valid || nastiIo.b.ready) {
+          printf(p"[TGTRACE][FASED@0x${tracePortBase.toString(16)}][B] cycle=${traceCycle} valid=${nastiIo.b.valid} ready=${nastiIo.b.ready} id=${nastiIo.b.bits.id}\n")
+        }
+        when(nastiIo.r.valid || nastiIo.r.ready) {
+          printf(p"[TGTRACE][FASED@0x${tracePortBase.toString(16)}][R] cycle=${traceCycle} valid=${nastiIo.r.valid} ready=${nastiIo.r.ready} id=${nastiIo.r.bits.id} last=${nastiIo.r.bits.last}\n")
+        }
+      }
+    }
     FASEDBridge(port.io.clock, nastiIo, th.harnessBinderReset.asBool,
       CompleteConfig(
         nastiParams,

@@ -252,16 +252,27 @@ class FireSimRocketWithRTLTrafficGenL2NoTracerVDeterministicConfig
     memOutstanding = 8,
     serializeSameLine = true)
 
+class FireSimRocketWithRTLTrafficGenL2NoTracerVDeterministicTraceConfig
+  extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
+    numGenerators = 16,
+    memOutstanding = 8,
+    serializeSameLine = true,
+    traceFirstCycles = 128)
+
 class FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
   numGenerators: Int,
   memOutstanding: Int = 8,
   serializeSameLine: Boolean = true,
+  traceFirstCycles: Int = 0,
 ) extends Config(
+  new Config((site, here, up) => {
+    case sifive.blocks.inclusivecache.InclusiveCacheTrafficGenTraceCycles => traceFirstCycles
+  }) ++
   new chipyard.config.WithNoTraceIO ++
   new chipyard.example.WithTrafficGenMemL2 ++
   new WithGPGPUSimLikeInclusiveL2 ++
   new chipyard.example.WithRTLTrafficGen(
-    numGenerators, memOutstanding, serializeSameLine) ++
+    numGenerators, memOutstanding, serializeSameLine, traceFirstCycles) ++
   new chipyard.iobinders.WithTrafficGenIOPunchthrough ++
   new WithTrafficGenBridge ++
   new freechips.rocketchip.subsystem.WithExtMemSize((1L << 30) * 8) ++

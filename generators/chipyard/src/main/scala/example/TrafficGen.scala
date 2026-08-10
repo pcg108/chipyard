@@ -3,6 +3,7 @@ package chipyard.example
 import chisel3._
 import chisel3.util._
 import chisel3.experimental.IntParam
+import chisel3.util.experimental.BoringUtils
 
 import freechips.rocketchip.prci._
 import freechips.rocketchip.subsystem._
@@ -44,11 +45,13 @@ case class TrafficGenParams(
   backend: TrafficGenBackend = TrafficGenDPIBackend,
   memBackend: TrafficGenMemBackend = TrafficGenUncachedMemBackend,
   serializeSameLine: Boolean = true,
+  traceFirstCycles: Int = 0,
   remapTraceAddresses: Boolean = false,
   remapBase: BigInt = 0x80000000L,
   remapSize: BigInt = 1L << 32
 ) {
   require(numGenerators >= 1, "TrafficGen requires at least one generator")
+  require(traceFirstCycles >= 0, "TrafficGen trace cycle count must be non-negative")
   require(maxL2AccessEntries % numGenerators == 0,
     "TrafficGen requires maxL2AccessEntries to divide evenly across generators")
 }
@@ -920,6 +923,18 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val startingWorkload =
     acceptingRound && !targetTimeStarted
 
+  if (params.traceFirstCycles > 0) {
+    val traceCycle = Mux(startingWorkload, 0.U, targetCycle)
+    val traceActive = startingWorkload ||
+      (targetTimeStarted && targetCycle < params.traceFirstCycles.U)
+    BoringUtils.addSource(traceActive, "trafficgen_trace_active")
+    BoringUtils.addSource(traceCycle, "trafficgen_trace_cycle")
+
+    when(traceActive) {
+      printf(p"[TGTRACE][ENGINE] cycle=${traceCycle} state=${state} issue=0x${Hexadecimal(issueFires.asUInt)} completion=0x${Hexadecimal(completionFires.asUInt)} mem_active=${io.memActive} inflight=0x${Hexadecimal(io.memInflightAccesses.asUInt)} pending_consume=0x${Hexadecimal(accessReadConsumePendingMask)}\n")
+    }
+  }
+
   io.accessReadCycle := targetCycle
   io.accessReadEn := state === sIssueBatch && issueWindowOpen
   io.accessReadBatchReady := state === sIssueBatch && issueWindowOpen
@@ -1641,6 +1656,43 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
         assert(dSourceValid, "TrafficGenMemL2 received a ReleaseAck for an invalid source slot")
       }
 
+      if (params.traceFirstCycles > 0) {
+        val traceActive = Wire(Bool())
+        val traceCycle = Wire(UInt(64.W))
+        traceActive := false.B
+        traceCycle := 0.U
+        BoringUtils.addSink(traceActive, "trafficgen_trace_active")
+        BoringUtils.addSink(traceCycle, "trafficgen_trace_cycle")
+
+        when(traceActive) {
+          printf(p"[TGTRACE][LANE${id}] cycle=${traceCycle} q=${issueQueue.io.count} sender=${senderValid} inflight=0x${Hexadecimal(inflightValid.asUInt)} states=0x${Hexadecimal(sourceStates.asUInt)} probe=${probeValid} cactive=${cActive} completion_q=${completionQueue.io.count}\n")
+          when(issueQueue.io.enq.fire) {
+            printf(p"[TGTRACE][LANE${id}][QENQ] cycle=${traceCycle} uid=${io.req.bits.id} addr=0x${Hexadecimal(selectedAddress(io.req.bits))}\n")
+          }
+          when(issueQueue.io.deq.fire) {
+            printf(p"[TGTRACE][LANE${id}][QDEQ] cycle=${traceCycle} uid=${issueQueue.io.deq.bits.id} source=${nextSource} line=0x${Hexadecimal(candidateLineAddr)} conflict=${candidateLineOwned}\n")
+          }
+          when(mem.a.valid || mem.a.ready) {
+            printf(p"[TGTRACE][LANE${id}][A] cycle=${traceCycle} valid=${mem.a.valid} ready=${mem.a.ready} opcode=${mem.a.bits.opcode} param=${mem.a.bits.param} source=${mem.a.bits.source} addr=0x${Hexadecimal(mem.a.bits.address)}\n")
+          }
+          when(mem.b.valid || mem.b.ready) {
+            printf(p"[TGTRACE][LANE${id}][B] cycle=${traceCycle} valid=${mem.b.valid} ready=${mem.b.ready} opcode=${mem.b.bits.opcode} param=${mem.b.bits.param} source=${mem.b.bits.source} addr=0x${Hexadecimal(mem.b.bits.address)}\n")
+          }
+          when(mem.c.valid || mem.c.ready) {
+            printf(p"[TGTRACE][LANE${id}][C] cycle=${traceCycle} valid=${mem.c.valid} ready=${mem.c.ready} opcode=${mem.c.bits.opcode} param=${mem.c.bits.param} source=${mem.c.bits.source} addr=0x${Hexadecimal(mem.c.bits.address)}\n")
+          }
+          when(mem.d.valid || mem.d.ready) {
+            printf(p"[TGTRACE][LANE${id}][D] cycle=${traceCycle} valid=${mem.d.valid} ready=${mem.d.ready} opcode=${mem.d.bits.opcode} param=${mem.d.bits.param} source=${mem.d.bits.source} sink=${mem.d.bits.sink} denied=${mem.d.bits.denied}\n")
+          }
+          when(mem.e.valid || mem.e.ready) {
+            printf(p"[TGTRACE][LANE${id}][E] cycle=${traceCycle} valid=${mem.e.valid} ready=${mem.e.ready} sink=${mem.e.bits.sink}\n")
+          }
+          when(dCompletionFire || cProbeCompletionFire) {
+            printf(p"[TGTRACE][LANE${id}][COMPLETE] cycle=${traceCycle} d=${dCompletionFire} probe=${cProbeCompletionFire} source=${Mux(dCompletionFire, dSource, cActiveSource)}\n")
+          }
+        }
+      }
+
       io.completion <> completionQueue.io.deq
       io.active := senderValid ||
         issueQueue.io.deq.valid ||
@@ -1740,12 +1792,14 @@ class WithRTLTrafficGen(
   numGenerators: Int = 16,
   memOutstanding: Int = 8,
   serializeSameLine: Boolean = true,
+  traceFirstCycles: Int = 0,
 ) extends Config((site, here, up) => {
   case TrafficGenKey => Some(TrafficGenParams(
     numGenerators = numGenerators,
     memOutstanding = memOutstanding,
     backend = TrafficGenRTLBackend,
     serializeSameLine = serializeSameLine,
+    traceFirstCycles = traceFirstCycles,
     remapTraceAddresses = true,
     remapBase = 0x100000000L,
     remapSize = 1L << 32))
