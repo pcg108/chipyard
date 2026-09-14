@@ -179,7 +179,6 @@ private:
 
   size_t process_completed_bundle_ids_stream();
   size_t process_issued_access_writeback_stream();
-  void push_upload_data();
   void write_schedule_to_bram();
   void connect_gpu_model_socket();
   void reset_workload_state();

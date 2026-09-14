@@ -244,7 +244,8 @@ class FireSimRocketWithRTLTrafficGenL2NoTracerVBoundaryOnlyConfig
   extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
     numGenerators = 16,
     memOutstanding = 8,
-    serializeSameLine = false)
+    // Source slots share one coherent client; serialize ownership of each line.
+    serializeSameLine = true)
 
 class FireSimRocketWithRTLTrafficGenL2NoTracerVDeterministicConfig
   extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
@@ -407,13 +408,13 @@ class FireSimLeanGemminiRocketMMIOOnlyConfig extends Config(
   new WithFireSimConfigTweaks ++
   new chipyard.LeanGemminiRocketConfig)
 
-class FireSimRadianceClusterSynConfig extends Config(
-  new chipyard.harness.WithHarnessBinderClockFreqMHz(500.0) ++
-  new chipyard.config.WithNoTraceIO ++
-  new WithDefaultFireSimBridges ++
-  new chipyard.config.WithRadBootROM ++
-  new WithFireSimConfigTweaks ++
-  new chipyard.RadianceClusterSynConfig)
+// class FireSimRadianceClusterSynConfig extends Config(
+//   new chipyard.harness.WithHarnessBinderClockFreqMHz(500.0) ++
+//   new chipyard.config.WithNoTraceIO ++
+//   new WithDefaultFireSimBridges ++
+//   new chipyard.config.WithRadBootROM ++
+//   new WithFireSimConfigTweaks ++
+//   new chipyard.RadianceClusterSynConfig)
 
 class FireSimLargeBoomCospikeConfig extends Config(
   new WithCospikeBridge ++

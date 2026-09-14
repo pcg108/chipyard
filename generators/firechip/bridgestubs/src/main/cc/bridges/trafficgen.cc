@@ -819,6 +819,9 @@ static bool access_warp_is_blocked(
 }
 
 void trafficgen_t::refresh_pending_access_blocked_annotations() {
+  /*
+    For every pending access, update the m_warp_blocked field based on the current round's blocked warp IDs
+  */
   for (auto &[cycle, accesses] : pending_accesses_by_cycle) {
     (void)cycle;
     for (auto &access : accesses) {
@@ -829,6 +832,9 @@ void trafficgen_t::refresh_pending_access_blocked_annotations() {
 }
 
 void trafficgen_t::refresh_upload_access_blocked_annotations() {
+  /*
+    For every access in the current upload chunk, update the m_warp_blocked field based on the current round's blocked warp IDs
+  */
   for (auto &access : l2_accesses) {
     access.m_warp_blocked =
         access_warp_is_blocked(access, current_round_blocked_warp_ids);
@@ -929,7 +935,7 @@ void trafficgen_t::build_next_l2_access_chunk() {
 
 L2SubpartitionReservationsByCycle trafficgen_t::build_reserved_subpartitions_from_pending() const {
 
-  // create the cycle : subpartition reservation map from the un-issued accesses to send to scheduler
+  // create the {cycle : subpartition} reservation map from the un-issued accesses to send to scheduler
 
   L2SubpartitionReservationsByCycle reservations;
   for (const auto &[cycle, accesses] : pending_accesses_by_cycle) {
@@ -1382,10 +1388,12 @@ void trafficgen_t::write_schedule_to_bram() {
     return;
   }
 
+  // instead of a blocked warp map in the RTL engine, we annotate the pending and upload accesses with 
+  // the blocked warp status from current round's blocked warp IDs
   refresh_pending_access_blocked_annotations();
   refresh_upload_access_blocked_annotations();
 
-  // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O
+  // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O for XDMA
   auto &xdma = simif.get_cpu_managed_stream_io();
 
   const size_t access_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
@@ -1453,7 +1461,7 @@ void trafficgen_t::write_schedule_to_bram() {
               << std::endl;
   }
 
-  // write access meta data into MMIO registers
+  // write access metadata into MMIO registers
   const std::uint64_t max_cycle =
       l2_accesses.empty() ? 0 : l2_accesses.back().cycle_count;
   write(mmio_addrs.upload_count, static_cast<uint32_t>(l2_accesses.size()));
@@ -1466,10 +1474,6 @@ void trafficgen_t::write_schedule_to_bram() {
   write(mmio_addrs.commit_upload, 1);
 
   upload_written_to_bram = true;
-}
-
-void trafficgen_t::push_upload_data() {
-  write_schedule_to_bram();
 }
 
 void trafficgen_t::tick() {
@@ -1504,6 +1508,11 @@ void trafficgen_t::tick() {
     break;
   case trafficgen_state_t::SEND_RESERVED_PARTITIONS:
     {
+      /*
+        GPU scheduler uses {cycle : subpartitions} map to avoid scheduling a new access to an L2 subpartition
+        that already has a pending access in the traffic generator
+      */
+
       const auto reservations = build_reserved_subpartitions_from_pending();
       std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
                 << reservations.size()
@@ -1532,7 +1541,7 @@ void trafficgen_t::tick() {
   case trafficgen_state_t::UPLOAD_SCHEDULE:
 
     // write schedule to bridge module via XDMA
-    push_upload_data();
+    write_schedule_to_bram();
 
     // once the upload is complete, signal target to start round and unpause target clock
     if (read(mmio_addrs.upload_ready)) {
