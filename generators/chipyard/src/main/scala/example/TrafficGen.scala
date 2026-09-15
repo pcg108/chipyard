@@ -31,6 +31,7 @@ case object TrafficGenRTLBackend extends TrafficGenBackend
 sealed trait TrafficGenMemBackend
 case object TrafficGenUncachedMemBackend extends TrafficGenMemBackend
 case object TrafficGenL2MemBackend extends TrafficGenMemBackend
+case object TrafficGenL2PutGetMemBackend extends TrafficGenMemBackend
 
 case class TrafficGenParams(
   address: BigInt = 0x5000,
@@ -1252,16 +1253,25 @@ abstract class TrafficGenMemBase(id: Int, beatBytes: Int, params: TrafficGenPara
   }
 }
 
-class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit p: Parameters)
+class TrafficGenMem(
+  id: Int,
+  beatBytes: Int,
+  params: TrafficGenParams,
+  transferBytes: Int = 64,
+  serializeSameTransfer: Boolean = false,
+  requireAligned: Boolean = false,
+)(implicit p: Parameters)
     extends TrafficGenMemBase(id, beatBytes, params)(p) {
-  require(beatBytes <= 64 && 64 % beatBytes == 0,
-    "TrafficGenMem assumes 64-byte accesses split into an integral number of TL beats")
+  require(transferBytes > 0 && isPow2(transferBytes), "TrafficGenMem transfer size must be a power of two")
+  require(beatBytes <= transferBytes && transferBytes % beatBytes == 0,
+    "TrafficGenMem accesses must contain an integral number of TL beats")
   require(params.memOutstanding >= 1, "TrafficGenMem requires at least one outstanding access slot")
+  private val transferOffsetBits = log2Ceil(transferBytes)
   if (params.remapTraceAddresses) {
     require(params.remapSize == (1L << 32),
       "TrafficGenMem trace-address remapping currently assumes a 4 GiB window")
-    require(params.remapBase % 64 == 0,
-      "TrafficGenMem trace-address remap base must be 64-byte aligned")
+    require(params.remapBase % transferBytes == 0,
+      "TrafficGenMem trace-address remap base must be transfer aligned")
   }
 
   val node = TLClientNode(Seq(TLMasterPortParameters.v1(
@@ -1269,8 +1279,8 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
       name = s"trafficgenmem$id",
       sourceId = IdRange(0, params.memOutstanding),
       emits = TLMasterToSlaveTransferSizes(
-        get = TransferSizes(64, 64),
-        putFull = TransferSizes(64, 64)
+        get = TransferSizes(transferBytes, transferBytes),
+        putFull = TransferSizes(transferBytes, transferBytes)
       )
     ))
   )))
@@ -1293,33 +1303,49 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
       val completionQueue = Module(new Queue(new RTLL2Access, params.memOutstanding))
       val inflightValid = RegInit(VecInit(Seq.fill(params.memOutstanding)(false.B)))
       val inflightAccesses = Reg(Vec(params.memOutstanding, new RTLL2Access))
+      val inflightTransferAddrs = Reg(Vec(params.memOutstanding, UInt(64.W)))
+      val sentRequests = RegInit(VecInit(Seq.fill(params.memOutstanding)(false.B)))
       val senderValid = RegInit(false.B)
       val senderAccess = Reg(new RTLL2Access)
+      val senderAddress = Reg(UInt(64.W))
       val sourceIdxWidth = log2Ceil(params.memOutstanding max 2)
       val senderSource = Reg(UInt(sourceIdxWidth.W))
       val freeSourceOH = VecInit(inflightValid.map(v => !v)).asUInt
       val hasFreeSource = freeSourceOH.orR
       val nextSource = PriorityEncoder(freeSourceOH)
       val activeAccess = senderAccess
-      val rawAddr = activeAccess.address + io.coreOffset
-      val remappedAddr = params.remapBase.U(64.W) + activeAccess.address(31, 0)
-      val selectedAddr = Mux(params.remapTraceAddresses.B, remappedAddr, rawAddr)
-      val addr = Cat(selectedAddr(63, 6), 0.U(6.W))
-      val size = log2Ceil(64).U
+      def selectedAddress(access: RTLL2Access): UInt = TrafficGenLineOwnership.selectedAddress(
+        access.address, io.coreOffset, params.remapTraceAddresses, params.remapBase)
+      val addr = senderAddress
+      val size = transferOffsetBits.U
 
       issueQueue.io.enq <> io.req
 
-      val canStartRequest = !senderValid && hasFreeSource
+      val candidateSelectedAddr = selectedAddress(issueQueue.io.deq.bits)
+      val candidateTransferAddr = TrafficGenLineOwnership.lineAddress(candidateSelectedAddr, transferOffsetBits)
+      val candidateTransferOwned = TrafficGenLineOwnership.conflict(
+        candidateTransferAddr, inflightValid.toSeq, inflightTransferAddrs.toSeq)
+      val transferReady = if (serializeSameTransfer) !candidateTransferOwned else true.B
+      val canStartRequest = !senderValid && hasFreeSource && transferReady
       issueQueue.io.deq.ready := canStartRequest
 
+      if (requireAligned) {
+        when(issueQueue.io.deq.valid) {
+          assert(candidateSelectedAddr(transferOffsetBits - 1, 0) === 0.U,
+            "TrafficGenMem request address must be transfer aligned")
+        }
+      }
       when(issueQueue.io.deq.fire) {
         val allocatedSource = nextSource(sourceIdxWidth - 1, 0)
         assert(hasFreeSource, "TrafficGenMem allocated a request with no free source slots")
         senderValid := true.B
         senderAccess := issueQueue.io.deq.bits
+        senderAddress := candidateTransferAddr
         senderSource := allocatedSource
         inflightValid(allocatedSource) := true.B
         inflightAccesses(allocatedSource) := issueQueue.io.deq.bits
+        inflightTransferAddrs(allocatedSource) := candidateTransferAddr
+        sentRequests(allocatedSource) := false.B
       }
 
       val (putLegal, putBits) = edge.Put(senderSource, addr, size, 0.U((beatBytes * 8).W))
@@ -1327,7 +1353,7 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
 
       mem.a.valid := senderValid
       mem.a.bits := Mux(activeAccess.mIsWrite, putBits, getBits)
-      val (_, aLast, aDone, aBeat) = edge.count(mem.a)
+      val (aFirst, aLast, _, aBeat) = edge.count(mem.a)
 
       val beatIndex = Wire(UInt(64.W))
       beatIndex := aBeat
@@ -1351,15 +1377,24 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
       val dSourceInRange = mem.d.bits.source < params.memOutstanding.U
       val dSource = mem.d.bits.source(sourceIdxWidth - 1, 0)
       val dSourceValid = dSourceInRange && inflightValid(dSource)
+      // TileLink may respond after the first A beat of a multibeat legacy Put.
+      val dRequestSent = sentRequests(dSource) ||
+        (mem.a.fire && aFirst && senderSource === dSource)
+      val dExpectedOpcode = Mux(inflightAccesses(dSource).mIsWrite,
+        TLMessages.AccessAck, TLMessages.AccessAckData)
+      val dResponseValid = mem.d.bits.opcode === dExpectedOpcode &&
+        mem.d.bits.size === size && !mem.d.bits.denied && !mem.d.bits.corrupt
 
       mem.b.ready := false.B
       mem.c.valid := false.B
       mem.c.bits := DontCare
-      mem.d.ready := dSourceValid && (!dLast || completionQueue.io.enq.ready)
+      mem.d.ready := dSourceValid && dRequestSent && dResponseValid &&
+        (!dLast || completionQueue.io.enq.ready)
       mem.e.valid := false.B
       mem.e.bits := DontCare
 
-      completionQueue.io.enq.valid := mem.d.valid && dSourceValid && dLast
+      completionQueue.io.enq.valid := mem.d.valid && dSourceValid &&
+        dRequestSent && dResponseValid && dLast
       completionQueue.io.enq.bits := inflightAccesses(dSource)
       io.completion <> completionQueue.io.deq
       io.active := senderValid ||
@@ -1370,6 +1405,7 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
 
       when(mem.a.fire) {
         assert(Mux(activeAccess.mIsWrite, putLegal, getLegal), "TrafficGenMem issued illegal TL access")
+        when(aFirst) { sentRequests(senderSource) := true.B }
       }
 
       when(mem.a.fire && aLast) {
@@ -1378,9 +1414,34 @@ class TrafficGenMem(id: Int, beatBytes: Int, params: TrafficGenParams)(implicit 
 
       when(mem.d.valid) {
         assert(dSourceValid, "TrafficGenMem received a D response for an invalid source slot")
+        assert(dRequestSent, "TrafficGenMem received a D response before sending its request")
+        assert(mem.d.bits.opcode === dExpectedOpcode, "TrafficGenMem received an unexpected D response opcode")
+        assert(mem.d.bits.size === size, "TrafficGenMem received an unexpected D response size")
+        assert(!mem.d.bits.denied, "TrafficGenMem received a denied D response")
+        assert(!mem.d.bits.corrupt, "TrafficGenMem received a corrupt D response")
       }
       when(mem.d.fire && dLast) {
+        assert(completionQueue.io.enq.fire, "TrafficGenMem lost a completed access")
         inflightValid(dSource) := false.B
+        sentRequests(dSource) := false.B
+      }
+
+      // Preserve the new backend's protocol/ownership observations for metasim profiling.
+      if (serializeSameTransfer) {
+        val observedCValid = WireDefault(mem.c.valid)
+        val observedEValid = WireDefault(mem.e.valid)
+        dontTouch(observedCValid)
+        dontTouch(observedEValid)
+        dontTouch(candidateTransferAddr)
+        dontTouch(candidateTransferOwned)
+        dontTouch(inflightTransferAddrs)
+        dontTouch(inflightValid)
+        dontTouch(inflightAccesses)
+        dontTouch(sentRequests)
+        dontTouch(senderValid)
+        dontTouch(senderSource)
+        dontTouch(hasFreeSource)
+        dontTouch(dLast)
       }
     }
   }
@@ -1762,6 +1823,10 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       val trafficGenMem = params.memBackend match {
         case TrafficGenUncachedMemBackend => LazyModule(new TrafficGenMem(i, sbus.beatBytes, params)(p))
         case TrafficGenL2MemBackend => LazyModule(new TrafficGenMemL2(i, sbus.beatBytes, params)(p))
+        case TrafficGenL2PutGetMemBackend =>
+          require(sbus.beatBytes == 32, "TrafficGen L2 Put/Get backend requires a 32-byte system bus beat")
+          LazyModule(new TrafficGenMem(i, sbus.beatBytes, params,
+            transferBytes = 32, serializeSameTransfer = true, requireAligned = true)(p))
       }
       trafficGenMem.clockNode := sbus.fixedClockNode
       sbus.coupleFrom(s"trafficgen-mem-$i") { _ := trafficGenMem.node }
@@ -1829,6 +1894,10 @@ class WithTrafficGen(numGenerators: Int = 1) extends Config((site, here, up) => 
 
 class WithTrafficGenMemL2 extends Config((site, here, up) => {
   case TrafficGenKey => up(TrafficGenKey, site).map(_.copy(memBackend = TrafficGenL2MemBackend))
+})
+
+class WithTrafficGenMemL2PutGet extends Config((site, here, up) => {
+  case TrafficGenKey => up(TrafficGenKey, site).map(_.copy(memBackend = TrafficGenL2PutGetMemBackend))
 })
 
 class WithRTLTrafficGen(

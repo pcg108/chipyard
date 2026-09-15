@@ -247,6 +247,11 @@ class FireSimRocketWithRTLTrafficGenL2NoTracerVBoundaryOnlyConfig
     // Source slots share one coherent client; serialize ownership of each line.
     serializeSameLine = true)
 
+// Full-sector synthetic Get/Put traffic through the same inclusive L2 as the coherent baseline.
+class FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig extends Config(
+  new chipyard.example.WithTrafficGenMemL2PutGet ++
+  new FireSimRocketWithRTLTrafficGenL2NoTracerVBoundaryOnlyConfig)
+
 class FireSimRocketWithRTLTrafficGenL2NoTracerVDeterministicConfig
   extends FireSimRocketWithRTLTrafficGenL2NoTracerVParameterizedConfig(
     numGenerators = 16,
