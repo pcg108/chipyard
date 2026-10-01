@@ -152,6 +152,7 @@ class TrafficGenPutGetL2Spec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.req.bits.mWarpBlocked.poke(false.B)
       dut.io.req.bits.bundleIssueCount.poke(1.U)
       dut.io.req.bits.bundleGeneration.poke(1.U)
+      dut.io.req.bits.launchId.poke(23.U)
       dut.clock.step(16) // Allow the real directory to finish its reset wipe.
 
       val generatorA = ArrayBuffer.empty[AEvent]
@@ -189,6 +190,7 @@ class TrafficGenPutGetL2Spec extends AnyFlatSpec with ChiselScalatestTester {
           completions += access.id.peek().litValue
           access.mBundleId.expect(17.U)
           access.bundleGeneration.expect(3.U)
+          access.launchId.expect(23.U)
         }
         dut.clock.step()
       }
@@ -202,6 +204,7 @@ class TrafficGenPutGetL2Spec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.req.bits.address.poke(address.U)
         dut.io.req.bits.mBundleId.poke(17.U)
         dut.io.req.bits.bundleGeneration.poke(3.U)
+        dut.io.req.bits.launchId.poke(23.U)
         dut.io.req.bits.mIsWrite.poke(write.B)
         dut.io.req.valid.poke(true.B)
         var waited = 0

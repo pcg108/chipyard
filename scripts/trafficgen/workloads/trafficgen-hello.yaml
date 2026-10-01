@@ -1,0 +1,12 @@
+{
+  "name" : "trafficgen-hello",
+  "base" : "bare-base.json",
+  "host-init" : "build.sh",
+  "bin" : "hello",
+  "firesim" : {
+    "simulation_outputs" : [
+      "uartlog",
+      "metasim_stderr.out"
+    ]
+  }
+}

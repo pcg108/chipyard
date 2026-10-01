@@ -40,9 +40,17 @@ object TrafficGenBridge {
     ep.io.trafficgen.targetBusy := trafficGenIO.targetBusy
     ep.io.trafficgen.hasPendingWork := trafficGenIO.hasPendingWork
     ep.io.trafficgen.startTrafficGen := trafficGenIO.startTrafficGen
+    ep.io.trafficgen.launchRegistryIds := trafficGenIO.launchRegistryIds
+    ep.io.trafficgen.launchIds := trafficGenIO.launchIds
+    ep.io.trafficgen.launchPendingMask := trafficGenIO.launchPendingMask
+    ep.io.trafficgen.closeSubmissions := trafficGenIO.closeSubmissions
+    trafficGenIO.launchStatusIds := ep.io.trafficgen.launchStatusIds
+    trafficGenIO.launchStatuses := ep.io.trafficgen.launchStatuses
+    trafficGenIO.sessionStatus := ep.io.trafficgen.sessionStatus
     ep.io.trafficgen.roundStarted := trafficGenIO.roundStarted
     ep.io.trafficgen.roundComplete := trafficGenIO.roundComplete
     ep.io.trafficgen.roundExitReason := trafficGenIO.roundExitReason
+    ep.io.trafficgen.bundleTableFullLaneMask := trafficGenIO.bundleTableFullLaneMask
     ep.io.trafficgen.currentCycleAfterIssue := trafficGenIO.currentCycleAfterIssue
     ep.io.trafficgen.dpiState := trafficGenIO.dpiState
     ep.io.trafficgen.issuedAccessBatch <> trafficGenIO.issuedAccessBatch

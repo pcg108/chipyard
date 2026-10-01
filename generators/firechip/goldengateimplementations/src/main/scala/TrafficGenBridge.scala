@@ -65,20 +65,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val hPort = IO(HostPort(new TrafficGenBridgeTargetIO(key.numLanes, key.useRTL)))
     val target = hPort.hBits.trafficgen
 
-    /*
-     * Bridge-driver control and target clock gating.
-
-      1. target asserts target.startTrafficGen for 1 cycle
-          1.1 startTrafficGenLatched set to true (usage: read by bridge driver)
-          1.2 boundaryPaused set to true (controls fire gating)
-      2. boundaryPaused:
-          2.1 Read in bridge driver as mmio_addrs.target_paused to transition out of IDLE
-          2.2 Gates fire (!boundaryPaused)
-      3. resumeTarget from mmio_addrs.resume_target sets startTrafficGenLatched and boundaryPaused false
-     
-     */
+    // Active launch submissions stop at the engine's normal round-completion
+    // fence. Only an idle engine may pause directly on a new control request.
     val resumeTarget = RegInit(false.B)
     val boundaryPaused = RegInit(false.B)
+    val startRoundPending = RegInit(false.B)
     val accessReadTargetPaused = RegInit(false.B)
     val trafficGenDone = RegInit(false.B)
     val trafficGenDonePulse = Wire(Bool())
@@ -89,15 +80,67 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       !boundaryPaused &&
       !accessReadTargetPaused
 
-    // Latch the target's start doorbell and synchronously stop the target on the
-    // token that contains it. The driver explicitly resumes after it has
-    // prepared the first round, so host timing cannot change the boundary.
+    private val launchSlots = 4
+    val launchRegistryIds = RegInit(VecInit(Seq.fill(launchSlots)(0.U(64.W))))
+    val launchIds = RegInit(VecInit(Seq.fill(launchSlots)(0.U(64.W))))
+    val launchPendingMask = RegInit(0.U(launchSlots.W))
+    val closeSubmissions = RegInit(false.B)
+
+    // stages the update registers so that all launch and session status updates are applied atomically
+    val stagedLaunchStatusIdLow = RegInit(VecInit(Seq.fill(launchSlots)(0.U(32.W))))
+    val stagedLaunchStatusIdHigh = RegInit(VecInit(Seq.fill(launchSlots)(0.U(32.W))))
+    val stagedLaunchStatuses = RegInit(VecInit(Seq.fill(launchSlots)(0.U(8.W))))
+    val stagedSessionStatus = RegInit(0.U(32.W))
+    val launchStatusIds = RegInit(VecInit(Seq.fill(launchSlots)(0.U(64.W))))
+    val launchStatuses = RegInit(VecInit(Seq.fill(launchSlots)(0.U(8.W))))
+    val sessionStatus = RegInit(0.U(32.W))
+    val commitLaunchStatus = WireDefault(false.B)
+
+    target.launchStatusIds := launchStatusIds.asUInt
+    target.launchStatuses := launchStatuses.asUInt
+    target.sessionStatus := sessionStatus
+    when(commitLaunchStatus) {
+      assert(boundaryPaused, "TrafficGenBridge published launch status while target was running")
+      for (slot <- 0 until launchSlots) {
+        launchStatusIds(slot) := Cat(stagedLaunchStatusIdHigh(slot), stagedLaunchStatusIdLow(slot))
+      }
+      launchStatuses := stagedLaunchStatuses
+      sessionStatus := stagedSessionStatus
+    }
+
+    // The first token after resume may still contain the old pending mask.
+    // Compare the IDs with the committed host acknowledgement as well, so that
+    // token cannot stop the target a second time for the same submission.
+    val unacknowledgedLaunches = VecInit((0 until launchSlots).map { slot =>
+      val id = target.launchIds(64 * slot + 63, 64 * slot)
+      target.launchPendingMask(slot) && id =/= 0.U && id =/= launchStatusIds(slot)
+    }).asUInt
+    val unacknowledgedClose = target.closeSubmissions && !sessionStatus(1)
+    val sessionTerminal = sessionStatus(5, 3).orR
+    // An idle-looking token may be the first response after the host has
+    // started a round. A launch first visible on that token must reach the
+    // engine's control-exit fence, otherwise pausing here strands its start
+    // handshake while the driver is already waiting for round completion.
+    val idleControlBoundary = fire && !target.targetBusy && !startRoundPending && !sessionTerminal &&
+      (unacknowledgedLaunches.orR || unacknowledgedClose)
+    val legacyStartBoundary = fire && target.startTrafficGen
+
+    when(fire) {
+      for (slot <- 0 until launchSlots) {
+        launchRegistryIds(slot) := target.launchRegistryIds(64 * slot + 63, 64 * slot)
+        launchIds(slot) := target.launchIds(64 * slot + 63, 64 * slot)
+      }
+      launchPendingMask := unacknowledgedLaunches
+      closeSubmissions := target.closeSubmissions
+    }
+
+    // Retain the existing driver doorbell name for idle control boundaries.
     val startTrafficGenLatched = RegInit(false.B)
     when(resumeTarget) {
       startTrafficGenLatched := false.B
       boundaryPaused := false.B
     }
-    when(fire && target.startTrafficGen) {
+    when(idleControlBoundary || legacyStartBoundary) {
       startTrafficGenLatched := true.B
       trafficGenDone := false.B
       boundaryPaused := true.B
@@ -831,7 +874,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // Hold the round start request high until the target DPI acknowledges it.
     val startRoundPulse = Wire(Bool())
-    val startRoundPending = RegInit(false.B)
     val currentRound = RegInit(0.U(64.W))
     dontTouch(currentRound)
     val startRoundPulsePrev = RegNext(startRoundPulse, false.B)
@@ -850,32 +892,57 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // and all lane-bank writes from that batch have committed.
     val roundCompleteLatched = RegInit(false.B)
     val roundCompletePending = RegInit(false.B)
-    val roundStopCycle = RegInit(0.U(64.W))
-    val roundStopCycleValid = RegInit(false.B)
+    // A cycle snapshot belongs to a boundary, not to the last memory round:
+    // an open session may resume target software and become idle for any time.
+    val boundaryCycle = RegInit(0.U(64.W))
+    val boundaryCycleValid = RegInit(false.B)
+    val roundExitReason = RegInit(TrafficGenRoundExitReason.scheduling)
+    // indicates that we exited because one of the lanes had a full bundle table, and we need to do bundle table recovery
+    val bundleTableFullLaneMask = RegInit(0.U(replayLanes.W))
+    when(resumeTarget) {
+      boundaryCycleValid := false.B
+    }
     when(fire && target.roundStarted) {
       roundCompleteLatched := false.B
       roundCompletePending := false.B
-      roundStopCycleValid := false.B
+      boundaryCycleValid := false.B
+      roundExitReason := TrafficGenRoundExitReason.scheduling
+      bundleTableFullLaneMask := 0.U
     }.elsewhen(roundCompletePending && !issuedWriteCommitPending) {
       roundCompleteLatched := true.B
       roundCompletePending := false.B
     }.elsewhen(fire && target.roundComplete) {
       roundCompletePending := true.B
-      roundStopCycle := target.currentCycleAfterIssue
-      roundStopCycleValid := true.B
+      boundaryCycle := target.currentCycleAfterIssue
+      boundaryCycleValid := true.B
+      roundExitReason := target.roundExitReason
+      bundleTableFullLaneMask := (if (key.useRTL) {
+        Mux(target.roundExitReason === TrafficGenRoundExitReason.bundleTableFull,
+          target.bundleTableFullLaneMask, 0.U)
+      } else { 0.U })
       boundaryPaused := true.B
+    }.elsewhen(idleControlBoundary || legacyStartBoundary) {
+      boundaryCycle := target.currentCycleAfterIssue
+      boundaryCycleValid := true.B
+      roundExitReason := TrafficGenRoundExitReason.control
+      bundleTableFullLaneMask := 0.U
     }
 
     val boundaryPausedPrev = RegNext(boundaryPaused, false.B)
-    val roundStopCycleValidPrev = RegNext(roundStopCycleValid, false.B)
-    val roundStopCyclePrev = RegNext(roundStopCycle, 0.U)
+    val boundaryCycleValidPrev = RegNext(boundaryCycleValid, false.B)
+    val boundaryCyclePrev = RegNext(boundaryCycle, 0.U)
+    val roundExitReasonPrev = RegNext(roundExitReason, TrafficGenRoundExitReason.scheduling)
+    val bundleTableFullLaneMaskPrev = RegNext(bundleTableFullLaneMask, 0.U)
     when(boundaryPaused) {
       assert(!fire, "TrafficGenBridge target token fired while boundary-paused")
     }
     when(boundaryPaused && boundaryPausedPrev &&
-         roundStopCycleValid && roundStopCycleValidPrev && !resumeTarget) {
-      assert(roundStopCycle === roundStopCyclePrev,
-        "TrafficGenBridge round stop cycle changed while boundary-paused")
+         boundaryCycleValid && boundaryCycleValidPrev && !resumeTarget) {
+      assert(boundaryCycle === boundaryCyclePrev,
+        "TrafficGenBridge cycle snapshot changed while boundary-paused")
+      assert(roundExitReason === roundExitReasonPrev &&
+        bundleTableFullLaneMask === bundleTableFullLaneMaskPrev,
+        "TrafficGenBridge recovery metadata changed while boundary-paused")
     }
 
 
@@ -914,11 +981,24 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       startTrafficGenLatched := false.B
       roundCompleteLatched := false.B
       roundCompletePending := false.B
-      roundStopCycle := 0.U
-      roundStopCycleValid := false.B
+      boundaryCycle := 0.U
+      boundaryCycleValid := false.B
+      roundExitReason := TrafficGenRoundExitReason.scheduling
+      bundleTableFullLaneMask := 0.U
       boundaryPaused := false.B
       trafficGenDone := false.B
       currentRound := 0.U
+      launchRegistryIds.foreach(_ := 0.U)
+      launchIds.foreach(_ := 0.U)
+      launchPendingMask := 0.U
+      closeSubmissions := false.B
+      stagedLaunchStatusIdLow.foreach(_ := 0.U)
+      stagedLaunchStatusIdHigh.foreach(_ := 0.U)
+      stagedLaunchStatuses.foreach(_ := 0.U)
+      stagedSessionStatus := 0.U
+      launchStatusIds.foreach(_ := 0.U)
+      launchStatuses.foreach(_ := 0.U)
+      sessionStatus := 0.U
     }
 
     when(trafficGenDonePulse) {
@@ -927,7 +1007,6 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReplayActive := false.B
       accessReadPrefillPending := false.B
       uploadReady := false.B
-      roundStopCycleValid := false.B
       for (flat <- 0 until replaySlots) {
         accessReadCursors(flat) := (flat % replaySlotsPerLane).U
       }
@@ -986,10 +1065,10 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genWORegInit(minIssueCycleHigh, "min_issue_cycle_high", 0.U)
 
     val reportedCycleAfterIssue = Mux(
-      roundStopCycleValid, roundStopCycle, target.currentCycleAfterIssue)
+      boundaryCycleValid, boundaryCycle, target.currentCycleAfterIssue)
     genROReg(reportedCycleAfterIssue(31, 0), "current_cycle_after_issue_low")
     genROReg(reportedCycleAfterIssue(63, 32), "current_cycle_after_issue_high")
-    genROReg(target.roundExitReason, "round_exit_reason")
+    genROReg(roundExitReason, "round_exit_reason")
     genROReg(target.dpiState, "dpi_state")
     genROReg(issuedAccessWritebackCount, "issued_access_writeback_count")
     val issuedLaneCountIndex = Wire(UInt(replayLaneIdxWidth.W))
@@ -1002,6 +1081,42 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
 
     genROReg(completedBundleCount, "completed_bundle_count")
+    // Append the new register so existing MMIO offsets retain their positions.
+    require(replayLanes <= 32, "TrafficGen recovery lane mask must fit one MMIO word")
+    genROReg(bundleTableFullLaneMask, "bundle_table_full_lane_mask")
+
+    // Append protocol-v2 registers so the existing replay MMIO offsets remain
+    // stable. Slot zero occupies the least significant slice of target IO.
+    val launchSlotIndex = Wire(UInt(log2Ceil(launchSlots).W))
+    genWORegInit(launchSlotIndex, "launch_slot_index", 0.U)
+    genROReg(launchRegistryIds(launchSlotIndex)(31, 0), "launch_registry_id_low")
+    genROReg(launchRegistryIds(launchSlotIndex)(63, 32), "launch_registry_id_high")
+    genROReg(launchIds(launchSlotIndex)(31, 0), "launch_id_low")
+    genROReg(launchIds(launchSlotIndex)(63, 32), "launch_id_high")
+    genROReg(launchPendingMask, "launch_pending_mask")
+    genROReg(closeSubmissions, "close_submissions")
+
+    // Use write handshakes rather than level-sensitive register mirrors: an
+    // index change alone must never write the preceding slot's staged value.
+    def launchStatusWrite(name: String)(update: UInt => Unit): Unit = {
+      val write = Wire(Decoupled(UInt(32.W)))
+      write.ready := true.B
+      attachDecoupledSink(write, name)
+      when(write.fire && !targetReset) { update(write.bits) }
+    }
+    launchStatusWrite("slot_status_id_low") { value =>
+      stagedLaunchStatusIdLow(launchSlotIndex) := value
+    }
+    launchStatusWrite("slot_status_id_high") { value =>
+      stagedLaunchStatusIdHigh(launchSlotIndex) := value
+    }
+    launchStatusWrite("slot_status") { value =>
+      stagedLaunchStatuses(launchSlotIndex) := value(7, 0)
+    }
+    launchStatusWrite("session_status") { value =>
+      stagedSessionStatus := value
+    }
+    Pulsify(genWORegInit(commitLaunchStatus, "commit_launch_status", false.B), pulseLength = 1)
 
 
 

@@ -9,7 +9,7 @@ import freechips.rocketchip.prci._
 import freechips.rocketchip.subsystem._
 import org.chipsalliance.cde.config.{Config, Field, Parameters}
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.regmapper.RegField
+import freechips.rocketchip.regmapper.{RegField, RegWriteFn}
 import freechips.rocketchip.tilelink._
 
 import chipyard.iobinders.TrafficGenPortPeripheralIO
@@ -95,14 +95,34 @@ class TrafficGenTopIO(
 
   // MMIO from target program to initiate traffic generation
   val startTrafficGen = Output(Bool())
+
+  // identifies which registered workloads each slot should run
+  val launchRegistryIds = Output(UInt(256.W))
+  // each individual launch ID for the corresponding slot
+  // registry ID = which workload, launch ID = which execution of workload
+  val launchIds = Output(UInt(256.W))
+  // launch IDs not yet acknowledged by the host
+  val launchPendingMask = Output(UInt(4.W))
+  // software has closed submissions for new launches (existing work can complete)
+  val closeSubmissions = Output(Bool())
+  // launch corresponding to each returned status
+  val launchStatusIds = Input(UInt(256.W))
+  // packed 4 8-bit slot statuses that software can poll (acceptance, completion, etc.)
+  val launchStatuses = Input(UInt(32.W))
+  // session-wide state (idle, complete, error)
+  val sessionStatus = Input(UInt(32.W))
+
+  // Internal TL-to-engine scheduling-boundary request.
+  val controlPending = Input(Bool())
   // TG currently issuing schedule
   val targetBusy = Output(Bool())
   // TG accepted the current round start request
   val roundStarted = Output(Bool())
   // TG reaches min_issue_cycle, unblocks a blocked warp, issues all accesses
   val roundComplete = Output(Bool())
-  // why the last round completed: scheduling exit or access-store capacity exit
+  // Why the last round completed; the lane mask is nonzero only for bundle-table recovery.
   val roundExitReason = Output(UInt(2.W))
+  val bundleTableFullLaneMask = Output(UInt(nGenerators.W))
   // TG still has a scheduling round active or memory requests in flight
   val hasPendingWork = Output(Bool())
   // Debug: current TrafficGen DPI state machine state.
@@ -306,6 +326,10 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   val dpi = Module(new TrafficGenDPIBlackBox(params.numGenerators))
 
   io.startTrafficGen := false.B
+  io.launchRegistryIds := 0.U
+  io.launchIds := 0.U
+  io.launchPendingMask := 0.U
+  io.closeSubmissions := false.B
 
   dpi.io.clock := clock
   dpi.io.reset := reset.asBool
@@ -372,6 +396,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   // uniformly batch based for both backends.
   val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter(params.numGenerators))
   val dpiIssuedAccess = Wire(new IssuedAccess)
+  dpiIssuedAccess.launchId := 0.U // Legacy DPI does not support protocol-v2 launches.
   dpiIssuedAccess.requestUid := dpi.io.issued_access_writeback_id
   dpiIssuedAccess.address := dpi.io.issued_access_writeback_address
   dpiIssuedAccess.cycleIssued := dpi.io.issued_access_writeback_cycle_count
@@ -385,6 +410,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   io.currentCycleAfterIssue := currentCycleAfterIssue
   io.roundStarted := roundStarted
   io.roundExitReason := dpi.io.round_exit_reason
+  io.bundleTableFullLaneMask := 0.U
 
   io.accessReadCycle := dpi.io.access_read_cycle
   io.accessReadEn := dpi.io.access_read_en
@@ -455,7 +481,10 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   }
 }
 
-class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTrafficGenTopIO {
+class TrafficGenRTLEngine(
+  params: TrafficGenParams,
+  completionReportLimit: Int = CompletedBundleIds.capacity,
+) extends Module with HasTrafficGenTopIO {
   
   /*
     The RTL engine issues access from the bridge module into the target memory system.
@@ -467,6 +496,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   */
 
   require(params.numGenerators >= 1, "TrafficGenRTLEngine requires at least one generator")
+  require(completionReportLimit >= params.numGenerators && completionReportLimit <= CompletedBundleIds.capacity,
+    "TrafficGen completion report limit must reserve one event per lane and fit the bridge store")
 
   val io = IO(new TrafficGenTopIO(
     params.width, params.numGenerators, params.memOutstanding, useRTL = true))
@@ -480,7 +511,10 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val targetCycle = RegInit(0.U(64.W))
   val targetTimeStarted = RegInit(false.B)
   val roundCapacityBounded = RegInit(false.B)
+  val roundHadAccesses = RegInit(false.B)
   val wakeExitPending = RegInit(false.B)
+  val bundleTableRecoveryPending = RegInit(false.B)
+  val bundleTableFullLaneMaskReg = RegInit(0.U(params.numGenerators.W))
   val roundExitReasonReg = RegInit(TrafficGenRoundExitReason.scheduling)
   val lastHasPendingWork = RegInit(false.B)
 
@@ -497,8 +531,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
   // Bundle Table
   // Note: all accesses in a bundle are guaranteed by bridge driver to be in a single lane
-  // Each lane therefore needs only its own 2*M inflight entries plus one newly visible head, 
-  // rather than comparing every lane against one global table.
+  // Partially issued bundles retain an entry even after all issued members return.
+  // A full table of these bundles needs host-assisted replay reordering to make progress.
   // And all the bundle-related structures are indexed first per lane
   val localBundleTableEntries = params.memOutstanding * 2 + 1
   val bundleCountWidth = log2Ceil(localBundleTableEntries + 1)
@@ -515,10 +549,9 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val bundleWarpBlocked = RegInit(VecInit(Seq.fill(params.numGenerators)(
     VecInit(Seq.fill(localBundleTableEntries)(false.B)))))
 
-  // Bundle IDs intentionally alias across GPU schedulers. The driver stamps
-  // each access with the GPU scheduling round that introduced it and retains
-  // that stamp while the access remains pending. This is independent of host
-  // round trips and BRAM-capacity refills.
+  // Public IDs name session-wide unique replay groups. A group may contain
+  // aliased bundles from several schedulers within one launch. Preserve its
+  // member count and introducing round across host round trips and refills.
   val bundleIssueRound = RegInit(VecInit(Seq.fill(params.numGenerators)(
     VecInit(Seq.fill(localBundleTableEntries)(0.U(32.W))))))
   val bundleEntryIdxWidth = log2Ceil(localBundleTableEntries max 2)
@@ -533,11 +566,24 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val completedBundleArb = Module(new RRArbiter(UInt(64.W), params.numGenerators))
   val completedBundleCount = RegInit(0.U(CompletedBundleIds.countWidth.W))
 
+  // A round can finish bundles retained from an earlier upload as well as all
+  // new requests. Reserve space for simultaneous lane completions, including
+  // IDs still queued for the bridge's single write port.
+  val bufferedCompletionCount = completedBundleCount +&
+    completedBundleQueues.map(_.io.count).reduce(_ +& _)
+  val completionBudgetAvailable =
+    bufferedCompletionCount <= (completionReportLimit - params.numGenerators).U
+
   io.startTrafficGen := false.B
+  io.launchRegistryIds := 0.U
+  io.launchIds := 0.U
+  io.launchPendingMask := 0.U
+  io.closeSubmissions := false.B
   io.targetBusy := state =/= sIdle
   io.roundStarted := false.B
   io.roundComplete := false.B
   io.roundExitReason := roundExitReasonReg
+  io.bundleTableFullLaneMask := bundleTableFullLaneMaskReg
   io.dpiState := state
 
   for (i <- 0 until params.numGenerators) {
@@ -563,7 +609,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   completedBundleArb.io.out.ready := true.B
 
   when(completedBundleArb.io.out.fire) {
-    assert(completedBundleCount =/= CompletedBundleIds.capacity.U,
+    assert(completedBundleCount < completionReportLimit.U,
       "TrafficGenRTLEngine completed bundle ID capacity exceeded")
     io.completedBundleIdWriteIdx := completedBundleCount(CompletedBundleIds.idxWidth - 1, 0)
     completedBundleCount := completedBundleCount + 1.U
@@ -573,12 +619,14 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.currentCycleAfterIssue := targetCycle
 
   // signals to indicate work is still occurring in current round or in memory subsystem
+  val bundleTableHasEntries = bundleValid.flatten.reduce(_ || _)
   val bundleTableHasInflight = VecInit(bundleOutstanding.flatMap(_.map(_ =/= 0.U))).asUInt.orR
   val outputQueuesHaveWork = issuedBatchQueue.io.deq.valid || completedBundleArb.io.out.valid
   val roundHasFutureIssueWork = io.accessStoreHasEntries && !io.accessReadLaneDoneMask.andR
   val livePendingWork =
     state =/= sIdle ||
     io.memActive ||
+    bundleTableHasEntries ||
     outputQueuesHaveWork ||
     roundHasFutureIssueWork ||
     io.accessStoreHasMore
@@ -599,7 +647,8 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val completedQueuesCanAccept = completedBundleQueues.map(_.io.enq.ready).reduce(_ && _)
   val completionAnyValid = VecInit((0 until params.numGenerators).map(i => io.completion(i).valid)).asUInt.orR
   val drainCompletionsThisCycle = WireDefault(false.B)
-  val completionCanFire = drainCompletionsThisCycle && completionAnyValid && completedQueuesCanAccept
+  val completionCanFire = drainCompletionsThisCycle && completionAnyValid &&
+    completedQueuesCanAccept && completionBudgetAvailable
   val completionFires = Wire(Vec(params.numGenerators, Bool()))
   for (i <- 0 until params.numGenerators) {
     io.completion(i).ready := completionCanFire
@@ -774,10 +823,13 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val rtlAccessReadData = VecInit(io.accessReadData.map(RTLL2Access.unpack))
   // is each lane's selected request eligible to issue
   val currentIssueValid = Wire(Vec(params.numGenerators, Bool()))
+  val currentHeadStable = Wire(Vec(params.numGenerators, Bool()))
 
   // check that we are within the issue cycle window
   val roundReachedMin = targetCycle >= io.minIssueCycle
-  val issueWindowOpen = !roundReachedMin
+  val sessionTerminal = io.sessionStatus(5, 3).orR || io.trafficGenDone
+  val issueWindowOpen = !roundReachedMin && !io.controlPending && !sessionTerminal &&
+    completionBudgetAvailable
 
   //// track which slot consumes the bridge has acknowledged:
   // unpack bridge acknowledgements (each slot has 2-bit generation counter, advanced when it dequeues slot FIFO)
@@ -814,13 +866,16 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     // Record when this access is actually issued by the target.
     issuedAccess.cycleCount := targetCycle
     currentIssueAccess(lane) := issuedAccess
-    currentIssueValid(lane) := io.accessReadDataValid(selectedSlot) &&
-      (!accessReadConsumePendingMask(selectedSlot) || accessReadAckNowMask(selectedSlot)) &&
+    currentHeadStable(lane) := io.accessReadDataValid(selectedSlot) &&
+      (!accessReadConsumePendingMask(selectedSlot) || accessReadAckNowMask(selectedSlot))
+    currentIssueValid(lane) := currentHeadStable(lane) &&
       rtlAccessReadData(selectedSlot).cycleCount <= targetCycle
   }
 
   // Each lane selects a bundle-table entry matching the selected access's bundle ID
   val issueHasTableEntry = Wire(Vec(params.numGenerators, Bool()))
+  // identifies lanes that are stuck becase bundle table is full and waiting for memory responses alone can't free entry
+  val bundleTableBlockedLanes = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
     val access = currentIssueAccess(lane)
     val matchVec = (0 until localBundleTableEntries).map { e =>
@@ -837,12 +892,29 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
 
     issueAssignedEntry(lane) := OHToUInt(selectedOH)
     issueHasTableEntry(lane) := matchAny || freeAny
+    // A fully issued entry may retire on its next completion, so it must not
+    // trigger recovery. All entries here require later replay members.
+    val allEntriesNeedMembers = VecInit((0 until localBundleTableEntries).map { e =>
+      bundleValid(lane)(e) && bundleRemainingToIssue(lane)(e) =/= 0.U
+    }).asUInt.andR
+    bundleTableBlockedLanes(lane) := currentHeadStable(lane) &&
+      !issueHasTableEntry(lane) && allEntriesNeedMembers
+  }
+  // this is in the case that all entries in the lane's bundle table are currently occupied, and the lane head access is a different bundle
+  // additionally, in-flight accesses would not unblock the lane. Then we need to go into bundle table recovery mode,
+  // wherein we exit and the bridge driver reorders accesses to free up a bundle table entry for the lane.
+  val bundleTableRecoveryTrigger = state === sIssueBatch && issueWindowOpen &&
+    !wakeExitPending && (bundleTableBlockedLanes.asUInt & currentIssueValid.asUInt).orR
+  when(bundleTableRecoveryTrigger) {
+    bundleTableRecoveryPending := true.B
   }
   // check whether any lane has a valid access to issue and if we can 
   val chunkHasValid = currentIssueValid.asUInt.orR
   val issueResourcesAvailable =
     state === sIssueBatch &&
     issueWindowOpen &&
+    !bundleTableRecoveryPending &&
+    !bundleTableRecoveryTrigger &&
     chunkHasValid &&
     !io.accessReadPrefetchPauseReq &&
     issuedBatchQueue.io.enq.ready
@@ -860,7 +932,13 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val issuedBatchMask = issueFires.asUInt
   val issueCanFire = issueFires.asUInt.orR
 
-  drainCompletionsThisCycle := state === sDrainCompletions || state === sIssueBatch
+  // Preserve the original cooperative wake boundary: finish the finite stream
+  // of ready issues and responses before returning dependency feedback. A wake
+  // does not turn every following response into a separate scheduler round.
+  // Control requests and report capacity remain hard boundaries, so a new
+  // launch does not wait behind a busy memory stream and reports cannot overrun.
+  drainCompletionsThisCycle :=
+    (state === sDrainCompletions || state === sIssueBatch) && !io.controlPending && !sessionTerminal
   
   // enqueue the issued-access batch to the issued-batch queue for the bridge module
   issuedBatchQueue.io.enq.valid := issueCanFire
@@ -868,6 +946,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   issuedBatchQueue.io.enq.bits.validMask := issuedBatchMask
   val issuedBatchPackedAccesses = VecInit((0 until params.numGenerators).map { lane =>
     val issued = Wire(new IssuedAccess)
+    issued.launchId := currentIssueAccess(lane).launchId
     issued.requestUid := currentIssueAccess(lane).id
     issued.cycleIssued := currentIssueAccess(lane).cycleCount
     issued.address := currentIssueAccess(lane).address
@@ -957,12 +1036,19 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   val pendingAfterExit =
     !allAccessLanesDone ||
     roundMemoryHasWork ||
+    bundleTableHasEntries ||
     io.accessStoreHasMore
+  val completionCapacityExitReady = !completionBudgetAvailable && !accessReadPendingAfterAck.orR
+  val controlExitReady = io.controlPending && !accessReadPendingAfterAck.orR
+  val noFiniteProgressTarget = io.minIssueCycle.andR
   val minExitReady =
     roundReachedMin &&
     !accessReadPendingAfterAck.orR
+  val bundleTableRecoveryExitReady =
+    (bundleTableRecoveryPending || bundleTableRecoveryTrigger) &&
+    !roundMemoryHasWork && !completionAnyValid && !accessReadPendingAfterAck.orR
   val acceptingRound =
-    state === sIdle && io.startRound && io.uploadReady
+    state === sIdle && io.startRound && io.uploadReady && !sessionTerminal
   val startingWorkload =
     acceptingRound && !targetTimeStarted
 
@@ -982,13 +1068,13 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   io.accessReadEn := state === sIssueBatch && issueWindowOpen
   io.accessReadBatchReady := state === sIssueBatch && issueWindowOpen
 
-  // The workload's target-time epoch begins on the first accepted round. Until
+  // The session's target-time epoch begins on the first accepted round. Until
   // then the socket scheduler's initialization cycle and the RTL both remain
   // at zero even while the rest of the target boots. Once armed, target time is
   // free-running: HostPort fire gating is the sole authority over whether a
   // target edge occurs, and engine state or scheduling boundaries never stop
   // it.
-  when(targetTimeStarted || startingWorkload) {
+  when((targetTimeStarted || startingWorkload) && !sessionTerminal) {
     targetCycle := targetCycle + 1.U
   }
   when(startingWorkload) {
@@ -999,8 +1085,11 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
   when(state === sIdle) {
     when(acceptingRound) {
       roundCapacityBounded := io.accessStoreHasMore
+      roundHadAccesses := io.accessStoreHasEntries
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       wakeExitPending := false.B
+      bundleTableRecoveryPending := false.B
+      bundleTableFullLaneMaskReg := 0.U
       completedBundleCount := 0.U
       accessReadConsumePendingMask := 0.U
       accessReadLaneSlot.foreach(_ := 0.U)
@@ -1012,7 +1101,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       state := sDrainCompletions
     }
   }.elsewhen(state === sDrainCompletions) {
-    when(completionAnyValid) {
+    when(completionAnyValid && completionBudgetAvailable && !io.controlPending && !sessionTerminal) {
       when(completionCanFire) {
         for (lane <- 0 until params.numGenerators; e <- 0 until localBundleTableEntries) {
           bundleValid(lane)(e) := bundleValidNext(lane)(e)
@@ -1028,11 +1117,15 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         }
       }
     }.otherwise {
-      when(wakeExitPending) {
+      when(controlExitReady) {
+        roundExitReasonReg := TrafficGenRoundExitReason.control
+        lastHasPendingWork := pendingAfterExit
+        state := sDrainOutputs
+      }.elsewhen(wakeExitPending) {
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
         lastHasPendingWork := pendingAfterExit
         state := sDrainOutputs
-      }.elsewhen(minExitReady) {
+      }.elsewhen(minExitReady || completionCapacityExitReady) {
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
         lastHasPendingWork := pendingAfterExit
         state := sDrainOutputs
@@ -1040,7 +1133,7 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
         roundExitReasonReg := TrafficGenRoundExitReason.capacity
         lastHasPendingWork := true.B
         state := sDrainOutputs
-      }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork) {
+      }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork && (roundHadAccesses || noFiniteProgressTarget)) {
         roundExitReasonReg := TrafficGenRoundExitReason.scheduling
         lastHasPendingWork := pendingAfterExit
         state := sDrainOutputs
@@ -1062,19 +1155,30 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
       when(completionCanFire && completeEventWakeExit.asUInt.orR) {
         wakeExitPending := true.B
       }
+    }.elsewhen(controlExitReady) {
+      roundExitReasonReg := TrafficGenRoundExitReason.control
+      lastHasPendingWork := pendingAfterExit
+      state := sDrainOutputs
     }.elsewhen(wakeExitPending) {
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       lastHasPendingWork := pendingAfterExit
       state := sDrainOutputs
-    }.elsewhen(minExitReady) {
+    }.elsewhen(minExitReady || completionCapacityExitReady) {
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       lastHasPendingWork := pendingAfterExit
+      state := sDrainOutputs
+    }.elsewhen(bundleTableRecoveryExitReady) {
+      assert(bundleTableBlockedLanes.asUInt.orR,
+        "TrafficGenRTLEngine lost all blocked lanes during bundle-table recovery")
+      roundExitReasonReg := TrafficGenRoundExitReason.bundleTableFull
+      bundleTableFullLaneMaskReg := bundleTableBlockedLanes.asUInt
+      lastHasPendingWork := true.B
       state := sDrainOutputs
     }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && roundCapacityBounded) {
       roundExitReasonReg := TrafficGenRoundExitReason.capacity
       lastHasPendingWork := true.B
         state := sDrainOutputs
-    }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork) {
+    }.elsewhen(allAccessLanesDone && !accessReadPendingAfterAck.orR && !roundMemoryHasWork && (roundHadAccesses || noFiniteProgressTarget)) {
       roundExitReasonReg := TrafficGenRoundExitReason.scheduling
       lastHasPendingWork := pendingAfterExit
       state := sDrainOutputs
@@ -1088,42 +1192,97 @@ class TrafficGenRTLEngine(params: TrafficGenParams) extends Module with HasTraff
     }
   }
 
-  // The bridge asserts trafficGenDone only after the scheduler has consumed
-  // the final round outputs and reported global workload completion. Reset all
-  // workload-scoped state while the level remains asserted so a later kernel
-  // can establish a fresh cycle-zero epoch without resetting the machine.
-  when(io.trafficGenDone) {
+  // Successful completion closes this session. Preserve its final cycle and
+  // identity counters for diagnostics; only target reset starts another epoch.
+  when(io.trafficGenDone || io.sessionStatus(3)) {
     assert(state === sIdle,
-      "TrafficGenRTLEngine workload completed while a round was active")
-    assert(!io.memActive && !bundleTableHasInflight,
-      "TrafficGenRTLEngine workload completed with memory requests in flight")
+      "TrafficGenRTLEngine session completed while a round was active")
+    assert(!io.memActive && !bundleTableHasEntries,
+      "TrafficGenRTLEngine session completed with unfinished bundles")
     assert(outputQueuesEmpty,
-      "TrafficGenRTLEngine workload completed with undrained outputs")
+      "TrafficGenRTLEngine session completed with undrained outputs")
+  }
 
-    state := sIdle
-    targetCycle := 0.U
-    targetTimeStarted := false.B
-    roundCapacityBounded := false.B
-    wakeExitPending := false.B
-    roundExitReasonReg := TrafficGenRoundExitReason.scheduling
-    lastHasPendingWork := false.B
-    accessReadConsumePendingMask := 0.U
-    accessReadLaneSlot.foreach(_ := 0.U)
-    for (slot <- 0 until replaySlots) {
-      lastAccessReadRespGenerations(slot) := accessReadRespGenerations(slot)
-    }
-    issuedBatchId := 0.U
-    completedBundleCount := 0.U
-    for (lane <- 0 until params.numGenerators; e <- 0 until localBundleTableEntries) {
-      bundleValid(lane)(e) := false.B
-      bundleIds(lane)(e) := 0.U
-      bundleRemainingToIssue(lane)(e) := 0.U
-      bundleOutstanding(lane)(e) := 0.U
-      bundleWakeRelevant(lane)(e) := false.B
-      bundleWarpBlocked(lane)(e) := false.B
-      bundleIssueRound(lane)(e) := 0.U
+}
+
+/** Hardware bookkeeping module for kernel submission slots
+  * SW writes registry ID and submits register
+  * Capture the registry ID and allocate a monotonically increasing launch ID.
+  * advertise launch to host through launchRegistryIDs, launch IDs, launchPendingMask
+  * controlPending ensures this happens on a scheduling boundary
+  * host returns progress, read through MMIO in software
+  * Software can reuse completed slots.
+  */
+class TrafficGenLaunchSlots(val useRTL: Boolean = true) extends Module {
+  val io = IO(new Bundle {
+    val registryIds = Input(Vec(4, UInt(64.W)))
+    val submit = Input(UInt(4.W))
+    val submitAndClose = Input(UInt(4.W))
+    val close = Input(Bool())
+    val clearErrors = Input(Vec(4, UInt(32.W)))
+    val clearSessionErrors = Input(UInt(32.W))
+    val launchStatusIds = Input(UInt(256.W))
+    val launchStatuses = Input(UInt(32.W))
+    val hostSessionStatus = Input(UInt(32.W))
+    val launchRegistryIds = Output(UInt(256.W))
+    val launchIds = Output(UInt(256.W))
+    val launchPendingMask = Output(UInt(4.W))
+    val closeSubmissions = Output(Bool())
+    val statuses = Output(Vec(4, UInt(8.W)))
+    val errors = Output(Vec(4, UInt(32.W)))
+    val sessionStatus = Output(UInt(32.W))
+    val sessionErrors = Output(UInt(32.W))
+    val controlPending = Output(Bool())
+  })
+  val ids = RegInit(VecInit(Seq.fill(4)(0.U(64.W))))
+  val registryIds = RegInit(VecInit(Seq.fill(4)(0.U(64.W))))
+  val errors = RegInit(VecInit(Seq.fill(4)(0.U(32.W))))
+  val sessionErrors = RegInit(0.U(32.W))
+  val nextLaunchId = RegInit(1.U(64.W))
+  val closed = RegInit(false.B)
+  val terminal = io.hostSessionStatus(5, 3).orR
+  val submissionClosed = closed || io.close || terminal
+  val submissions = io.submit | io.submitAndClose
+  val pending = Wire(Vec(4, Bool()))
+  val accepted = Wire(Vec(4, Bool()))
+  val exhausted = nextLaunchId === 0.U
+  val sessionErrorSet = Mux(submissions.orR && !useRTL.B, 2.U(32.W),
+    Mux(submissions.orR && exhausted, 1.U(32.W), 0.U(32.W)))
+  sessionErrors := (sessionErrors & ~io.clearSessionErrors) | sessionErrorSet
+  for (slot <- 0 until 4) {
+    val hostId = io.launchStatusIds(64 * slot + 63, 64 * slot)
+    val hostStatus = io.launchStatuses(8 * slot + 7, 8 * slot)
+    val tagged = ids(slot) =/= 0.U && hostId === ids(slot)
+    io.statuses(slot) := Mux(ids(slot) === 0.U, 0.U,
+      Mux(tagged, hostStatus, 1.U))
+    val busy = io.statuses(slot) >= 1.U && io.statuses(slot) <= 4.U
+    pending(slot) := ids(slot) =/= 0.U && !tagged
+    accepted(slot) := submissions(slot) && !submissionClosed && !busy && !exhausted && useRTL.B
+    val errorSet = Mux(submissions(slot),
+      Mux(!useRTL.B, 4.U(32.W),
+        Mux(submissionClosed, 2.U(32.W), Mux(busy, 1.U(32.W), 0.U(32.W)))),
+      0.U(32.W))
+    errors(slot) := (errors(slot) & ~io.clearErrors(slot)) | errorSet
+    when(accepted(slot)) {
+      ids(slot) := nextLaunchId
+      registryIds(slot) := io.registryIds(slot)
     }
   }
+  // TileLink serializes register writes, so one command can allocate per edge.
+  assert(PopCount(io.submit) +& PopCount(io.submitAndClose) <= 1.U,
+    "TrafficGen received simultaneous slot commands")
+  when(accepted.asUInt.orR) { nextLaunchId := nextLaunchId + 1.U }
+  // Publish the new launch and closure on the same target edge. Failed atomic
+  // submissions leave the session open, so software can correct and retry.
+  when(io.close || (accepted.asUInt & io.submitAndClose).orR) { closed := true.B }
+  io.launchRegistryIds := registryIds.asUInt
+  io.launchIds := ids.asUInt
+  io.launchPendingMask := pending.asUInt
+  io.closeSubmissions := closed
+  io.errors := errors
+  io.sessionErrors := sessionErrors
+  io.sessionStatus := io.hostSessionStatus | closed.asUInt
+  io.controlPending := !terminal && (pending.asUInt.orR || (closed && !io.hostSessionStatus(1)))
 }
 
 class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Parameters)
@@ -1151,11 +1310,32 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
 
       val trafficGenIdle = Wire(Bool())
 
-      // start traffic generator when target program writes to start register
-      // returns to false on next cycle
-      val startTrafficGenPulse = Wire(Bool())
-      startTrafficGenPulse := false.B
+      // ABI v3 adds an atomic submit-and-close command to the reusable slots.
+      // Retain the original start doorbell for diagnostic single-launch runs
+      // with an unchanged target binary; the driver supplies its registry ID.
+      val startTrafficGenPulse = WireDefault(false.B)
       io.startTrafficGen := startTrafficGenPulse
+      val desiredRegistryLow = RegInit(VecInit(Seq.fill(4)(0.U(32.W))))
+      val desiredRegistryHigh = RegInit(VecInit(Seq.fill(4)(0.U(32.W))))
+      val submit = WireDefault(VecInit(Seq.fill(4)(false.B)))
+      val submitAndClose = WireDefault(VecInit(Seq.fill(4)(false.B)))
+      val close = WireDefault(false.B)
+      val clearErrors = WireDefault(VecInit(Seq.fill(4)(0.U(32.W))))
+      val clearSessionErrors = WireDefault(0.U(32.W))
+      val slots = Module(new TrafficGenLaunchSlots(params.backend == TrafficGenRTLBackend))
+      slots.io.registryIds := VecInit((0 until 4).map(i => Cat(desiredRegistryHigh(i), desiredRegistryLow(i))))
+      slots.io.submit := submit.asUInt
+      slots.io.submitAndClose := submitAndClose.asUInt
+      slots.io.close := close
+      slots.io.clearErrors := clearErrors
+      slots.io.clearSessionErrors := clearSessionErrors
+      slots.io.launchStatusIds := io.launchStatusIds
+      slots.io.launchStatuses := io.launchStatuses
+      slots.io.hostSessionStatus := io.sessionStatus
+      io.launchRegistryIds := slots.io.launchRegistryIds
+      io.launchIds := slots.io.launchIds
+      io.launchPendingMask := slots.io.launchPendingMask
+      io.closeSubmissions := slots.io.closeSubmissions
 
       val patternReady = RegInit(false.B)
       val engine = params.backend match {
@@ -1167,6 +1347,10 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       engine.io.minIssueCycle := io.minIssueCycle
       engine.io.startRound := io.startRound
       engine.io.trafficGenDone := io.trafficGenDone
+      engine.io.controlPending := slots.io.controlPending
+      engine.io.launchStatusIds := io.launchStatusIds
+      engine.io.launchStatuses := io.launchStatuses
+      engine.io.sessionStatus := io.sessionStatus
       engine.io.accessReadData := io.accessReadData
       engine.io.accessReadDataValid := io.accessReadDataValid
       engine.io.accessReadRespValid := io.accessReadRespValid
@@ -1194,6 +1378,7 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.roundStarted := engine.io.roundStarted
       io.roundComplete := engine.io.roundComplete
       io.roundExitReason := engine.io.roundExitReason
+      io.bundleTableFullLaneMask := engine.io.bundleTableFullLaneMask
       io.currentCycleAfterIssue := engine.io.currentCycleAfterIssue
       io.dpiState := engine.io.dpiState
       io.issuedAccessBatch <> engine.io.issuedAccessBatch
@@ -1217,9 +1402,8 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         patternReady := true.B
       }
 
-      node.regmap(
+      val diagnosticRegisters = Seq(
         0x00 -> Seq(RegField.r(1, trafficGenIdle)),
-        0x04 -> Seq(RegField.w(1, startTrafficGenPulse)),
         0x08 -> Seq(RegField.r(1, io.targetBusy)),
         0x0C -> Seq(RegField.r(1, io.uploadReady)),
         0x10 -> Seq(RegField.r(1, io.trafficGenDone)),
@@ -1229,8 +1413,32 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
         0x38 -> Seq(RegField.r(32, io.currentCycleAfterIssue(31, 0))),
         0x3C -> Seq(RegField.r(32, io.currentCycleAfterIssue(63, 32))),
         0x40 -> Seq(RegField.r(32, io.dpiState)),
-        0x44 -> Seq(RegField.r(2, io.roundExitReason))
+        0x44 -> Seq(RegField.r(2, io.roundExitReason)),
+        0x48 -> Seq(RegField.r(32, 3.U(32.W))),
+        0x4C -> Seq(RegField.r(32, (if (params.backend == TrafficGenRTLBackend) 4 else 0).U(32.W))),
+        0x50 -> Seq(RegField.r(32, slots.io.sessionStatus)),
+        0x54 -> Seq(RegField.w(1, close)),
+        0x58 -> Seq(RegField(32, slots.io.sessionErrors, RegWriteFn((valid, data) => {
+          clearSessionErrors := Mux(valid, data, 0.U); true.B
+        }))),
       )
+      val launchRegisters = (0 until 4).flatMap { slot =>
+        val base = 0x100 + 0x20 * slot
+        Seq(
+          base -> Seq(RegField(32, desiredRegistryLow(slot))),
+          (base + 4) -> Seq(RegField(32, desiredRegistryHigh(slot))),
+          (base + 8) -> Seq(RegField.w(1, submit(slot))),
+          (base + 12) -> Seq(RegField.r(8, slots.io.statuses(slot))),
+          (base + 16) -> Seq(RegField.r(32, slots.io.launchIds(64 * slot + 31, 64 * slot))),
+          (base + 20) -> Seq(RegField.r(32, slots.io.launchIds(64 * slot + 63, 64 * slot + 32))),
+          (base + 24) -> Seq(RegField(32, slots.io.errors(slot), RegWriteFn((valid, data) => {
+            clearErrors(slot) := Mux(valid, data, 0.U); true.B
+          }))),
+          (base + 28) -> Seq(RegField.w(1, submitAndClose(slot))),
+        )
+      }
+      val legacyStart = Seq(0x04 -> Seq(RegField.w(1, startTrafficGenPulse)))
+      node.regmap((diagnosticRegisters ++ legacyStart ++ launchRegisters): _*)
     }
   }
 }
@@ -1842,9 +2050,18 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.targetBusy <> trafficGenTL.module.io.targetBusy
       outerIO.bits.hasPendingWork <> trafficGenTL.module.io.hasPendingWork
       outerIO.bits.startTrafficGen <> trafficGenTL.module.io.startTrafficGen
+      outerIO.bits.launchRegistryIds <> trafficGenTL.module.io.launchRegistryIds
+      outerIO.bits.launchIds <> trafficGenTL.module.io.launchIds
+      outerIO.bits.launchPendingMask <> trafficGenTL.module.io.launchPendingMask
+      outerIO.bits.closeSubmissions <> trafficGenTL.module.io.closeSubmissions
+      outerIO.bits.launchStatusIds <> trafficGenTL.module.io.launchStatusIds
+      outerIO.bits.launchStatuses <> trafficGenTL.module.io.launchStatuses
+      outerIO.bits.sessionStatus <> trafficGenTL.module.io.sessionStatus
+      trafficGenTL.module.io.controlPending := false.B
       outerIO.bits.roundStarted <> trafficGenTL.module.io.roundStarted
       outerIO.bits.roundComplete <> trafficGenTL.module.io.roundComplete
       outerIO.bits.roundExitReason <> trafficGenTL.module.io.roundExitReason
+      outerIO.bits.bundleTableFullLaneMask <> trafficGenTL.module.io.bundleTableFullLaneMask
       outerIO.bits.currentCycleAfterIssue <> trafficGenTL.module.io.currentCycleAfterIssue
       outerIO.bits.dpiState <> trafficGenTL.module.io.dpiState
       outerIO.bits.issuedAccessBatch <> trafficGenTL.module.io.issuedAccessBatch

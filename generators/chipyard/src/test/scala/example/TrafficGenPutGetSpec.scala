@@ -72,6 +72,7 @@ class TrafficGenPutGetSpec extends AnyFlatSpec with ChiselScalatestTester {
     bits.mWarpBlocked.poke((!access.write).B)
     bits.bundleIssueCount.poke(7.U)
     bits.bundleGeneration.poke(2.U)
+    bits.launchId.poke(23.U)
   }
 
   private def initialize(dut: TrafficGenPutGetHarnessImp): Unit = {
@@ -157,6 +158,7 @@ class TrafficGenPutGetSpec extends AnyFlatSpec with ChiselScalatestTester {
     bits.mWarpBlocked.expect((!access.write).B)
     bits.bundleIssueCount.expect(7.U)
     bits.bundleGeneration.expect(2.U)
+    bits.launchId.expect(23.U)
     dut.io.completion.ready.poke(true.B)
     dut.clock.step()
     dut.io.completion.ready.poke(false.B)

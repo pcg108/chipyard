@@ -1,0 +1,15 @@
+# Same target/platform recipe as the existing boundary-only m8 build, under the ABI-3 compatibility alias.
+alveo_u250_firesim_rocket_singlecore_trafficgen_rtl_no_nic_l2_putget_boundary_only_m8_multilaunch_compat_abi3:
+  PLATFORM: xilinx_alveo_u250
+  TARGET_PROJECT: firesim
+  TARGET_PROJECT_MAKEFRAG: ../../../generators/firechip/chip/src/main/makefrag/firesim
+  DESIGN: FireSim
+  TARGET_CONFIG: FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig
+  PLATFORM_CONFIG: BaseXilinxAlveoU250Config
+  deploy_quintuplet: null
+  platform_config_args:
+    fpga_frequency: 45
+    build_strategy: NORETIMING
+  post_build_hook: null
+  metasim_customruntimeconfig: null
+  bit_builder_recipe: bit-builder-recipes/xilinx_alveo_u250.yaml

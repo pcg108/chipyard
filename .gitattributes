@@ -1,2 +1,5 @@
 conda-reqs/conda-lock-reqs/conda-requirements-riscv-tools-linux-64-lean.conda-lock.yml linguist-generated=true
 conda-reqs/conda-lock-reqs/conda-requirements-riscv-tools-linux-64.conda-lock.yml linguist-generated=true
+
+# Preserve the frozen regression snapshot's original CRLF bytes and checksum.
+generators/firechip/bridgestubs/src/main/cc/bridges/test/data/kernel2_round911_pending.csv -text whitespace=cr-at-eol

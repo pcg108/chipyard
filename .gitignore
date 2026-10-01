@@ -16,7 +16,7 @@ env.sh
 tags
 *~
 .bsp/
-.conda-env/
+.conda-env
 .conda-lock-env/
 .#*
 first-clone-setup-fast-log
@@ -30,3 +30,5 @@ project/project/
 .classpath_cache/
 .vscode/
 tests/build/
+test_run_dir/
+scripts/trafficgen/**/__pycache__/

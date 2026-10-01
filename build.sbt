@@ -211,6 +211,8 @@ lazy val chipyard = {
       )
     )
     .settings(commonSettings)
+    // Diplomacy elaboration uses a shared LazyModule scope across test suites.
+    .settings(Test / parallelExecution := false)
     .settings(Compile / unmanagedSourceDirectories += {
       if (useChisel7) file("tools/stage-chisel7/src/main/scala")
       else file("tools/stage/src/main/scala")

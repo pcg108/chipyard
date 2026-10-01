@@ -82,6 +82,7 @@ object L2Access {
   * stores and target-side queues do not pay for unused fields.
   */
 class RTLL2Access extends Bundle {
+  val launchId = UInt(64.W)
   val id = UInt(64.W)
   val address = UInt(64.W)
   val cycleCount = UInt(64.W)
@@ -97,9 +98,10 @@ class RTLL2Access extends Bundle {
 }
 
 object RTLL2Access {
-  val streamWidthBits = 307
+  val streamWidthBits = 371
 
   def pack(access: RTLL2Access): UInt = Cat(
+    access.launchId,
     access.bundleGeneration,
     access.bundleIssueCount,
     access.mWarpBlocked,
@@ -123,12 +125,14 @@ object RTLL2Access {
     access.mWarpBlocked := bits(258)
     access.bundleIssueCount := bits(274, 259)
     access.bundleGeneration := bits(306, 275)
+    access.launchId := bits(370, 307)
     access
   }
 }
 
 /** The only per-access fields returned by either traffic-generator engine. */
 class IssuedAccess extends Bundle {
+  val launchId = UInt(64.W)
   val requestUid = UInt(64.W)
   val cycleIssued = UInt(64.W)
   val address = UInt(64.W)
@@ -136,9 +140,10 @@ class IssuedAccess extends Bundle {
 }
 
 object IssuedAccess {
-  val streamWidthBits = 193
+  val streamWidthBits = 257
 
   def pack(access: IssuedAccess): UInt = Cat(
+    access.launchId,
     access.isWrite,
     access.address,
     access.cycleIssued,
@@ -152,6 +157,7 @@ object IssuedAccess {
     access.cycleIssued := bits(127, 64)
     access.address := bits(191, 128)
     access.isWrite := bits(192)
+    access.launchId := bits(256, 193)
     access
   }
 }
@@ -192,6 +198,8 @@ object CompletedBundleIds {
 object TrafficGenRoundExitReason {
   val scheduling = 0.U(2.W)
   val capacity = 1.U(2.W)
+  val bundleTableFull = 2.U(2.W)
+  val control = 3.U(2.W)
 }
 
 class TrafficGenPortIO(numLanes: Int, useRTL: Boolean) extends Bundle {
@@ -200,9 +208,17 @@ class TrafficGenPortIO(numLanes: Int, useRTL: Boolean) extends Bundle {
   val targetBusy = Output(Bool())
   val hasPendingWork = Output(Bool())
   val startTrafficGen = Output(Bool())
+  val launchRegistryIds = Output(UInt(256.W))
+  val launchIds = Output(UInt(256.W))
+  val launchPendingMask = Output(UInt(4.W))
+  val closeSubmissions = Output(Bool())
+  val launchStatusIds = Input(UInt(256.W))
+  val launchStatuses = Input(UInt(32.W))
+  val sessionStatus = Input(UInt(32.W))
   val roundStarted = Output(Bool())
   val roundComplete = Output(Bool())
   val roundExitReason = Output(UInt(2.W))
+  val bundleTableFullLaneMask = Output(UInt(numLanes.W))
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
   val issuedAccessBatch = Decoupled(new IssuedAccessBatch(numLanes))

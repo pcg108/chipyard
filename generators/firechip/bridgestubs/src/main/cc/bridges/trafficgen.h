@@ -4,6 +4,9 @@
 #define __TRAFFICGEN_H
 
 #include "core/bridge_driver.h"
+#include "trafficgen_bundle_recovery.h"
+#include "trafficgen_bundle_tracking.h"
+#include "trafficgen_socket_protocol.h"
 
 #include <array>
 #include <cstddef>
@@ -47,6 +50,19 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t issued_lane_count_index;
   uint64_t issued_lane_count_value;
   uint64_t completed_bundle_count;
+  uint64_t bundle_table_full_lane_mask;
+  uint64_t launch_slot_index;
+  uint64_t launch_registry_id_low;
+  uint64_t launch_registry_id_high;
+  uint64_t launch_id_low;
+  uint64_t launch_id_high;
+  uint64_t launch_pending_mask;
+  uint64_t close_submissions;
+  uint64_t slot_status_id_low;
+  uint64_t slot_status_id_high;
+  uint64_t slot_status;
+  uint64_t session_status;
+  uint64_t commit_launch_status;
 };
 
 using L2SubpartitionReservationsByCycle =
@@ -56,6 +72,8 @@ using OrderedL2SubpartitionReservationsByCycle =
 
 struct trafficgen_l2_access_t {
   uint64_t id;
+  uint64_t launch_id = 0;
+  uint64_t registry_id = 0;
   uint64_t address;
   uint64_t cycle_count;
   uint32_t m_subpartition;
@@ -76,6 +94,7 @@ struct trafficgen_l2_access_t {
 
 struct trafficgen_issued_access_point_t {
   std::uint64_t request_uid = 0;
+  std::uint64_t launch_id = 0;
   std::uint64_t cycle_issued = 0;
   std::uint64_t address = 0;
   bool is_write = false;
@@ -133,6 +152,8 @@ public:
   void init() override;
   void tick() override;
   void finish() override;
+  bool terminate() override { return session_failed; }
+  int exit_code() override { return session_failed ? 1 : 0; }
 
 private:
   class socket_client_t;
@@ -146,24 +167,31 @@ private:
   const uint64_t completed_window_bytes;
   const bool use_rtl_engine;
   const std::size_t lane_count;
+  std::uint16_t socket_port = 50051;
   std::uint64_t min_issue_cycle = 0;
   std::filesystem::path round_log_root;
+  std::filesystem::path socket_round_log_root;
+  // Optional host-side measurement; never reads extra target registers.
+  std::filesystem::path boundary_log_path;
+  std::uint64_t boundary_start_cycle = 0;
+  std::uint64_t replay_min_issue_cycle = 0;
   std::uint64_t engine_round_number = 0;
   std::vector<trafficgen_l2_access_t> l2_accesses;
   std::map<std::uint64_t, std::vector<trafficgen_l2_access_t>>
       pending_accesses_by_cycle;
-  std::unordered_map<std::uint64_t, std::uint64_t> pending_access_cycle_by_id;
+  std::unordered_map<trafficgen_request_key_t, std::uint64_t, trafficgen_request_key_hash> pending_access_cycle_by_id;
   using bundle_key_t = std::pair<std::uint32_t, std::uint64_t>;
   std::map<bundle_key_t, std::size_t> bundle_lane_owners;
   std::map<bundle_key_t, std::uint16_t> bundle_member_counts;
-  std::unordered_map<std::uint64_t, trafficgen_bundle_assignment_t>
+  trafficgen_bundle_recovery::promotions_t promoted_bundles;
+  std::uint64_t recovery_number = 0;
+  std::uint64_t hardware_boundary_number = 0;
+  std::unordered_map<trafficgen_request_key_t, trafficgen_bundle_assignment_t, trafficgen_request_key_hash>
       bundle_assignment_by_request_uid;
+  trafficgen_bundle_tracker bundle_tracker;
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
-  std::array<uint8_t, COMPLETED_BUNDLE_ID_BEATS * STREAM_WIDTH_BYTES>
-      completed_bundle_stream_bytes{};
-  size_t completed_bundle_bytes_received = 0;
   bool completed_bundle_read_issued = false;
   std::vector<trafficgen_issued_access_point_t> issued_access_writeback_entries;
   std::vector<uint8_t> issued_access_writeback_stream_bytes;
@@ -173,26 +201,58 @@ private:
   std::vector<trafficgen_issued_access_point_t> accumulated_issued_accesses;
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
 
+  // Access BRAM is written only by this host driver; commit resets its read
+  // cursors without changing payload bytes. Empty entries mean no cached write.
+  std::vector<std::vector<std::uint8_t>> last_lane_upload_bytes;
   bool upload_written_to_bram = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
   std::unique_ptr<socket_client_t> gpu_model_socket_client;
 
+  enum slot_state_t : std::uint8_t {
+    FREE = 0, QUEUED = 1, SUBMITTED = 2, ACCEPTED = 3, DISPATCHED = 4,
+    COMPLETE = 5, REJECTED = 6, ABORTED = 7
+  };
+  struct launch_slot_t {
+    std::uint64_t launch_id = 0, registry_id = 0;
+    slot_state_t status = FREE;
+  };
+  struct launch_record_t {
+    std::size_t slot = 0;
+    std::uint64_t registry_id = 0;
+  };
+  std::array<launch_slot_t, 4> launch_slots{};
+  std::map<std::uint64_t, launch_record_t> launch_records;
+  trafficgen_socket::SchedulingRoundStateMessage scheduler_status;
+  bool submissions_closed = false, close_sent = false;
+  std::uint64_t legacy_registry_id = 0;
+  bool legacy_bootstrap_active = false;
+  bool session_complete = false, session_failed = false, session_truncated = false;
+  std::uint64_t last_reported_cycle = 0;
+  void tick_impl();
+  std::uint64_t read_target_cycle();
+  void capture_launch_requests();
+  void receive_scheduler_status();
+  void publish_launch_status();
+  void fail_session(const std::string &reason);
+  void finish_scheduler_boundary();
+  void clean_completed_bundle_metadata();
   size_t process_completed_bundle_ids_stream();
   size_t process_issued_access_writeback_stream();
   void write_schedule_to_bram();
   void connect_gpu_model_socket();
   void reset_workload_state();
-  bool receive_main_loop_complete_from_gpu_model() const;
   void send_reserved_subpartitions_snapshot(
-      const L2SubpartitionReservationsByCycle &reservations) const;
+      const L2SubpartitionReservationsByCycle &reservations);
   void receive_schedule_from_gpu_model();
   void refresh_pending_access_blocked_annotations();
   void refresh_upload_access_blocked_annotations();
   void build_next_l2_access_chunk();
   L2SubpartitionReservationsByCycle build_reserved_subpartitions_from_pending() const;
   void depopulate_issued_accesses(
-      const std::vector<trafficgen_issued_access_point_t> &issued_accesses);
-  void depopulate_uploaded_l2_access_chunk();
+      const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
+      bool require_complete_upload);
+  void recover_full_bundle_tables(std::uint32_t lane_mask,
+                                  std::uint64_t current_cycle);
   void assign_replay_lanes_and_bundle_counts();
   void write_upload_lane_count(unsigned lane, std::uint32_t count);
   std::uint32_t read_issued_lane_count(unsigned lane);

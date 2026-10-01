@@ -1,0 +1,33 @@
+#ifndef TRAFFICGEN_TARGET_H
+#define TRAFFICGEN_TARGET_H
+#include <stdint.h>
+#define TG_BASE ((uintptr_t)0x5000)
+#define TG_GLOBAL_DONE 0x10
+#define TG_ENGINE_STATE 0x40
+#define TG_ABI_VERSION 0x48
+#define TG_SLOT_COUNT 0x4c
+#define TG_SESSION_STATUS 0x50
+#define TG_CLOSE 0x54
+#define TG_SESSION_ERRORS 0x58
+#define TG_CYCLE_LOW 0x38
+#define TG_CYCLE_HIGH 0x3c
+#define TG_SLOT(i) (0x100 + 0x20 * (i))
+#define TG_REGISTRY_LOW 0x00
+#define TG_REGISTRY_HIGH 0x04
+#define TG_SUBMIT 0x08
+#define TG_STATUS 0x0c
+#define TG_LAUNCH_LOW 0x10
+#define TG_LAUNCH_HIGH 0x14
+#define TG_SLOT_ERRORS 0x18
+#define TG_SUBMIT_AND_CLOSE 0x1c
+enum tg_launch_status {
+  TG_FREE, TG_QUEUED, TG_SUBMITTED, TG_ACCEPTED, TG_DISPATCHED,
+  TG_COMPLETE, TG_REJECTED, TG_ABORTED
+};
+#define TG_SESSION_CLOSED (1U << 0)
+#define TG_SESSION_CLOSE_SENT (1U << 1)
+#define TG_SESSION_IDLE (1U << 2)
+#define TG_SESSION_COMPLETE (1U << 3)
+#define TG_SESSION_TRUNCATED (1U << 4)
+#define TG_SESSION_ERROR (1U << 5)
+#endif
