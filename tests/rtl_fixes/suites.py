@@ -3,7 +3,7 @@ from pathlib import Path
 import json,re,shutil
 from common import ROOT,TOOLS,sha,write,module,ports,zero_inputs,observe,compile_model,command
 HERE=Path(__file__).resolve().parent
-ROCKET_PROBES={'dbg_scalar_exception':('','wb_reg_xcpt'),'dbg_interrupt':('','csr_io_interrupt'),'dbg_ibuf_pc':('[39:0]','ibuf_io_pc'),'dbg_exception':('','csr_io_exception'),'dbg_trap_pc':('[39:0]','csr_io_pc'),'dbg_cause':('[63:0]','csr_io_cause'),'dbg_retire':('','wb_valid'),'dbg_retire_pc':('[39:0]','wb_reg_pc')}
+ROCKET_PROBES={'dbg_system_redirect':('','csr_io_eret'),'dbg_wb_inst':('[31:0]','wb_reg_inst'),'dbg_saved_pc':('[39:0]','csr.reg_mepc'),'dbg_saved_cause':('[63:0]','csr.reg_mcause'),'dbg_scalar_exception':('','wb_reg_xcpt'),'dbg_interrupt':('','csr_io_interrupt'),'dbg_ibuf_pc':('[39:0]','ibuf_io_pc'),'dbg_exception':('','csr_io_exception'),'dbg_trap_pc':('[39:0]','csr_io_pc'),'dbg_cause':('[63:0]','csr_io_cause'),'dbg_retire':('','wb_valid'),'dbg_retire_pc':('[39:0]','wb_reg_pc')}
 def prepare(sv,work):
  work.mkdir(parents=True,exist_ok=False)
  for n in ['EICG_wrapper.v','plusarg_reader.v']:shutil.copy2(sv.parent/n,work/n)
@@ -24,7 +24,11 @@ def rocket(sv,work,jobs,negative,trap=False):
  s=prepare(sv,work);s=observe(s,'Rocket',ROCKET_PROBES);(work/'observed.sv').write_text(s);(work/'zero_inputs.h').write_text(zero_inputs(ports(s,'Rocket')))
  driver=HERE/'rocket_irq'/('trap_pc.cpp' if trap else 'interrupt_pc.cpp')
  binary,build=compile_model(work/'observed.sv',work,'Rocket','VRocket',driver,jobs)
- result=check_run(binary,work,r'^TRAP_PC cases=(\d+) passed=(\d+) failed=(\d+)$' if trap else r'^IRQ_REGRESSION cases=(\d+) passed=(\d+) failed=(\d+)$',448 if trap else 8640,negative)
+ result=check_run(binary,work,r'^TRAP_PC cases=(\d+) passed=(\d+) failed=(\d+)$' if trap else r'^IRQ_REGRESSION cases=(\d+) passed=(\d+) failed=(\d+)$',512 if trap else 8640,negative)
+ if trap and negative:
+  log=(work/'run.log').read_text();rows=re.findall(r'TRAP_MISMATCH timing=(\d+) mode=(\d+) wbkind=(\d+) expected=([0-9a-f]+) actual=([0-9a-f]+) cause=([0-9a-f]+)',log)
+  assert len(rows)==result['checks_failed'] and result['checks_passed']>=128
+  assert all(int(mode)<3 and int(actual,16)==0x80000040 and int(cause,16)==[0x8000000000000007,2,1][int(mode)] for t,mode,k,expected,actual,cause in rows),'Negative control did not isolate stale vector PC'
  result.update(build=build,generated_sha256=sha(sv),driver_sha256=sha(driver));write(work/'result.json',result);return result
 
 def saturn(sv,work,jobs,negative):
@@ -104,4 +108,8 @@ def shuttle(sv,work,jobs,negative):
    bins.append(binary);firmware.append({'file':str(elf),'sha256':sha(elf)})
  driver=HERE/'shuttle_fdiv/run.cpp';binary,build=compile_model(work/'observed.sv',work,'ShuttleCore','VShuttle',driver,jobs)
  result=check_run(binary,work,r'^SHUTTLE_FDIV cases=(\d+) passed=(\d+) failed=(\d+)$',12,negative,bins)
+ if negative:
+  rows=re.findall(r'SHUTTLE_CASE reject=(\d+) sqrt=(\d+) bubbles=(\d+) expected=([0-9a-f]+) actual=([0-9a-f]+) traps=(\d+) pass=(\d+)',(work/'run.log').read_text())
+  assert len(rows)==12,'Incomplete bare-metal control cases'
+  assert all(ok=='1' or (reject=='1' and traps=='1' and actual!=expected) for reject,sqrt,bubbles,expected,actual,traps,ok in rows),'Unexpected negative-control failure'
  result.update(build=build,firmware=firmware,generated_sha256=sha(sv),driver_sha256=sha(driver));write(work/'result.json',result);return result

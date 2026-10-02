@@ -46,14 +46,21 @@ def elaborate(source,config,work,jobs):
  env.update(RISCV=str(ROOT/'.conda-env/riscv-tools'),TMPDIR=str(work/'tmp'),JAVA_TOOL_OPTIONS=f'-Xmx16G -Xss64M -XX:ActiveProcessorCount={jobs} -Djava.io.tmpdir={work / "tmp"}',SBT_OPTS='-Dsbt.supershell=false -Dsbt.server.forcestart=true')
  cache=Path(os.environ.get('RTL_FIX_CACHE',str(work.parent.parent/'cache')));cache.mkdir(exist_ok=True)
  env.update(COURSIER_CACHE=str(cache/'coursier/v1'),XDG_CACHE_HOME=str(cache))
- # Dependency downloads and compiled outputs stay in scratch.
+ # Load SBT's meta-build in scratch too. Source directories are read-only
+ # symlinks to the requested checkout; only project/ is privately copied.
+ import shutil
+ driver=work/'sbt-source';driver.mkdir()
+ for entry in source.iterdir():
+  if entry.name=='project':
+   shutil.copytree(entry,driver/'project',ignore=shutil.ignore_patterns('target','.bsp','.metals'))
+  else:(driver/entry.name).symlink_to(entry,target_is_directory=entry.is_dir())
  wrapper=work/'sbt-wrapper.py'
  launcher=[str(TOOLS/'java'),'-jar',str(source/'scripts/sbt-launch.jar'),'-Dsbt.supershell=false','-Dsbt.server.forcestart=true','-Dsbt.ivy.home='+str(cache/'ivy2'),'-Dsbt.global.base='+str(cache/'sbt'),'-Dsbt.boot.directory='+str(cache/'sbt/boot')]
- command(launcher+['projects'],work/'sbt-projects.log',cwd=source,env=env)
+ command(launcher+['projects'],work/'sbt-projects.log',cwd=driver,env=env)
  ids=re.findall(r'^\[info\]\s+\*?\s+([\w-]+)\s*$',(work/'sbt-projects.log').read_text(),re.M)
  assert 'chipyard' in ids and 'rocketchip' in ids,ids
  settings='set Seq('+', '.join('LocalProject("'+i+'") / target := file("'+str(work/'sbt-targets'/i)+'")' for i in ids)+')'
- wrapper.write_text('import os,sys\nos.execv('+repr(str(TOOLS/'java'))+', '+repr(launcher+[settings])+' + sys.argv[1:])\n')
+ wrapper.write_text('import os,sys\nos.chdir('+repr(str(driver))+')\nos.execv('+repr(str(TOOLS/'java'))+', '+repr(launcher+[settings])+' + sys.argv[1:])\n')
  make=['make','-C',source/'sims/verilator','CONFIG='+config,'EXTRA_CHISEL_OPTIONS=--emit-legacy-sfc','build_dir='+str(work/'generated'),'CLASSPATH_CACHE='+str(work/'classpath'),'SBT='+str(TOOLS/'python')+' '+str(wrapper),'firrtl']
  build=command(make,work/'elaboration.log',cwd=source,env=env,timeout=3600)
  firs=list((work/'generated').glob('*.sfc.fir'));assert len(firs)==1,firs
@@ -88,7 +95,7 @@ def zero_inputs(portlist):
 def observe(text,name,probes):
  a,b,e=module(text,name);body=text[b:e]
  for width,signal in probes.values():
-  if not re.search(r'\b'+re.escape(signal)+r'\b',body):raise ValueError('Missing observation signal '+signal)
+  if not re.search(r'\b'+re.escape(signal.split('.')[0])+r'\b',body):raise ValueError('Missing observation signal '+signal)
  decl=',\n'+',\n'.join('output '+w+' '+n for n,(w,s) in probes.items())+'\n'
  end=e-len('endmodule');assign='\n'+'\n'.join('assign '+n+' = '+s+';' for n,(w,s) in probes.items())+'\n'
  return text[:b]+decl+text[b:end]+assign+text[end:]

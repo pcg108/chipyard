@@ -25,9 +25,9 @@ behavioral cache substitutes or edited functional Verilog are used.
 
 Coverage:
 
-- Rocket trap arbitration: 384 scalar interrupt/illegal-instruction/ECALL
+- Rocket trap arbitration: 384 scalar interrupt/illegal-instruction/instruction-access-fault
   overlaps with external vector retirement or exception writeback, plus 64
-  vector-only exception controls. Check saved PC, cause and first retirement
+  vector-only exception controls and 64 ECALL controls. Check saved PC, cause and first retirement
   after MRET. This is an interface arbitration test with external vector
   writeback stimuli, not a Saturn instruction-stream test.
 - Rocket instruction buffer: 8,640 interrupt arrival/defer/fetch-bubble and
