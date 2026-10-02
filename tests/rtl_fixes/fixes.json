@@ -1,0 +1,27 @@
+[
+  {
+    "repo": "rocket-chip",
+    "patch": "rocket-vector-trap-pc.patch",
+    "commit": "cd67777adabe6e4b028b17f0dfa51b4fd75b26db"
+  },
+  {
+    "repo": "rocket-chip",
+    "patch": "rocket-vector-interrupt-ibuf.patch",
+    "commit": "1182a7b328287146a657edbb9c723a8ae57b3546"
+  },
+  {
+    "repo": "rocket-chip",
+    "patch": "rocket-nbdcache-probe-metadata-interlock.patch",
+    "commit": "2c0e4784c46f1a67ef39699c7d67aef65e3ea8c0"
+  },
+  {
+    "repo": "saturn",
+    "patch": "saturn-cross-page-dependency.patch",
+    "commit": "9e04c8c6c70a4b4db5989f9a16a89679183a5d1d"
+  },
+  {
+    "repo": "shuttle",
+    "patch": "shuttle-fdiv-retirement.patch",
+    "commit": "e789aa207148ade9eaed79f12841102597f5a0a5"
+  }
+]

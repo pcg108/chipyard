@@ -48,7 +48,7 @@
 	url = https://github.com/ucb-bar/rocc-acc-utils.git
 [submodule "generators/rocket-chip"]
 	path = generators/rocket-chip
-	url = https://github.com/chipsalliance/rocket-chip.git
+	url = git@github.com:pcg108/rocket-chip.git
 [submodule "generators/rocket-chip-blocks"]
 	path = generators/rocket-chip-blocks
 	url = https://github.com/chipsalliance/rocket-chip-blocks.git
@@ -57,7 +57,7 @@
 	url = https://github.com/chipsalliance/rocket-chip-inclusive-cache.git
 [submodule "generators/shuttle"]
 	path = generators/shuttle
-	url = https://github.com/ucb-bar/shuttle.git
+	url = git@github.com:pcg108/shuttle.git
 [submodule "generators/testchipip"]
 	path = generators/testchipip
 	url = https://github.com/ucb-bar/testchipip.git
@@ -138,7 +138,7 @@
 	url = https://github.com/ucb-bar/compress-acc.git
 [submodule "generators/saturn"]
 	path = generators/saturn
-	url = https://github.com/ucb-bar/saturn-vectors.git
+	url = git@github.com:pcg108/saturn-vectors.git
 [submodule "software/firesim-paper-workloads"]
 	path = software/firesim-paper-workloads
 	url = https://github.com/firesim/firesim-paper-workloads.git
