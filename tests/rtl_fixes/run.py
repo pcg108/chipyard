@@ -14,6 +14,7 @@ def execute(a):
   config='RTLFixShuttleConfig' if name=='shuttle-fdiv' else 'RTLFixRocketConfig'
   for negative in (False,True):
    out=w/name/('negative' if negative else 'corrected');out.mkdir(parents=True,exist_ok=False)
+   print(f'START {name} negative={negative}',flush=True)
    start=time.monotonic()
    try:
     source=isolated_source(out,fix['repo'],fix['commit']) if negative else ROOT
@@ -30,6 +31,7 @@ def execute(a):
     record={'suite':name,'negative_control':negative,'status':'incomplete' if isinstance(exc,(KeyboardInterrupt,subprocess.TimeoutExpired)) else 'failed','seconds':time.monotonic()-start,'error':repr(exc)}
     write(out/'status.json',record);raise
    write(out/'status.json',record);results.append(record)
+   print(f'PASS {name} negative={negative} seconds={record["seconds"]:.3f}',flush=True)
  write(w/('summary-'+a.suite+'.json'),{'status':'passed','parent_commit':subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),'results':results})
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--suite',choices=['all']+NAMES,default='all');p.add_argument('--work',type=Path,required=True);p.add_argument('--jobs',type=int,default=4);p.add_argument('--guarded-child',action='store_true',help=argparse.SUPPRESS);a=p.parse_args()

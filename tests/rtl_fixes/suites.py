@@ -6,7 +6,7 @@ HERE=Path(__file__).resolve().parent
 ROCKET_PROBES={'dbg_scalar_exception':('','wb_reg_xcpt'),'dbg_interrupt':('','csr_io_interrupt'),'dbg_ibuf_pc':('[39:0]','ibuf_io_pc'),'dbg_exception':('','csr_io_exception'),'dbg_trap_pc':('[39:0]','csr_io_pc'),'dbg_cause':('[63:0]','csr_io_cause'),'dbg_retire':('','wb_valid'),'dbg_retire_pc':('[39:0]','wb_reg_pc')}
 def prepare(sv,work):
  work.mkdir(parents=True,exist_ok=False)
- for n in ['AbstractClockGate.v','plusarg_reader.v']:shutil.copy2(sv.parent/n,work/n)
+ for n in ['EICG_wrapper.v','plusarg_reader.v']:shutil.copy2(sv.parent/n,work/n)
  return sv.read_text()
 def check_run(binary,work,pattern,total,negative=False,extra=()):
  execution=command([binary,*extra],work/'run.log',timeout=600,expect=None)
@@ -46,8 +46,9 @@ def cache_wrapper(s):
  cache,arb=caches[0],arbiters[0]
  probes={'dbg_s2valid':('','s2_valid_masked'),'dbg_s2replay':('','s2_replay'),'dbg_s2addr':('[39:0]','s2_req_addr'),'dbg_s2data':('[63:0]','s2_req_data'),'dbg_s2hit':('','s2_hit'),'dbg_s3valid':('','s3_valid'),'dbg_s3addr':('[39:0]','s3_req_addr'),'dbg_s3data':('[63:0]','s3_req_data'),'dbg_s3way':('[3:0]','s3_way')}
  s=observe(s,cache,probes);cp=ports(s,cache);ap=ports(s,arb);cpd={n:(d,w) for d,w,n in cp};apd={n:(d,w) for d,w,n in ap}
- assert any(n.startswith('io_requestor_2_') for n in apd),'Expected three cache requestors'
- external=cp+[(d,w,n.replace('io_requestor_2_','io_vec_')) for d,w,n in ap if n.startswith('io_requestor_2_')]
+ other='io_requestor_2_' if any(n.startswith('io_requestor_2_') for n in apd) else 'io_requestor_0_'
+ assert any(n.startswith(other) for n in apd),'Missing second requestor'
+ external=cp+[(d,w,n.replace(other,'io_vec_')) for d,w,n in ap if n.startswith(other)]
  wires=[];cc=[];assigns=[];ac=[]
  for d,w,n in cp:
   suffix=n.removeprefix('io_cpu_');mem='io_mem_'+suffix;req='io_requestor_1_'+suffix
@@ -61,12 +62,12 @@ def cache_wrapper(s):
    v='cache_'+n.removeprefix('io_mem_');assert 'io_cpu_'+n.removeprefix('io_mem_') in cpd
   elif n.startswith('io_requestor_1_'):
    v=n.replace('io_requestor_1_','io_cpu_');assert v in cpd
-  elif n.startswith('io_requestor_2_'):v=n.replace('io_requestor_2_','io_vec_')
+  elif n.startswith(other):v=n.replace(other,'io_vec_')
   elif n.startswith('io_requestor_0_'):v="'0" if d=='input' else ''
   else:raise ValueError('Unexpected arbiter port '+n)
   ac.append('.'+n+'('+v+')')
  wrapper='\nmodule ArbitratedCache(\n'+',\n'.join(d+' '+w+n for d,w,n in external)+'\n);\n'+'\n'.join(wires+assigns)+'\n'+cache+' cache(\n'+',\n'.join(cc)+'\n);\n'+arb+' arb(\n'+',\n'.join(ac)+'\n);\nendmodule\n'
- return s+wrapper,external,{'cache_module':cache,'arbiter_module':arb,'wrapper_sha256':__import__('hashlib').sha256(wrapper.encode()).hexdigest()}
+ return s+wrapper,external,{'cache_module':cache,'arbiter_module':arb,'secondary_requestor':other,'wrapper_sha256':__import__('hashlib').sha256(wrapper.encode()).hexdigest()}
 
 def cache(sv,work,jobs,negative):
  s=prepare(sv,work);wrapped,p,selection=cache_wrapper(s);model=work/'observed.sv';model.write_text(wrapped);write(work/'selection.json',selection)

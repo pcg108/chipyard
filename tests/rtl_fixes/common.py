@@ -40,7 +40,7 @@ def elaborate(source,config,work,jobs):
  files=[source/'generators/rocket-chip/src/main/scala/rocket/RocketCore.scala',source/'generators/rocket-chip/src/main/scala/rocket/NBDcache.scala',source/'generators/saturn/src/main/scala/mem/Mem.scala',source/'generators/shuttle/src/main/scala/exu/Core.scala',source/'generators/chipyard/src/main/scala/config/RTLFixConfigs.scala']
  hashes={str(p):sha(p) for p in files}
  if cached.exists():
-  d=json.loads(cached.read_text());assert d['source_hashes']==hashes and sha(d['generated_sv'])==d['generated_sha256'];return Path(d['generated_sv'])
+  d=json.loads(cached.read_text());assert d['source_hashes']==hashes and d.get('preserve_ports') and sha(d['generated_sv'])==d['generated_sha256'];return Path(d['generated_sv'])
  for n in ['tmp','classpath','sbt-targets','generated']:(work/n).mkdir(exist_ok=True)
  env=os.environ.copy();env['PATH']=str(TOOLS)+':'+str(ROOT/'.vecadd-sim/espresso-build')+':'+env['PATH']
  env.update(RISCV=str(ROOT/'.conda-env/riscv-tools'),TMPDIR=str(work/'tmp'),JAVA_TOOL_OPTIONS=f'-Xmx16G -Xss64M -XX:ActiveProcessorCount={jobs} -Djava.io.tmpdir={work / "tmp"}',SBT_OPTS='-Dsbt.supershell=false -Dsbt.server.forcestart=true')
@@ -60,13 +60,14 @@ def elaborate(source,config,work,jobs):
  # Use the same legacy compiler family as the previously validated FireSim RTL;
  # no replacement-memory black boxes or FPGA transforms are needed for these tops.
  sv=work/'generated/generated.sv'
- lower=command([TOOLS/'java','-cp',work/'classpath/chipyard.jar','firrtl2.stage.FirrtlMain','-i',firs[0],'-o',sv,'-X','sverilog','--target-dir',work/'generated'],work/'lowering.log',cwd=source,env=env,timeout=1800)
+ nodce=work/'preserve-ports.anno.json';write(nodce,[{'class':'firrtl2.transforms.NoDCEAnnotation$'}])
+ lower=command([TOOLS/'java','-cp',work/'classpath/chipyard.jar','firrtl2.stage.FirrtlMain','-i',firs[0],'-o',sv,'-X','sverilog','-faf',nodce,'--target-dir',work/'generated'],work/'lowering.log',cwd=source,env=env,timeout=1800)
  assert sv.is_file() and sv.stat().st_size>0
- for name in ['AbstractClockGate.v','plusarg_reader.v']:
+ for name in ['EICG_wrapper.v','plusarg_reader.v']:
   matches=list((source/'generators/rocket-chip/src/main/resources').rglob(name));assert len(matches)==1,(name,matches)
   import shutil
   shutil.copy2(matches[0],sv.parent/name)
- write(cached,{'source':str(source),'config':config,'source_hashes':hashes,'generated_sv':str(sv),'generated_sha256':sha(sv),'scala_build':build,'lowering':lower})
+ write(cached,{'source':str(source),'config':config,'preserve_ports':True,'source_hashes':hashes,'generated_sv':str(sv),'generated_sha256':sha(sv),'scala_build':build,'lowering':lower})
  return sv
 
 def module(text,name):
@@ -92,12 +93,30 @@ def observe(text,name,probes):
  end=e-len('endmodule');assign='\n'+'\n'.join('assign '+n+' = '+s+';' for n,(w,s) in probes.items())+'\n'
  return text[:b]+decl+text[b:end]+assign+text[end:]
 
+def select_modules(text,top):
+ """Extract whole generated modules in the top's dependency closure unchanged."""
+ matches=list(re.finditer(r'^module (\w+)\s*\(',text,re.M));modules={}
+ for match in matches:
+  end=text.index('endmodule',match.end())+len('endmodule')
+  modules[match.group(1)]=text[match.start():end]
+ pending=[top];selected=set()
+ instance=re.compile(r'^\s*(\w+)\s+(?:#\([^;]*?\)\s*)?\w+\s*\(',re.M)
+ while pending:
+  name=pending.pop()
+  if name in selected:continue
+  selected.add(name)
+  for kind in instance.findall(modules[name]):
+   if kind in modules and kind not in selected:pending.append(kind)
+ return '\n\n'.join(modules[n] for n in modules if n in selected)+'\n',sorted(selected)
+
 def compile_model(sv,work,top,prefix,driver,jobs,*,assertions=True):
  import shutil
  work.mkdir(parents=True,exist_ok=True);shutil.copy2(driver,work/'test.cpp')
- for n in ['AbstractClockGate.v','plusarg_reader.v']:
+ for n in ['EICG_wrapper.v','plusarg_reader.v']:
   src=sv.parent/n
   if src.resolve()!=(work/n).resolve():shutil.copy2(src,work/n)
- args=['nice','-n','10',TOOLS/'verilator','--cc','--exe','--build','-j',str(jobs),'--top-module',top,'--prefix',prefix,'-Wno-fatal','-DPRINTF_COND=0','--Mdir',work/'build',sv,work/'AbstractClockGate.v',work/'plusarg_reader.v',work/'test.cpp']
+ selected,names=select_modules(sv.read_text(),top);compile_sv=work/'selected.sv';compile_sv.write_text(selected)
+ write(work/'module-selection.json',{'source':str(sv),'source_sha256':sha(sv),'selected_sha256':sha(compile_sv),'modules':names})
+ args=['nice','-n','10',TOOLS/'verilator','--cc','--exe','--build','-j',str(jobs),'--top-module',top,'--prefix',prefix,'-Wno-fatal','-DPRINTF_COND=0','--Mdir',work/'build',compile_sv,work/'EICG_wrapper.v',work/'plusarg_reader.v',work/'test.cpp']
  if assertions:args.insert(4,'--assert')
  b=command(args,work/'build.log',timeout=1800);return work/'build'/prefix,b
