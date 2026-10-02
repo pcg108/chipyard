@@ -29,7 +29,7 @@ def rocket(sv,work,jobs,negative,trap=False):
   log=(work/'run.log').read_text();rows=re.findall(r'TRAP_MISMATCH timing=(\d+) mode=(\d+) wbkind=(\d+) expected=([0-9a-f]+) actual=([0-9a-f]+) cause=([0-9a-f]+)',log)
   assert len(rows)==result['checks_failed'] and result['checks_passed']>=128
   assert all(int(mode)<3 and int(actual,16)==0x80000040 and int(cause,16)==[0x8000000000000007,2,1][int(mode)] for t,mode,k,expected,actual,cause in rows),'Negative control did not isolate stale vector PC'
- result.update(build=build,generated_sha256=sha(sv),driver_sha256=sha(driver));write(work/'result.json',result);return result
+ result.update(build=build,generated_sha256=sha(sv),driver_sha256=sha(work/'test.cpp'));write(work/'result.json',result);return result
 
 def saturn(sv,work,jobs,negative):
  work.mkdir(parents=True,exist_ok=False);results=[]
@@ -38,7 +38,7 @@ def saturn(sv,work,jobs,negative):
   driver=HERE/'saturn_mem_order'/('page_bounds_extended.cpp' if extended else 'page_bounds.cpp')
   binary,build=compile_model(sv,out,'VectorMemUnit','VMem',driver,jobs)
   result=check_run(binary,out,r'^SATURN_PAGE_BOUNDS checks=(\d+) passed=(\d+) failed=(\d+)$',total,negative)
-  result.update(build=build,generated_sha256=sha(sv),driver_sha256=sha(driver));write(out/'result.json',result);results.append(result)
+  result.update(build=build,generated_sha256=sha(sv),driver_sha256=sha(out/'test.cpp'));write(out/'result.json',result);results.append(result)
  write(work/'result.json',{'passed':True,'negative_control':negative,'cases':results});return results
 
 def cache_wrapper(s):
@@ -90,7 +90,7 @@ def cache(sv,work,jobs,negative):
    elif negative:ok=execution['exit_code']==1 and counts['failures']>0 and counts['failures']==counts['expected_failures'] and 'counter expected 1 actual 0' in log
    else:ok=execution['exit_code']==0 and counts['failures']==0
    ok=ok and counts['tests']==total
-   result={'suite':name,'mode':label,'passed':ok,'negative_control':negative,'counts':counts,'build':build,'execution':execution,'generated_sha256':sha(sv),'driver_sha256':sha(HERE/'cache'/(name+'.cpp'))};results.append(result);write(work/'result.json',{'passed':all(x['passed'] for x in results),'cases':results})
+   result={'suite':name,'mode':label,'passed':ok,'negative_control':negative,'counts':counts,'build':build,'execution':execution,'generated_sha256':sha(sv),'driver_sha256':sha(out/'test.cpp')};results.append(result);write(work/'result.json',{'passed':all(x['passed'] for x in results),'cases':results})
    if not ok:raise RuntimeError('Cache gate failed: '+str(out)+' '+label)
  return results
 
@@ -112,4 +112,4 @@ def shuttle(sv,work,jobs,negative):
   rows=re.findall(r'SHUTTLE_CASE reject=(\d+) sqrt=(\d+) bubbles=(\d+) expected=([0-9a-f]+) actual=([0-9a-f]+) traps=(\d+) pass=(\d+)',(work/'run.log').read_text())
   assert len(rows)==12,'Incomplete bare-metal control cases'
   assert all(ok=='1' or (reject=='1' and traps=='1' and actual!=expected) for reject,sqrt,bubbles,expected,actual,traps,ok in rows),'Unexpected negative-control failure'
- result.update(build=build,firmware=firmware,generated_sha256=sha(sv),driver_sha256=sha(driver));write(work/'result.json',result);return result
+ result.update(build=build,firmware=firmware,generated_sha256=sha(sv),driver_sha256=sha(work/'test.cpp'));write(work/'result.json',result);return result

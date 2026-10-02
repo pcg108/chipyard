@@ -20,6 +20,8 @@ struct Sim {
  void event(std::string s){std::string l=std::to_string(cy)+" "+s;if(verbose)std::cout<<l<<"\n";log.push_back(l);if(log.size()>400)log.pop_front();}
  Sim(int lat,bool ex,bool v=false):delay(lat),exclusive(ex),verbose(v){
  #include "zero_inputs.h"
+ // Explicit legal Probe opcode and beat mask, including otherwise unused ports.
+ d.auto_out_b_bits_opcode=6;d.auto_out_b_bits_mask=0xffff;
  d.io_cpu_req_bits_phys=0;d.io_cpu_req_bits_dprv=3;d.io_ptw_req_ready=1;d.auto_out_c_ready=1;d.auto_out_e_ready=1;
  mem[COUNTER+8]=0x88429800;mem[COUNTER+12]=0;
  d.reset=1;for(int i=0;i<10;i++)step();d.reset=0;for(int i=0;i<100;i++)step();log.clear();
