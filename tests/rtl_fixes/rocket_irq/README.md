@@ -1,28 +1,30 @@
-# Rocket vector interrupt return-PC regression
+# Rocket trap and interrupt regressions
 
-Run `run_rtl.py --generated-sv /absolute/FireSim-generated.sv --work /new/scratch/output`.
-Use `--expect-failure` only on the preserved hardware's generated RTL.
+From the Chipyard root:
 
-This compiles the actual generated Rocket module and its CSR/IBuf dependencies
-with Verilator. Added outputs only observe existing signals; core logic is not
-replaced. The fixture drives Saturn's real `block_all` and `trap_check_busy`
-interface inputs to defer interrupt acceptance. It executes CSR setup, a linear
-instruction stream, an interrupt handler, and MRET. The expected return address
-comes from the last committed instruction, independently of speculative fetch
-or instruction-buffer pointers.
+```sh
+python3 tests/rtl_fixes/run.py --suite rocket-interrupt --work /scratch/rocket-interrupt-new --jobs 4
+python3 tests/rtl_fixes/run.py --suite rocket-trap-pc --work /scratch/rocket-trap-pc-new --jobs 4
+```
 
-The 8,640 cases cover 64 interrupt arrival cycles, nine stall durations
-(including zero), five instruction layouts, and three instruction-fetch bubble
-patterns. Layouts include aligned 32-bit, compressed 16-bit, and three mixed or
-straddled streams. Every instruction fetch supplies its aligned 32-bit word;
-the return-PC oracle decodes the instruction length at the last committed PC.
-Each case checks trap delivery, the saved trap PC, and the first retired
-instruction after MRET. The mixed-width cases reproduce a deadlock in the first
-candidate that the earlier 432 aligned/compressed cases missed: IBuf must still
-accept a fetch half when its output instruction is incomplete, even while an
-interrupt is pending. This isolates the Rocket frontend protocol; it does not simulate
-Saturn's vector datapath or replace the FPGA copy/pipeline acceptance tests.
+Each suite elaborates Scala and runs corrected and isolated negative-control
+versions. Generated core logic is unchanged; added outputs only observe signals.
 
-The initial comparison used a directly edited generated ready expression while
-Scala elaboration ran. Final acceptance must rerun this test on the fresh,
-unmodified generated RTL from the candidate Scala source.
+`interrupt_pc.cpp` drives the vector backend's `block_all` and `trap_check_busy`
+inputs to defer interrupt acceptance. Its 8,640 cases cover 64 arrival cycles,
+nine defer durations, five aligned/compressed/straddled instruction layouts, and
+three fetch-bubble patterns. The architectural return oracle is the last
+committed PC plus that instruction's decoded length. Every case checks trap
+arrival and the first retirement after MRET. Incomplete split instructions must
+still assemble while an interrupt is pending, or these cases detect deadlock.
+
+`trap_pc.cpp` tests 384 scalar interrupt/illegal-instruction/instruction-access-
+fault overlaps with stale vector retirement or exception writeback. Another 64
+vector-only exceptions and 64 ECALL controls check the unaffected paths. It
+checks PC/cause selection, the actual saved CSR values, and return instruction.
+ECALL controls observe the CSR-generated trap path; they do not inject vector
+writeback. This is an interface arbitration test, not a vector program.
+
+Both fixtures execute the real Rocket decode, CSR and instruction-buffer logic.
+The external instruction frontend and vector interface are test stimuli. No OS,
+full SoC, or FPGA behavior is claimed by these focused tests.

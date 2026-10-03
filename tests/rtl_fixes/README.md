@@ -50,8 +50,7 @@ kernel OOM kill. Memory PSI only warns. A guard stop creates a persistent latch
 and does not restart. Missing result markers, timeouts and interruptions never
 pass. Runtime limits are bounded per compilation and fixture.
 
-The imported `rocket_irq/run_rtl.py` and `saturn_mem_order/run_rtl.py` are retained
-historical harnesses. Use the top-level runner for main-tree acceptance.
+The top-level runner is the supported entry point for all five suites.
 
 Validation remains pending until the committed validation report contains the
 final tested revisions and all required corrected/negative outcomes.
