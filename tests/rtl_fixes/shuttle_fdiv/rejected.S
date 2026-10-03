@@ -56,3 +56,8 @@ trap:
  addi t0,t0,4
  csrw mepc,t0
  mret
+ // The external frontend may fetch beyond MRET before the redirect reaches it.
+ // Keep that speculative fetch inside the executable test image.
+ .rept 16
+ nop
+ .endr
