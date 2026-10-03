@@ -54,5 +54,5 @@ pass. Runtime limits are bounded per compilation and fixture.
 
 The top-level runner is the supported entry point for all five suites.
 
-Validation remains pending until the committed validation report contains the
-final tested revisions and all required corrected/negative outcomes.
+Completed results, exact source/RTL hashes and negative-control outcomes are
+recorded in [VALIDATION.md](VALIDATION.md) and [validation-summary.json](validation-summary.json).
