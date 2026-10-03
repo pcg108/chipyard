@@ -12,7 +12,8 @@ _start:
  // A preceding divide leaves recognizable FP pipeline operands.
  li t0,0x3ff0000000000000
  fmv.d.x fs0,t0
- fmv.d.x fs1,zero
+ li t0,0x4008000000000000 /* 3.0: nontrivial finite preceding divide */
+ fmv.d.x fs1,t0
  fdiv.d ft0,fs0,fs1
  frflags t0
 #if SQRT

@@ -41,7 +41,9 @@ Coverage:
 - Shuttle: bare-metal FDIV/FSQRT with FP disabled must trap and preserve a seeded
   destination. Legal divide/square-root controls must produce their exact
   expected values. Three frontend bubble patterns produce twelve cases.
-  Instruction responses drive the real ShuttleCore frontend interface; the
+  Negative cases record a forbidden FP writeback before its assertion edge;
+  corrected cases must complete final destination readback. Assertions stay
+  enabled. Instruction responses drive the real ShuttleCore frontend interface; the
   actual decoder, CSR logic, FP registers and divider run without an OS.
 
 Tests run sequentially at low priority with at most four workers. The guard

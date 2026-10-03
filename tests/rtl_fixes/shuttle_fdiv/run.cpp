@@ -25,6 +25,14 @@ static bool run(const char* file,bool reject,bool sqrt,unsigned bubbles) {
   d.io_imem_resp_0_bits_next_pc_valid=1;d.io_imem_resp_0_bits_next_pc_bits=pc+4;
   d.eval();
   if(d.dbg_exception){++traps;if(d.dbg_cause!=2||!reject){printf("BAD_TRAP cause=%lx\n",uint64_t(d.dbg_cause));return false;}}
+  // Stop this negative-control case at the first forbidden writeback, before
+  // its rising edge triggers the core's own CSR/scoreboard assertions. Those
+  // assertions remain enabled. Corrected cases execute through final readback.
+  if(reject&&traps==1&&d.dbg_ll_write&&d.dbg_ll_addr==10&&d.dbg_fp_ready) {
+   bool changed=false;for(unsigned i=0;i<3;++i)changed|=d.dbg_ll_data[i]!=d.dbg_fp_dest[i];
+   printf("SHUTTLE_FORBIDDEN_WRITE reject=1 sqrt=%u bubbles=%u target=10 ready=1 changed=%u traps=1 cycle=%u before=%x:%08x:%08x proposed=%x:%08x:%08x\n",sqrt,bubbles,changed,cycle,d.dbg_fp_dest[2],d.dbg_fp_dest[1],d.dbg_fp_dest[0],d.dbg_ll_data[2],d.dbg_ll_data[1],d.dbg_ll_data[0]);
+   return false;
+  }
   if(d.dbg_done) {
    uint64_t expected=reject?0x4022000000000000ULL:sqrt?0x4000000000000000ULL:0x400c000000000000ULL;
    bool ok=d.dbg_result==expected&&traps==unsigned(reject)&&d.dbg_trap_count==unsigned(reject);

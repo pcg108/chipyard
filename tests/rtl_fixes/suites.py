@@ -96,7 +96,7 @@ def cache(sv,work,jobs,negative):
 
 def shuttle(sv,work,jobs,negative):
  s=prepare(sv,work)
- probes={'dbg_exception':('','csr_io_exception'),'dbg_cause':('[63:0]','csr_io_cause'),'dbg_done':('[63:0]','iregfile_31'),'dbg_result':('[63:0]','iregfile_10'),'dbg_trap_count':('[63:0]','iregfile_18')}
+ probes={'dbg_ll_write':('','ll_fp_wval'),'dbg_ll_addr':('[4:0]','ll_fp_waddr'),'dbg_ll_data':('[64:0]','ll_fp_wdata'),'dbg_fp_dest':('[64:0]','fregfile_10'),'dbg_fp_ready':('','fsboard_10'),'dbg_exception':('','csr_io_exception'),'dbg_cause':('[63:0]','csr_io_cause'),'dbg_done':('[63:0]','iregfile_31'),'dbg_result':('[63:0]','iregfile_10'),'dbg_trap_count':('[63:0]','iregfile_18')}
  s=observe(s,'ShuttleCore',probes);(work/'observed.sv').write_text(s);(work/'zero_inputs.h').write_text(zero_inputs(ports(s,'ShuttleCore')))
  prefix=ROOT/'.conda-env/riscv-tools/bin/riscv64-unknown-elf-';bins=[];firmware=[]
  for reject in (0,1):
@@ -110,6 +110,7 @@ def shuttle(sv,work,jobs,negative):
  result=check_run(binary,work,r'^SHUTTLE_FDIV cases=(\d+) passed=(\d+) failed=(\d+)$',12,negative,bins)
  if negative:
   rows=re.findall(r'SHUTTLE_CASE reject=(\d+) sqrt=(\d+) bubbles=(\d+) expected=([0-9a-f]+) actual=([0-9a-f]+) traps=(\d+) pass=(\d+)',(work/'run.log').read_text())
-  assert len(rows)==12,'Incomplete bare-metal control cases'
+  illegal=re.findall(r'SHUTTLE_FORBIDDEN_WRITE reject=1 sqrt=(\d+) bubbles=(\d+) target=10 ready=1 changed=1 traps=1', (work/'run.log').read_text())
+  assert len(rows)+len(illegal)==12 and len(illegal)==result['checks_failed'],'Incomplete bare-metal control cases'
   assert all(ok=='1' or (reject=='1' and traps=='1' and actual!=expected) for reject,sqrt,bubbles,expected,actual,traps,ok in rows),'Unexpected negative-control failure'
  result.update(build=build,firmware=firmware,generated_sha256=sha(sv),driver_sha256=sha(work/'test.cpp'));write(work/'result.json',result);return result

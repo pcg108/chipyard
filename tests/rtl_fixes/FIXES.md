@@ -69,3 +69,10 @@ Run `--suite shuttle-fdiv`. The bare-metal program seeds the destination with
 handler, and waits long enough to expose a stray completion. It also checks
 legal 7.0/2.0 and sqrt(4.0) results. No interrupt masking workaround or OS is
 part of this fix.
+
+The assertion-enabled uncorrected Shuttle also trips CSR/FP-scoreboard assertions
+on the stray completion. The final negative fixture observes that forbidden
+writeback to an idle destination before the active clock edge and terminates the
+failing case normally. It records the different proposed data; it does not
+disable assertions or claim a completed architectural overwrite. Corrected
+cases still run through the handler and final destination readback.
