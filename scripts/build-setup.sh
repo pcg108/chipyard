@@ -163,6 +163,12 @@ if run_step "1"; then
       LOCKFILE=$CONDA_LOCK_REQS/conda-requirements-$TOOLCHAIN_TYPE-linux-64-lean.conda-lock.yml
     fi
 
+    # Check before creating either environment: conda-lock 2.5.7 only prints
+    # generic help when its input file is missing.
+    if [ "$USE_UNPINNED_DEPS" = false ] && [ ! -f "$LOCKFILE" ]; then
+        die "Missing packaged Conda lockfile: $LOCKFILE. Restore the file from this Chipyard revision before retrying."
+    fi
+
     # create conda-lock only environment to be used in this section.
     # done with cloning base then installing conda lock to speed up dependency solving.
     CONDA_LOCK_ENV_PATH=$CYDIR/.conda-lock-env
@@ -206,7 +212,7 @@ conda environment or \`source env.sh\` and skip this step with \`-s 1\`." >&2
     fi
     echo "Storing main conda environment in $CONDA_ENV_NAME"
 
-    conda-lock install --conda $CONDA_EXE $CONDA_ENV_ARG $LOCKFILE &&
+    conda-lock install --conda "$CONDA_EXE" $CONDA_ENV_ARG "$LOCKFILE" &&
     ## If the above line errors in your environment, you can try the line below
     # conda-lock install --conda $(which conda) $CONDA_ENV_ARG $LOCKFILE &&
     source $(conda info --base)/etc/profile.d/conda.sh &&
