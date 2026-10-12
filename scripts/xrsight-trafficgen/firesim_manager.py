@@ -24,6 +24,8 @@ def main():
              'CCACHE_DIR','COURSIER_CACHE','SBT_OPTS','FS_DIR','CY_DIR','RISCV','PATH',
              'FIRESIM_ENV_SOURCED','FIRESIM_SOURCED']
     env.shell_env = {key: os.environ[key] for key in names if key in os.environ}
+    # Honor the existing localhost identity used by noninteractive OpenSSH.
+    env.use_ssh_config = True
     env.abort_on_prompts = True
     deploy = args.chipyard.resolve() / 'sims/firesim/deploy'
     os.chdir(deploy)
