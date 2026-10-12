@@ -1,0 +1,16 @@
+{
+  "build_farm": {
+    "base_recipe": "build-farm-recipes/externally_provisioned.yaml",
+    "recipe_arg_overrides": {
+      "default_build_dir": "/scratch/prashanth_xrsight_trafficgen_20261011/builds",
+      "build_farm_hosts": [
+        "localhost"
+      ]
+    }
+  },
+  "builds_to_run": [
+    "alveo_u250_quad_rocket_dual_gemmini_saturn_trafficgen_abi3"
+  ],
+  "agfis_to_share": [],
+  "share_with_accounts": {}
+}

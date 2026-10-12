@@ -1,0 +1,75 @@
+diff --git a/design/craft/inclusivecache/src/Directory.scala b/design/craft/inclusivecache/src/Directory.scala
+index b82011a..b38945f 100644
+--- a/design/craft/inclusivecache/src/Directory.scala
++++ b/design/craft/inclusivecache/src/Directory.scala
+@@ -24,6 +24,7 @@ import freechips.rocketchip.diplomacy._
+ import freechips.rocketchip.tilelink._
+ import MetaData._
+ import chisel3.experimental.dataview._
++import chisel3.util.experimental.BoringUtils
+ import freechips.rocketchip.util.DescribedSRAM
+ 
+ class DirectoryEntry(params: InclusiveCacheParameters) extends InclusiveCacheBundle(params)
+@@ -137,6 +138,18 @@ class Directory(params: InclusiveCacheParameters) extends Module
+   io.result.bits.hit := hit || (setQuash && tagMatch && bypass.data.state =/= INVALID)
+   io.result.bits.way := Mux(hit, OHToUInt(hits), Mux(setQuash && tagMatch, bypass.way, victimWay))
+ 
++  if (params.p(InclusiveCacheTrafficGenTraceCycles) > 0) {
++    val traceActive = Wire(Bool())
++    val traceCycle = Wire(UInt(64.W))
++    traceActive := false.B
++    traceCycle := 0.U
++    BoringUtils.addSink(traceActive, "trafficgen_trace_active")
++    BoringUtils.addSink(traceCycle, "trafficgen_trace_cycle")
++    when(traceActive && (io.read.valid || io.result.valid || io.write.valid)) {
++      printf(p"[TGTRACE][DIRECTORY] cycle=${traceCycle} read=${io.read.valid} set=${io.read.bits.set} tag=0x${Hexadecimal(io.read.bits.tag)} result=${io.result.valid} hit=${io.result.bits.hit} way=${io.result.bits.way} victim=${victimWay} hits=0x${Hexadecimal(hits)} write=${io.write.valid} write_set=${io.write.bits.set} write_way=${io.write.bits.way} write_state=${io.write.bits.data.state}\n")
++    }
++  }
++
+   params.ccover(ren2 && setQuash && tagMatch, "DIRECTORY_HIT_BYPASS", "Bypassing write to a directory hit")
+   params.ccover(ren2 && setQuash && !tagMatch && wayMatch, "DIRECTORY_EVICT_BYPASS", "Bypassing a write to a directory eviction")
+ 
+diff --git a/design/craft/inclusivecache/src/Parameters.scala b/design/craft/inclusivecache/src/Parameters.scala
+index 9f3f918..3f05950 100644
+--- a/design/craft/inclusivecache/src/Parameters.scala
++++ b/design/craft/inclusivecache/src/Parameters.scala
+@@ -27,6 +27,8 @@ import freechips.rocketchip.util._
+ import freechips.rocketchip.util.property.cover
+ import scala.math.{min,max}
+ 
++case object InclusiveCacheTrafficGenTraceCycles extends Field[Int](0)
++
+ case class CacheParameters(
+   level:       Int,
+   ways:        Int,
+diff --git a/design/craft/inclusivecache/src/Scheduler.scala b/design/craft/inclusivecache/src/Scheduler.scala
+index 06de3b5..99a3b0e 100644
+--- a/design/craft/inclusivecache/src/Scheduler.scala
++++ b/design/craft/inclusivecache/src/Scheduler.scala
+@@ -23,6 +23,7 @@ import freechips.rocketchip.diplomacy.AddressSet
+ import freechips.rocketchip.tilelink._
+ import freechips.rocketchip.util._
+ import chisel3.experimental.dataview._
++import chisel3.util.experimental.BoringUtils
+ 
+ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Module
+ {
+@@ -261,6 +262,18 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
+   request.ready := request_alloc_cases || (queue && (bypassQueue || requests.io.push.ready))
+   val alloc_uses_directory = request.valid && request_alloc_cases
+ 
++  if (params.p(InclusiveCacheTrafficGenTraceCycles) > 0) {
++    val traceActive = Wire(Bool())
++    val traceCycle = Wire(UInt(64.W))
++    traceActive := false.B
++    traceCycle := 0.U
++    BoringUtils.addSink(traceActive, "trafficgen_trace_active")
++    BoringUtils.addSink(traceCycle, "trafficgen_trace_cycle")
++    when(traceActive && request.valid) {
++      printf(p"[TGTRACE][SCHEDULER] cycle=${traceCycle} ready=${request.ready} set=${request.bits.set} tag=0x${Hexadecimal(request.bits.tag)} prio=0x${Hexadecimal(request.bits.prio.asUInt)} alloc=${alloc} queue=${queue} block_b=${blockB} block_c=${blockC} nest_b=${nestB} nest_c=${nestC} dir=${alloc_uses_directory || mshr_uses_directory} mshr_valid=0x${Hexadecimal(mshr_validOH)}\n")
++    }
++  }
++
+   // When a request goes through, it will need to hit the Directory
+   directory.io.read.valid := mshr_uses_directory || alloc_uses_directory
+   directory.io.read.bits.set := Mux(mshr_uses_directory_for_lb, scheduleSet,          request.bits.set)
