@@ -26,6 +26,6 @@
     "lane_assignment": "passed",
     "synthetic_scheduler_8_iterations": "passed",
     "combined_target_metasimulation": "passed",
-    "bitstream": "resource_stopped_at_64_GiB_during_leaf_clock_delay_optimization"
+    "bitstream": "passed_final_timing_and_routing"
   }
 }
