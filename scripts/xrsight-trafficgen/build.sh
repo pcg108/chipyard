@@ -18,7 +18,10 @@ make_args=(-C "$FS_DIR/sim" PLATFORM=xilinx_alveo_u250 TARGET_PROJECT=firesim
   "VERILATOR_MAKEFLAGS=-j4 VM_PARALLEL_BUILDS=1")
 case "$stage" in
   elaborate) command=(make "${make_args[@]}" verilog) ;;
-  metasim) command=(make "${make_args[@]}" verilator) ;;
+  # Stock Gemmini emits a narrow unsigned divisor; Saturn emits comparisons
+  # that specialize to constants. Neither changes the intended arithmetic.
+  metasim) command=(make "${make_args[@]}"
+    "EXTRA_VERILATOR_FLAGS=-Wno-WIDTHEXPAND -Wno-UNSIGNED" verilator) ;;
   driver) command=(make "${make_args[@]}" xilinx_alveo_u250) ;;
   bitstream) command=(python3 "$pkg/firesim_manager.py" --chipyard "$root" --
     buildbitstream -b "$pkg/config_build.yaml" -r "$pkg/config_build_recipes.yaml"
