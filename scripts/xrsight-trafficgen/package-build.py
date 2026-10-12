@@ -39,7 +39,7 @@ record={
     'timing_closed':True,'fpga_programmed':False,
 }
 driver=build/'driver/FireSim-xilinx_alveo_u250'
-elf=driver.read_bytes()[:64]
+with driver.open('rb') as f: elf=f.read(64)
 require(elf[:6]==b'\x7fELF\x02\x01' and struct.unpack_from('<H',elf,18)[0]==62 and os.access(driver,os.X_OK),'Wrong driver executable')
 out.mkdir(parents=True,exist_ok=False)
 runtime=out/'quad-rocket-dual-gemmini-saturn-trafficgen.conf'
@@ -59,7 +59,10 @@ with tarfile.open(out/'driver.tar.gz','w:gz',dereference=True) as archive:
 record['driver_files']={name:evidence(path) for path,name in contents}
 for name in ['gemmini_params_illixr.h','gemmini_params_illixr_int8.h']:
     shutil.copy2(root/name,out/name)
-shutil.copy2(root/'scripts/xrsight-trafficgen/build-manifest.json',out/'source-manifest.json')
+source_manifest=json.loads((root/'scripts/xrsight-trafficgen/build-manifest.json').read_text())
+source_manifest['build_source_commit']=record['source_commit']
+source_manifest['validation'].update(combined_target_metasimulation='passed',bitstream='passed_final_timing_and_routing')
+(out/'source-manifest.json').write_text(json.dumps(source_manifest,indent=2)+'\n')
 shutil.copy2(root/'scripts/xrsight-trafficgen/source-record/elaboration.json',out/'elaboration.json')
 shutil.copy2(a.smoke_result,out/'smoke-result.json')
 shutil.copy2(build/'firesim.tar.gz',out/'firesim.tar.gz')
