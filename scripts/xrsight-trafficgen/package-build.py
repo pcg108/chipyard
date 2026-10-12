@@ -78,5 +78,9 @@ runtime_dest.parent.mkdir(parents=True,exist_ok=True)
 if runtime_dest.exists(): require(runtime_dest.read_bytes()==runtime.read_bytes(),'Conflicting runtime config')
 else: shutil.copy2(runtime,runtime_dest)
 alias='alveo_u250_quad_rocket_dual_gemmini_saturn_trafficgen_abi3'
-(out/'config_hwdb.yaml').write_text(json.dumps({alias:{'bitstream_tar':(out/'firesim.tar.gz').as_uri(),'deploy_quintuplet_override':None,'custom_runtime_config':runtime.name}},indent=2)+'\n')
+(out/'config_hwdb.yaml').write_text(json.dumps({alias:{
+    'bitstream_tar':(out/'firesim.tar.gz').as_uri(),
+    'driver_tar':(out/'driver.tar.gz').as_uri(),
+    'deploy_quintuplet_override':None,'custom_runtime_config':runtime.name,
+}},indent=2)+'\n')
 print(out/'hardware.json')
