@@ -1,5 +1,7 @@
 package chipyard.stage.phases
 
+import java.io.{BufferedWriter, File, FileWriter, Writer}
+
 import circt.stage.{ChiselStage, CIRCTTargetAnnotation, CIRCTTarget}
 import firrtl.options.PhaseManager.PhaseDependency
 import firrtl.options.{Shell}
@@ -8,6 +10,14 @@ import firrtl.{AnnotationSeq}
 import firrtl.stage.{FirrtlCircuitAnnotation}
 import firrtl.options.{Phase, PhaseManager, Shell, Stage, StageError, StageMain, Dependency, StageOptions}
 import chipyard.stage._
+
+private[stage] object LegacyFirrtl2Emission {
+  def emitCircuit(circuit: firrtl2.ir.Circuit, writer: Writer): Unit = {
+    // The ordinary ChirrtlEmitter materializes the entire circuit as one String,
+    // which exceeds the JVM array limit for sufficiently large targets.
+    firrtl2.ir.Serializer.lazily(circuit).foreach(writer.write)
+  }
+}
 
 final class LegacyFirrtl2Emission extends Phase with PreservesAll with HasChipyardStageUtils {
   override val prerequisites = Seq(Dependency[chipyard.stage.ChipyardChiselStage])
@@ -19,13 +29,9 @@ final class LegacyFirrtl2Emission extends Phase with PreservesAll with HasChipya
     val annos = annotations.filterNot(_.isInstanceOf[firrtl.options.TargetDirAnnotation])
 
     val converted = firrtl2.bridge.ChiselBridge.annosToState(annos)
-    val emitter = new firrtl2.ChirrtlEmitter
-    val circuit = converted.copy(annotations = converted.annotations ++ Seq(
-      firrtl2.EmitCircuitAnnotation(classOf[firrtl2.ChirrtlEmitter])
-    ))
-    val emitted = emitter.execute(circuit)
-    val emittedCircuit = emitted.annotations.collectFirst { case firrtl2.EmittedFirrtlCircuitAnnotation(circuit) => circuit }.get
-    writeOutputFile(targetDir, fileName, emittedCircuit.value)
+    val writer = new BufferedWriter(new FileWriter(new File(targetDir, fileName)))
+    try LegacyFirrtl2Emission.emitCircuit(converted.circuit, writer)
+    finally writer.close()
 
     annotations
   }

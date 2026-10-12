@@ -1,0 +1,31 @@
+{
+  "base_chipyard": "974da28f4",
+  "xrsight_source": "/home/prashanth/illixr_example_zephyr",
+  "xrsight_revision": "5d3c912ed912c08a9e646279b15b4b48b680f879",
+  "source_checkouts": {
+    ".": "974da28f4dd76b2d063e02e19d745b8d2e40c98b",
+    "generators/rocket-chip": "2c0e4784c46f1a67ef39699c7d67aef65e3ea8c0",
+    "generators/saturn": "9e04c8c6c70a4b4db5989f9a16a89679183a5d1d",
+    "generators/shuttle": "e789aa207148ade9eaed79f12841102597f5a0a5",
+    "generators/gemmini": "8d6d83b7a68f30ab971c8a4e78083f2bda1c9c92",
+    "generators/rocket-chip-inclusive-cache": "9242577cfa92e7c8f411ffa724ce55cf87bb9063",
+    "sims/firesim": "7dd0b16ec97c0d02efcb47aa431d9a949dbb026b"
+  },
+  "toolchain": {
+    "vivado": "2022.1",
+    "gcc": "13.2.0"
+  },
+  "target": "FireSimQuadRocketDualGemminiSaturnTrafficGenConfig",
+  "fpga_mhz": 30,
+  "build_strategy": "NORETIMING",
+  "artifact_root": "/scratch/prashanth_xrsight_trafficgen_20261011",
+  "validation": {
+    "trafficgen_protocol_v2": "passed",
+    "trafficgen_driver_sessions": "passed",
+    "bundle_recovery": "passed",
+    "lane_assignment": "passed",
+    "synthetic_scheduler_8_iterations": "passed",
+    "combined_target_metasimulation": "pending",
+    "bitstream": "pending"
+  }
+}

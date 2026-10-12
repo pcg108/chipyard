@@ -1,0 +1,21 @@
+{
+  "revision": "5d3c912ed912c08a9e646279b15b4b48b680f879",
+  "files": {
+    "array.c": {
+      "source": "tests/gemmini_dispatch/array.c",
+      "sha256": "c8b1e9844a86b0bd35743ff4b4f0ba8cd70242bf8cdc5b6ee92dfdb6014e5449"
+    },
+    "vendor/gemmini.h": {
+      "source": "third_party/ritnet/port/include/gemmini.h",
+      "sha256": "f86ff97be14ca4874c740b83b34382f049c9dcf62ad1997c7c5970594144f2c1"
+    },
+    "vendor/include/gemmini_counter.h": {
+      "source": "third_party/ritnet/port/include/gemmini_counter.h",
+      "sha256": "5826242287784b9a383d45fdcb6791f8a1651d9d320a1a5f011585a9885b5669"
+    },
+    "vendor/rocc-software/src/xcustom.h": {
+      "source": "third_party/ritnet/port/rocc-software/src/xcustom.h",
+      "sha256": "9582eb00cee774e4680fde6408a0d607bba85196a0a4fd803f7b7ddd801aad69"
+    }
+  }
+}
