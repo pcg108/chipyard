@@ -52,7 +52,12 @@ runtime.write_text('\n'.join(args)+'\n')
 sys.path.insert(0,str(root/'sims/firesim/deploy'))
 from runtools.utils import get_local_shared_libraries
 contents=[(driver,driver.name),(runtime,runtime.name)]
-contents += [(Path(path),name) for path,name in get_local_shared_libraries(str(driver))]
+# FireSim's helper queries /usr/lib paths, but this host's libc package records
+# /lib paths. Resolve both spellings so we do not bundle glibc beside a host loader.
+glibc_files={Path(path).resolve() for path in subprocess.check_output(
+    ['dpkg-query','-L','libc6:amd64'],text=True).splitlines() if '.so' in path}
+contents += [(Path(path),name) for path,name in get_local_shared_libraries(str(driver))
+             if Path(path).resolve() not in glibc_files]
 require(len({name for _,name in contents})==len(contents),'Duplicate driver archive members')
 with tarfile.open(out/'driver.tar.gz','w:gz',dereference=True) as archive:
     for path,name in contents: archive.add(path,arcname=name)
