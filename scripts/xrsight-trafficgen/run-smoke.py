@@ -5,6 +5,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -25,7 +26,10 @@ with socket.socket() as s:
 env=os.environ.copy()
 env['LD_LIBRARY_PATH']=str(root/'.conda-env/lib')+':/home/prashanth/gpu_model/build-chipyard-boost/boost-libs:'+env.get('LD_LIBRARY_PATH','')
 sched_cmd=[str(a.gpu_model),'-c',str(work/'fixture/hardware.config'),'--kernel-registry',str(work/'fixture/registry.json'),'--socket-port',str(port),'--round-log-dir',str(work/'scheduler')]
-cmd=[str(sim),'+permissive','+fesvr-step-size=10000','+max-cycles=12000000',
+header=(sim.parent/'FireSim-generated.const.h').read_text()
+reset=re.search(r'new reset_pulse_t\(.*?\bargs\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\);',header,re.S)
+if reset is None or 128*8<=int(reset[1]): raise RuntimeError('Metasim HTIF startup interval does not cover reset')
+cmd=[str(sim),'+permissive','+fesvr-step-size=128','+max-cycles=12000000',
      '+idle-counts=1','+fesvr-wait-ticks=8',f'+trafficgen-socket-port={port}',
      f'+trafficgen-round-log-dir={work}/bridge','+print-start=0','+print-end=-1']
 for ch in range(8):

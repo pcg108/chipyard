@@ -58,6 +58,7 @@ void smoke_main(unsigned long h) {
   while(!ready[1]||!ready[2]||!ready[3]) if(cycle()-start>1000000) finish(10);
   say("COMBINED_SMOKE: four harts passed startup; testing Saturn, dual Gemmini and TrafficGen\n");
   if(rd(TG_ABI_VERSION)!=3 || rd(TG_SLOT_COUNT)!=4) finish(11);
+  int8_prepare(0); fp32_prepare(0);
   const unsigned ids[4]={1106,1003,1044,1001};
   for(unsigned s=0;s<4;s++) {
     wr(TG_SLOT(s)+TG_REGISTRY_LOW,ids[s]); wr(TG_SLOT(s)+TG_REGISTRY_HIGH,0);
@@ -71,7 +72,7 @@ void smoke_main(unsigned long h) {
   cycles[0]=cycle();
   unsigned err=0, overlap=0;
   for(int r=0;r<8;r++) {
-    int8_prepare(r); fp32_prepare(r);
+    if(r) { int8_prepare(r); fp32_prepare(r); }
     for(int step=0;step<9;step++) {
       for(unsigned s=0;s<4;s++) overlap += rd(TG_SLOT(s)+TG_STATUS)==TG_DISPATCHED;
       if(r&1) { fp32_step(step); int8_step(step); }
