@@ -1,0 +1,112 @@
+{
+  "status": "complete",
+  "completed_at": "2026-10-12T21:24:50.493957+00:00",
+  "build_source_commit": "e2943832fd1e9e57a22271758534c2c6b7602098",
+  "packaging_source_commit": "dae083b5419d143358578b30162c5c8a42083a6a",
+  "artifact_root": "/scratch/prashanth_xrsight_trafficgen_20261011/deliverables",
+  "hardware": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/deliverables/hardware.json",
+    "sha256": "b241eb3d38b34f633e8e6a19be8b902f2d472d015aa761b42b13bfba3cf7bb99"
+  },
+  "checksums": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/deliverables/SHA256SUMS",
+    "sha256": "d8f9b9153a38784731b0a05b39af3f32bbfb11c1025070a84ebd3479bea73b87"
+  },
+  "bitstream": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/firesim.bit",
+    "sha256": "03f4a1c684ae074a21653ab9eed8a46b2c087b97f34c62cef1aca2203f668ff0"
+  },
+  "flash_image": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/firesim.mcs",
+    "sha256": "ff8e27549814dec9108f6b35747ad238d7bc32b37ddd635850773e4485091589"
+  },
+  "bitstream_archive": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/deliverables/firesim.tar.gz",
+    "sha256": "e73a797c8fe36bec36e9555afe641aa83c662537f25a6c2a36b9807d8333539b"
+  },
+  "driver_archive": {
+    "path": "/scratch/prashanth_xrsight_trafficgen_20261011/deliverables/driver.tar.gz",
+    "sha256": "26424780299af81900af2b3d940672549bc956efaa621263adf08a744112fe10"
+  },
+  "timing": {
+    "report": {
+      "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/reports/final_timing_summary.rpt",
+      "sha256": "72219398c6279d00d9e2fcc48e7bbe81700a0cad6ad4cfe1ffdf450e13bcb68c"
+    },
+    "metrics": {
+      "wns_ns": 0.0,
+      "tns_ns": 0.0,
+      "setup_failing_endpoints": 0.0,
+      "setup_total_endpoints": 2336224.0,
+      "whs_ns": 0.009,
+      "ths_ns": 0.0,
+      "hold_failing_endpoints": 0.0,
+      "hold_total_endpoints": 2335264.0,
+      "wpws_ns": 0.0,
+      "tpws_ns": 0.0,
+      "pulse_failing_endpoints": 0.0,
+      "pulse_total_endpoints": 821559.0
+    },
+    "physical_clock": {
+      "requested_mhz": 30,
+      "reported_period_ns": 33.33,
+      "reported_mhz": 30.003
+    }
+  },
+  "routing": {
+    "report": {
+      "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/reports/final_route_status.rpt",
+      "sha256": "bfa17c76e2ca84892c6ed7d0969ae7ef4e636853bf51239d7e8253b32943913c"
+    },
+    "counts": {
+      "logical nets": 3251424,
+      "nets not needing routing": 1244034,
+      "internally routed nets": 1108964,
+      "nets with no loads": 135070,
+      "routable nets": 2007390,
+      "fully routed nets": 2007390,
+      "nets with routing errors": 0
+    }
+  },
+  "bus_skew": {
+    "report": {
+      "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/firesim.runs/impl_1/overall_fpga_top_bus_skew_postroute_physopted.rpt",
+      "sha256": "f28ccc2a83181e12afafbc8c042806f2f8e9259bd2882dbb0efc5fae1632ce54"
+    },
+    "constraints": 28,
+    "minimum_slack_ns": 3.271,
+    "violations": 0
+  },
+  "implementation_recovery": {
+    "source_commit": "222b491be8082ea5efa665b40de24f3fd7bda25e",
+    "change": {
+      "route.optimizeLeafClkProgDlys": false
+    },
+    "checkpoint": {
+      "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/vivado_proj/firesim.runs/impl_1/overall_fpga_top_postroute_physopt.dcp",
+      "sha256": "d069c61323301c1c6190c26cfd8beb8f57a0e1ab82cba2d7167ec80995d3c9d2"
+    },
+    "result": {
+      "path": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/recovery.json",
+      "sha256": "ee406f3cf562c7912b23c2f1fa85525af7035b2cbad9859189016e53843532da"
+    }
+  },
+  "prior_stopped_attempt": "bitstream-stop.json",
+  "resources": {
+    "routing": {
+      "max_process_rss_mib": 27463,
+      "min_host_available_mib": 94646,
+      "new_oom_events": 0,
+      "guard_result": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/guard/guard-result.json"
+    },
+    "emission": {
+      "max_process_rss_mib": 25552,
+      "min_host_available_mib": 97404,
+      "new_oom_events": 0,
+      "guard_result": "/scratch/prashanth_xrsight_trafficgen_20261011/route-retry-20261012T153145Z/guard-emission/guard-result.json"
+    }
+  },
+  "combined_target_metasimulation": "passed",
+  "bitstream_produced": true,
+  "fpga_programmed": false
+}

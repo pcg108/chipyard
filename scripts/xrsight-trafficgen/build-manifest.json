@@ -25,7 +25,7 @@
     "bundle_recovery": "passed",
     "lane_assignment": "passed",
     "synthetic_scheduler_8_iterations": "passed",
-    "combined_target_metasimulation": "pending",
-    "bitstream": "pending"
+    "combined_target_metasimulation": "passed",
+    "bitstream": "passed_final_timing_and_routing"
   }
 }
