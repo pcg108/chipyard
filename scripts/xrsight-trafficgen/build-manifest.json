@@ -25,7 +25,7 @@
     "bundle_recovery": "passed",
     "lane_assignment": "passed",
     "synthetic_scheduler_8_iterations": "passed",
-    "combined_target_metasimulation": "pending",
-    "bitstream": "pending"
+    "combined_target_metasimulation": "passed",
+    "bitstream": "resource_stopped_at_64_GiB_during_leaf_clock_delay_optimization"
   }
 }

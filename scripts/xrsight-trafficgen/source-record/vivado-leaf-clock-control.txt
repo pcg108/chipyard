@@ -1,0 +1,33 @@
+
+****** Vivado v2022.1 (64-bit)
+  **** SW Build 3526262 on Mon Apr 18 15:47:01 MDT 2022
+  **** IP Build 3524634 on Mon Apr 18 20:55:01 MDT 2022
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+
+CRITICAL WARNING: [Common 17-741] No write access right to the local Tcl store at '/home/prashanth/.Xilinx/Vivado/2022.1/XilinxTclStore'. XilinxTclStore is reverted to the installation area. If you want to use local Tcl Store, please change the access right and relaunch Vivado.
+source /tmp/xrsight-vivado-query.tcl
+# set_param general.maxThreads 1
+# foreach p {route.optimizeLeafClkProgDlys route.doProgDelayOpt route.LeafClockProgDelayOptimization route.incremental.doLeafClockProgDelayOpt} {
+#   set rc [catch {get_param $p} value]
+#   puts "PARAM_QUERY $p rc=$rc value=$value"
+#   if {$rc == 0} {puts [report_param -return_string $p]}
+# }
+PARAM_QUERY route.optimizeLeafClkProgDlys rc=0 value=1
+WARNING: [Common 17-35] No params matched 'route.optimizeLeafClkProgDlys'.
+
+PARAM_QUERY route.doProgDelayOpt rc=0 value=0
+WARNING: [Common 17-35] No params matched 'route.doProgDelayOpt'.
+
+PARAM_QUERY route.LeafClockProgDelayOptimization rc=1 value=ERROR: [Common 17-153] Param 'route.LeafClockProgDelayOptimization' does not exist
+
+PARAM_QUERY route.incremental.doLeafClockProgDelayOpt rc=0 value=1
+WARNING: [Common 17-35] No params matched 'route.incremental.doLeafClockProgDelayOpt'.
+
+# if {![catch {get_param route.optimizeLeafClkProgDlys} original]} {
+#   set_param route.optimizeLeafClkProgDlys false
+#   puts "PARAM_SET_TEST route.optimizeLeafClkProgDlys=[get_param route.optimizeLeafClkProgDlys]"
+#   set_param route.optimizeLeafClkProgDlys $original
+# }
+PARAM_SET_TEST route.optimizeLeafClkProgDlys=0
+# exit
+INFO: [Common 17-206] Exiting Vivado at Mon Oct 12 07:28:54 2026...
