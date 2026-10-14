@@ -16,6 +16,8 @@ import sys
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("build", type=pathlib.Path)
 parser.add_argument("--output", type=pathlib.Path)
+parser.add_argument("--command-file", type=pathlib.Path)
+parser.add_argument("--build-log", type=pathlib.Path)
 args = parser.parse_args()
 build = args.build.resolve()
 repo = pathlib.Path(__file__).resolve().parents[2]
@@ -164,10 +166,10 @@ if sv is not None:
     # FPGA mapping is deliberately outside this phase's acceptance criteria.
     del sv
 
-command = read(build / "command.sh")
+command = read(args.command_file or build / "command.sh")
 if command is not None:
     check("build explicitly enables Verilator assertions", "EXTRA_VERILATOR_FLAGS=--assert" in command, command.strip())
-log = build / "build.log"
+log = args.build_log or build / "build.log"
 if log.is_file():
     invocations = [line.strip() for line in log.read_text(errors="replace").splitlines()
                    if re.search(r"(?:^|/)verilator\s", line) and "-Mdir" in line]

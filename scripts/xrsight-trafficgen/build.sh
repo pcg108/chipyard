@@ -29,6 +29,8 @@ case "$stage" in
   *) echo "usage: $0 {elaborate|metasim|driver|bitstream}" >&2; exit 2 ;;
 esac
 attempt=$(date -u +%Y%m%dT%H%M%SZ)
+printf '%q ' "${command[@]}" > "$work/$stage-command.sh"
+printf '\n' >> "$work/$stage-command.sh"
 python3 "$pkg/firesim_resource_guard.py" --scratch "$work" \
   --run-dir "$work/guard-$stage-$attempt" --latch "$work/STOPPED_NO_AUTORESTART.json" \
   --jobs 4 -- "${command[@]}" 2>&1 | tee "$work/logs/$stage-$attempt.log"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare validated physical-service traffic on the original capture cycle axes."""
 import argparse,csv,json
+from collections import Counter
 from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
@@ -21,12 +22,10 @@ for directory,mode in [(a.software,'reference'),(a.firesim,'firesim')]:
     with (directory/'physical-comparison.csv').open() as f:
         rows=[{k:int(v) for k,v in row.items()} for row in csv.DictReader(f)]
     runs.append((rows,validation))
-# Each run's physical service IDs may differ; match the recorded service identity.
-maps=[{r['recorded_service_id']:r for r in rows} for rows,_ in runs]
-assert all(len(m)==len(rows) for m,(rows,_) in zip(maps,runs))
-assert maps[0].keys()==maps[1].keys()
-for key in maps[0]:
-    assert all(maps[0][key][f]==maps[1][key][f] for f in ['is_write','recorded_issue','recorded_return'])
+# Validators establish identity/contributor correctness. Writes have service ID
+# zero in this export, so compare capture multisets without claiming unique IDs.
+capture_fields=['recorded_service_id','is_write','recorded_issue','recorded_return']
+assert Counter(tuple(r[f] for f in capture_fields) for r in runs[0][0]) == Counter(tuple(r[f] for f in capture_fields) for r in runs[1][0])
 series=[('Ground truth',runs[0][0],'recorded_issue','recorded_return'),
         ('Software traffic generator',runs[0][0],'measured_issue','measured_return'),
         ('FireSim FPGA',runs[1][0],'measured_issue','measured_return')]
