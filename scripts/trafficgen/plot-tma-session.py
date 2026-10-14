@@ -19,7 +19,7 @@ def main():
         rows = [{k: int(v) for k, v in r.items()} for r in csv.DictReader(source)]
     validation = json.loads((args.run / 'validation.json').read_text())
     mode = json.loads((args.run / 'provenance.json').read_text())['mode']
-    replay = 'software reference' if mode == 'reference' else 'RTL metasim'
+    replay = {'reference': 'software reference', 'metasim': 'RTL metasim', 'firesim': 'FireSim FPGA'}[mode]
     require = validation['result'] == 'PASS'
     if not require:
         raise RuntimeError('plot requires successful event validation')

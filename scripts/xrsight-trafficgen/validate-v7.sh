@@ -7,11 +7,14 @@ export GPU_MODEL_ROOT="$work/model-src" GPU_MODEL_BUILD="$work/model-build"
 export BOOST_ROOT="$root/.conda-env" TMPDIR="$work/tmp" CXX=/usr/bin/c++
 export LD_LIBRARY_PATH="$work/model-build/boost-libs:${LD_LIBRARY_PATH:-}"
 export PATH="$root/.conda-env/bin:$PATH"
+if [[ "$1" == model || "$1" == cpp ]]; then
+ export PATH="/usr/bin:/bin:$PATH"
+fi
 case "$1" in
  model)
   mkdir -p "$GPU_MODEL_BUILD/boost-libs"
-  ln -s "$BOOST_ROOT/lib/libboost_serialization.so.1.85.0" "$GPU_MODEL_BUILD/boost-libs/libboost_serialization.so"
-  ln -s "$BOOST_ROOT/lib/libboost_serialization.so.1.85.0" "$GPU_MODEL_BUILD/boost-libs/libboost_serialization.so.1.85.0"
+  ln -sf "$BOOST_ROOT/lib/libboost_serialization.so.1.85.0" "$GPU_MODEL_BUILD/boost-libs/libboost_serialization.so"
+  ln -sf "$BOOST_ROOT/lib/libboost_serialization.so.1.85.0" "$GPU_MODEL_BUILD/boost-libs/libboost_serialization.so.1.85.0"
   /usr/bin/cmake -S "$GPU_MODEL_ROOT" -B "$GPU_MODEL_BUILD" -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
    -DCMAKE_BUILD_TYPE=Release -DBOOST_ROOT="$BOOST_ROOT" -DBOOST_LIBRARYDIR="$GPU_MODEL_BUILD/boost-libs" -DBoost_NO_BOOST_CMAKE=ON
   /usr/bin/cmake --build "$GPU_MODEL_BUILD" -j4
@@ -29,6 +32,7 @@ case "$1" in
  rtl)
   cd "$root"
   java -jar scripts/sbt-launch.jar 'chipyard/testOnly chipyard.example.LrcCompletionMonitorSpec chipyard.example.LrcNativeFenceSpec chipyard.example.TrafficGenPutGetSpec chipyard.example.TrafficGenPutGetL2Spec chipyard.example.TrafficGenTLControlSpec chipyard.example.TrafficGenTargetCycleSpec chipyard.example.TmaWakeMonitorSpec chipyard.example.TmaWakeMonitorAdversarialSpec chipyard.example.TmaWakeMonitorFailureSpec'
+  java -jar scripts/sbt-launch.jar 'firechip_bridgestubs/testOnly firechip.bridgestubs.TrafficGenChannelSpec'
   ;;
  *) exit 2 ;;
 esac

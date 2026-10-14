@@ -72,8 +72,8 @@ def validate(root, dataset, kernel, require_complete_policies=False):
     total = 504000 if kernel==6632 else 131072
     capture_cycle = 363659 if kernel==6632 else 53034
     provenance = json.loads((root / 'provenance.json').read_text())
-    require(provenance['mode'] in ('reference', 'metasim'), 'unknown validation mode')
-    metasim = provenance['mode'] == 'metasim'
+    require(provenance['mode'] in ('reference', 'metasim', 'firesim'), 'unknown validation mode')
+    metasim = provenance['mode'] in ('metasim', 'firesim')
     for field in ('client_exit_code', 'scheduler_exit_code'):
         if metasim or field in provenance:
             require(provenance.get(field) == 0, f'missing or unsuccessful process termination: {field}')

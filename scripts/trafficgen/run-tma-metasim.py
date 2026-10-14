@@ -36,13 +36,20 @@ def main():
     parser.add_argument('--port', type=int, default=50052)
     parser.add_argument('--max-cycles', type=int, default=300000000)
     parser.add_argument('--timeout', type=int, default=7200)
+    parser.add_argument('--design', default='FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig')
+    parser.add_argument('--fpga', action='store_true', help='Use a freshly programmed physical U250 with --simulator DRIVER')
     parser.add_argument('--policy-decoder', type=Path, required=True,
                         help='official-v7 decoder for complete archived policy snapshots')
     args = parser.parse_args()
+    if args.fpga and args.reference:
+        parser.error('--fpga requires --simulator')
     if not 1 <= args.port <= 65535 or min(args.max_cycles, args.timeout) <= 0:
         parser.error('port must be 1..65535 and limits must be positive')
     root, source, build, data = (p.resolve() for p in
                                 (args.output, args.model_source, args.model_build, args.dataset))
+    observed_pin = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    if observed_pin != PIN or subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no'], text=True).strip():
+        raise RuntimeError('GPU model source must be the unmodified requested commit')
     scheduler = build / 'gpu_model_socket'
     client = build / 'tma-reference-client' if args.reference else args.simulator.resolve()
     for path in (scheduler, client):
@@ -93,6 +100,17 @@ def main():
                       '+print-end=-1', f'+trafficgen-socket-port={args.port}',
                       f'+trafficgen-round-log-dir={root}/bridge',
                       f'+trafficgen-boundary-log={root}/boundaries.csv', '+permissive-off', str(hello / 'hello')]
+        runtime = []
+        if args.design == 'FireSimQuadRocketDualGemminiSaturnTrafficGenConfig':
+            runtime += ['+idle-counts=1', '+fesvr-wait-ticks=8']
+            for channel in range(8):
+                runtime += [f'+mm_{key}_{channel}={value}' for key, value in
+                            [('readLatency', 30), ('writeLatency', 30), ('readMaxReqs', 10), ('writeMaxReqs', 10)]]
+                runtime.append(f'+mm_useHardwareDefaultRuntimeSettings_{channel}')
+        if args.fpga:
+            runtime += ['+domain=0', '+bus=51', '+device=0', '+function=0', '+bar=0',
+                        '+pci-vendor=10ee', '+pci-device=903f']
+        client_cmd[client_cmd.index('+permissive-off'):client_cmd.index('+permissive-off')] = runtime
     commands['client'] = client_cmd
     relevant_sources = [p for base in ('generators/chipyard/src', 'generators/firechip')
                         for p in (REPO / base).rglob('*') if p.is_file() and
@@ -106,13 +124,13 @@ def main():
         dataset_files.append(data / 'import_manifest.json')
     provenance = {
         'model_commit': PIN, 'protocol_version': 7, 'boost_version': '1.85.0',
-        'mode': 'reference' if args.reference else 'metasim',
-        'design': 'FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig',
+        'mode': 'reference' if args.reference else 'firesim' if args.fpga else 'metasim',
+        'design': args.design,
         'platform': 'BaseXilinxAlveoU250Config', 'replay_lanes': 16, 'outstanding_per_lane': 8,
         'registry_id': args.kernel, 'commands': commands, 'timeout_seconds': args.timeout,
         'binary_sha256': {str(p): sha(p) for p in binaries},
         'source_sha256': {str(p): sha(p) for p in relevant_sources},
-        'model_source_sha256': {str(p.relative_to(source)): sha(p) for p in sorted(source.rglob('*')) if p.is_file()},
+        'model_source_sha256': {str(p.relative_to(source)): sha(p) for p in sorted(source.rglob('*')) if p.is_file() and '.git' not in p.relative_to(source).parts},
         'dataset_sha256': {str(p): sha(p) for p in dataset_files},
         'config_sha256': sha(root / 'hardware.config'), 'registry_sha256': sha(root / 'registry.json'),
         'build_provenance_note': 'Use the separate fresh-build manifest to establish binary source provenance.'}
