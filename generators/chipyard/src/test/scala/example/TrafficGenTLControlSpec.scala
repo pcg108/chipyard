@@ -43,6 +43,10 @@ private class TrafficGenTLControlHarnessImp(outer: TrafficGenTLControlHarness)
   control.sessionStatus := 0.U
   control.controlPending := false.B
   control.uploadReady := false.B
+  control.batchMode := false.B
+  control.replayEpoch := 0.U
+  control.memPhysicalCompletionValidMask := 0.U
+  control.memPhysicalCompletionTokens := 0.U
   control.minIssueCycle := 0.U
   control.startRound := false.B
   control.trafficGenDone := io.done

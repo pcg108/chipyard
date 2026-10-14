@@ -48,6 +48,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
                          wake: Boolean = false, blocked: Boolean = false,
                          generation: BigInt = 0, launchId: BigInt = 0,
                          isWrite: Boolean = false): Unit = {
+    access.physicalToken.poke(0.U)
     access.launchId.poke(launchId.U)
     access.id.poke(id.U)
     access.address.poke(0.U)
@@ -80,6 +81,7 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
 
   private def pokeIssued(access: IssuedAccess, id: BigInt = 0, cycle: BigInt = 0,
                          address: BigInt = 0, isWrite: Boolean = false): Unit = {
+    access.physicalToken.poke(0.U)
     access.launchId.poke(0.U)
     access.requestUid.poke(id.U)
     access.cycleIssued.poke(cycle.U)
@@ -100,6 +102,10 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
     ((value >> 192) & 1) != 0
 
   private def initialize(dut: TrafficGenRTLEngine, numGenerators: Int): Unit = {
+    dut.io.batchMode.poke(false.B)
+    dut.io.replayEpoch.poke(0.U)
+    dut.io.memPhysicalCompletionValidMask.poke(0.U)
+    dut.io.memPhysicalCompletionTokens.poke(0.U)
     dut.io.uploadReady.poke(true.B)
     dut.io.minIssueCycle.poke(1000.U)
     dut.io.startRound.poke(false.B)
@@ -145,6 +151,181 @@ class TrafficGenTargetCycleSpec extends AnyFlatSpec with ChiselScalatestTester {
       cycles += 1
     }
     assert(condition, s"condition was not reached within $limit cycles")
+  }
+
+  it should "issue batch tokens on the first epoch edge and replace replay without a drain bubble" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 2, memOutstanding = 1))) { dut =>
+      initialize(dut, 2)
+      dut.io.batchMode.poke(true.B)
+      dut.io.replayEpoch.poke(1.U)
+      dut.io.minIssueCycle.poke(0.U) // Batch deadlines include events at the deadline.
+      dut.io.issuedAccessBatch.ready.poke(false.B) // Not part of batch admission.
+      val token = BigInt("123456789abcdef0", 16)
+      for (lane <- 0 until 2) {
+        dut.io.accessReadDataValid(replaySlot(lane)).poke(true.B)
+        dut.io.accessReadData(replaySlot(lane)).poke(
+          ((token + lane) << 371 | BigInt(100 + lane)).U)
+      }
+      dut.io.issue(1).ready.poke(false.B)
+      dut.io.physicalIssueValidMask.expect(1.U)
+      dut.io.physicalConsumeMask.expect(1.U)
+      dut.io.issue(0).bits.physicalToken.expect(token.U)
+      assert((packedLane(dut.io.physicalIssueAccesses, 0) >> 257) == token)
+      dut.io.currentCycleAfterIssue.expect(0.U)
+      dut.io.roundComplete.expect(false.B)
+      dut.clock.step()
+      dut.io.currentCycleAfterIssue.expect(1.U)
+      dut.io.physicalIssueValidMask.expect(0.U)
+      dut.io.issuedAccessBatch.valid.expect(false.B)
+
+      // A host-only pause takes no clock steps. Publish another epoch while an
+      // old slot consume is still pending, then issue at the very next edge.
+      dut.io.replayEpoch.poke(2.U)
+      dut.io.minIssueCycle.poke(1.U)
+      dut.io.issue(1).ready.poke(true.B)
+      dut.io.accessReadData(replaySlot(0)).poke(((token + 2) << 371 | BigInt(102)).U)
+      dut.io.physicalIssueValidMask.expect(3.U)
+      dut.io.accessReadConsumeMask.expect(allLaneSlotZeroMask(dut).U)
+      dut.io.physicalConsumeMask.expect(allLaneSlotZeroMask(dut).U)
+      dut.io.issue(0).bits.id.expect(102.U)
+      dut.io.issue(0).bits.cycleCount.expect(1.U)
+      dut.clock.step()
+      dut.io.currentCycleAfterIssue.expect(2.U)
+      dut.io.roundComplete.expect(false.B)
+      dut.io.completedBundleIdWriteEn.expect(false.B)
+    }
+  }
+
+  it should "sustain batch replay while slot acknowledgements take two target cycles" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 1))) { dut =>
+      initialize(dut, 1)
+      dut.io.batchMode.poke(true.B)
+      dut.io.replayEpoch.poke(1.U)
+      dut.io.issuedAccessBatch.ready.poke(false.B)
+      for (slot <- 0 until slotsPerLane) {
+        dut.io.accessReadDataValid(replaySlot(0, slot)).poke(true.B)
+        pokePackedAccess(dut.io.accessReadData(replaySlot(0, slot)), id = 100 + slot)
+      }
+      var generations = BigInt(0)
+      for (cycle <- 0 until 6) {
+        // A consume at C updates bridge queue state after fromHost samples its
+        // input token. Its replacement is consequently visible at C+2.
+        if (cycle >= 2) {
+          val retiredSlot = (cycle - 2) % slotsPerLane
+          generations += BigInt(1) << (2 * retiredSlot)
+          dut.io.accessReadRespId.poke(generations.U)
+          pokePackedAccess(dut.io.accessReadData(replaySlot(0, retiredSlot)), id = 101 + cycle)
+        }
+        dut.io.physicalIssueValidMask.expect(1.U)
+        dut.io.physicalConsumeMask.expect((BigInt(1) << (cycle % slotsPerLane)).U)
+        dut.io.issue(0).bits.id.expect((100 + cycle).U)
+        dut.io.issue(0).bits.cycleCount.expect(cycle.U)
+        dut.io.issuedAccessBatch.valid.expect(false.B)
+        dut.clock.step()
+      }
+    }
+  }
+
+  for (drained <- Seq(false, true)) {
+    it should s"stop issue for new native control at an unlimited deadline with drained=$drained" in {
+      test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 1))) { dut =>
+        initialize(dut, 1)
+        dut.io.batchMode.poke(true.B)
+        dut.io.replayEpoch.poke(1.U)
+        dut.io.minIssueCycle.poke(((BigInt(1) << 64) - 1).U)
+        dut.io.accessReadDataValid(0).poke(true.B)
+        pokePackedAccess(dut.io.accessReadData(0), id = 10)
+        dut.io.physicalIssueValidMask.expect(1.U)
+        dut.clock.step()
+        dut.io.accessReadDataValid(1).poke((!drained).B)
+        pokePackedAccess(dut.io.accessReadData(1), id = 11)
+        dut.io.accessStoreHasEntries.poke((!drained).B)
+        dut.io.accessReadLaneDoneMask.poke((if (drained) 1 else 0).U)
+        dut.io.memActive.poke((!drained).B)
+        dut.io.controlPending.poke(true.B)
+        dut.io.targetBusy.expect(true.B) // Native idle/control fences are bridge-owned.
+        dut.io.hasPendingWork.expect((!drained).B)
+        dut.io.physicalIssueValidMask.expect(0.U)
+        dut.io.physicalConsumeMask.expect(0.U)
+        if (!drained) {
+          dut.io.memPhysicalCompletionValidMask.poke(1.U)
+          dut.io.memPhysicalCompletionTokens.poke(99.U)
+          dut.io.physicalCompletionValidMask.expect(1.U)
+          dut.io.physicalCompletionCycles.expect(1.U)
+        }
+        // A control fence must still permit already accepted physical returns.
+        dut.io.completion(0).ready.expect(true.B)
+        dut.io.roundComplete.expect(false.B)
+        dut.clock.step()
+        dut.io.memPhysicalCompletionValidMask.poke(0.U)
+        dut.io.controlPending.poke(false.B)
+        dut.io.replayEpoch.poke(2.U)
+        dut.io.accessStoreHasEntries.poke(true.B)
+        dut.io.accessReadLaneDoneMask.poke(0.U)
+        pokePackedAccess(dut.io.accessReadData(0), id = 12)
+        dut.io.physicalIssueValidMask.expect(1.U)
+        dut.io.issue(0).bits.id.expect(12.U)
+        dut.io.issue(0).bits.cycleCount.expect(2.U)
+      }
+    }
+  }
+
+  it should "expose every physical return in its target cycle independently of legacy completions" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 2, memOutstanding = 1))) { dut =>
+      initialize(dut, 2)
+      dut.io.batchMode.poke(true.B)
+      dut.io.replayEpoch.poke(1.U)
+      dut.clock.step(5)
+      dut.io.memPhysicalCompletionValidMask.poke(3.U)
+      dut.io.memPhysicalCompletionTokens.poke(((BigInt(22) << 64) | BigInt(11)).U)
+      dut.io.physicalCompletionValidMask.expect(3.U)
+      dut.io.physicalCompletionTokens.expect(((BigInt(22) << 64) | BigInt(11)).U)
+      dut.io.physicalCompletionCycles.expect(((BigInt(5) << 64) | BigInt(5)).U)
+      // A migrated legacy response can still occupy its old bookkeeping FIFO.
+      // It must neither be reported again nor index the old bundle table.
+      dut.io.completion(0).valid.poke(true.B)
+      pokeAccess(dut.io.completion(0).bits, id = 7, cycle = 1, bundleId = 999)
+      dut.io.completion(0).ready.expect(true.B)
+      dut.clock.step()
+      dut.io.memPhysicalCompletionValidMask.poke(0.U)
+      dut.io.completion(0).valid.poke(false.B)
+      dut.io.physicalCompletionValidMask.expect(0.U)
+      dut.io.completedBundleIdWriteEn.expect(false.B)
+    }
+  }
+
+  it should "migrate an ordinary outstanding request without replay or an ordinary wake" in {
+    test(new TrafficGenRTLEngine(TrafficGenParams(numGenerators = 1, memOutstanding = 1))) { dut =>
+      initialize(dut, 1)
+      dut.io.minIssueCycle.poke(4.U)
+      dut.io.memActive.poke(true.B)
+      dut.io.accessReadDataValid(0).poke(true.B)
+      pokePackedAccess(dut.io.accessReadData(0), id = 31, bundleId = 41, wake = true, blocked = true)
+      startRound(dut)
+      waitFor(dut.io.issue(0).valid.peek().litToBoolean, dut)
+      val oldIndex = dut.io.issue(0).bits.mBundleId.peek().litValue
+      dut.clock.step()
+      dut.io.accessReadDataValid(0).poke(false.B)
+      dut.io.accessReadRespId.poke(1.U)
+      dut.io.accessReadLaneDoneMask.poke(1.U)
+      waitFor(dut.io.roundComplete.peek().litToBoolean, dut)
+      dut.clock.step()
+      val migrationCycle = dut.io.currentCycleAfterIssue.peek().litValue
+      dut.io.batchMode.poke(true.B)
+      dut.io.replayEpoch.poke(1.U)
+      dut.io.memPhysicalCompletionValidMask.poke(1.U)
+      dut.io.memPhysicalCompletionTokens.poke(501.U)
+      dut.io.completion(0).valid.poke(true.B)
+      pokeAccess(dut.io.completion(0).bits, id = 31, bundleId = oldIndex)
+      dut.io.physicalIssueValidMask.expect(0.U)
+      dut.io.physicalCompletionCycles.expect(migrationCycle.U)
+      dut.clock.step()
+      dut.io.memPhysicalCompletionValidMask.poke(0.U)
+      dut.io.completion(0).valid.poke(false.B)
+      dut.io.memActive.poke(false.B)
+      dut.io.completedBundleIdWriteEn.expect(false.B)
+      dut.io.roundComplete.expect(false.B)
+    }
   }
 
   it should "let a ready lane fire while a backpressured lane retains its head" in {

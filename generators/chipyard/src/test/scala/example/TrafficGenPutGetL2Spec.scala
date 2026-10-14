@@ -86,6 +86,7 @@ private class TrafficGenPutGetL2Harness(implicit p: Parameters) extends LazyModu
       bundle.reset := reset
     }
     traffic.module.io.coreOffset := 0.U
+    traffic.module.io.batchMode := false.B
     traffic.module.io.req <> io.req
     io.completion <> traffic.module.io.completion
 
@@ -144,6 +145,7 @@ class TrafficGenPutGetL2Spec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.req.valid.poke(false.B)
       dut.io.completion.ready.poke(true.B)
       dut.io.req.bits.id.poke(0.U)
+      dut.io.req.bits.physicalToken.poke(0.U)
       dut.io.req.bits.address.poke(0.U)
       dut.io.req.bits.cycleCount.poke(0.U)
       dut.io.req.bits.mBundleId.poke(0.U)

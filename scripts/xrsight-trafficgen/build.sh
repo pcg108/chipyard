@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-work=${XRSIGHT_TG_WORK:-/scratch/prashanth_xrsight_trafficgen_20261011}
+work=${XRSIGHT_TG_WORK:-/scratch/prashanth_xrsight_trafficgen_v7_20261013}
 stage=${1:-elaborate}
 source "$root/env.sh"
 export FS_DIR="$root/sims/firesim"
@@ -21,7 +21,7 @@ case "$stage" in
   # Stock Gemmini emits a narrow unsigned divisor; Saturn emits comparisons
   # that specialize to constants. Neither changes the intended arithmetic.
   metasim) command=(make "${make_args[@]}"
-    "EXTRA_VERILATOR_FLAGS=-Wno-WIDTHEXPAND -Wno-UNSIGNED" verilator) ;;
+    "EXTRA_VERILATOR_FLAGS=--assert -Wno-WIDTHEXPAND -Wno-UNSIGNED" verilator) ;;
   driver) command=(make "${make_args[@]}" xilinx_alveo_u250) ;;
   bitstream) command=(python3 "$pkg/firesim_manager.py" --chipyard "$root" --
     buildbitstream -b "$pkg/config_build.yaml" -r "$pkg/config_build_recipes.yaml"

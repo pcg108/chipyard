@@ -143,6 +143,14 @@ class TrafficGenTopIO(
 
   // TG issue logic will enqueue the actual issued L2 accesses here with cycleCount updated to the real issue cycle.
   val issuedAccessBatch = Decoupled(new IssuedAccessBatch(nGenerators))
+  val physicalIssueValidMask = Output(UInt(nGenerators.W))
+  val physicalIssueAccesses = Output(UInt((nGenerators * IssuedAccess.streamWidthBits).W))
+  val physicalConsumeMask = Output(UInt(replaySlots.W))
+  val physicalCompletionValidMask = Output(UInt(nGenerators.W))
+  val physicalCompletionTokens = Output(UInt((nGenerators * 64).W))
+  val physicalCompletionCycles = Output(UInt((nGenerators * 64).W))
+  val batchMode = Input(Bool())
+  val replayEpoch = Input(UInt(32.W))
 
   // query the L2 access store for an L2 access
   val accessReadCycle = Output(UInt(64.W))
@@ -180,6 +188,8 @@ class TrafficGenTopIO(
   val accessStoreHasMore = Input(Bool())
 
   val memActive = Input(Bool())
+  val memPhysicalCompletionValidMask = Input(UInt(nGenerators.W))
+  val memPhysicalCompletionTokens = Input(UInt((nGenerators * 64).W))
   val memInflightAccesses = Input(Vec(nGenerators, UInt(log2Ceil(memOutstanding + 1).W)))
   val issue = Vec(nGenerators, Decoupled(new RTLL2Access))
   val completion = Vec(nGenerators, Flipped(Decoupled(new RTLL2Access)))
@@ -322,6 +332,13 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
     params.width, params.numGenerators, params.memOutstanding, useRTL = false))
 
   val currentCycleAfterIssue = Wire(UInt(64.W))
+  io.physicalIssueValidMask := 0.U
+  io.physicalIssueAccesses := 0.U
+  io.physicalCompletionValidMask := 0.U
+  io.physicalConsumeMask := 0.U
+  io.physicalCompletionTokens := 0.U
+  io.physicalCompletionCycles := 0.U
+  assert(!io.batchMode, "TrafficGen DPI does not support LRC batch replay")
   val roundStarted = Wire(Bool())
   val dpi = Module(new TrafficGenDPIBlackBox(params.numGenerators))
 
@@ -396,6 +413,7 @@ class TrafficGenDPIEngine(params: TrafficGenParams) extends Module with HasTraff
   // uniformly batch based for both backends.
   val issuedBatchAdapter = Module(new LegacyIssuedAccessBatchAdapter(params.numGenerators))
   val dpiIssuedAccess = Wire(new IssuedAccess)
+  dpiIssuedAccess.physicalToken := 0.U
   dpiIssuedAccess.launchId := 0.U // Legacy DPI does not support protocol-v2 launches.
   dpiIssuedAccess.requestUid := dpi.io.issued_access_writeback_id
   dpiIssuedAccess.address := dpi.io.issued_access_writeback_address
@@ -510,6 +528,16 @@ class TrafficGenRTLEngine(
   val state = RegInit(sIdle)
   val targetCycle = RegInit(0.U(64.W))
   val targetTimeStarted = RegInit(false.B)
+  val replayEpochSeen = RegInit(0.U(32.W))
+  val batchModeSeen = RegInit(false.B)
+  val batchEpochChanged = io.batchMode &&
+    (!batchModeSeen || io.replayEpoch =/= replayEpochSeen)
+  when(io.batchMode) {
+    replayEpochSeen := io.replayEpoch
+    batchModeSeen := true.B
+  }
+  assert(!batchModeSeen || io.batchMode,
+    "TrafficGen cannot leave batch mode before target reset")
   val roundCapacityBounded = RegInit(false.B)
   val roundHadAccesses = RegInit(false.B)
   val wakeExitPending = RegInit(false.B)
@@ -579,7 +607,7 @@ class TrafficGenRTLEngine(
   io.launchIds := 0.U
   io.launchPendingMask := 0.U
   io.closeSubmissions := false.B
-  io.targetBusy := state =/= sIdle
+  io.targetBusy := Mux(io.batchMode, targetTimeStarted, state =/= sIdle)
   io.roundStarted := false.B
   io.roundComplete := false.B
   io.roundExitReason := roundExitReasonReg
@@ -595,6 +623,9 @@ class TrafficGenRTLEngine(
   issuedBatchQueue.io.enq.valid := false.B
   issuedBatchQueue.io.enq.bits := 0.U.asTypeOf(new IssuedAccessBatch(params.numGenerators))
   io.issuedAccessBatch <> issuedBatchQueue.io.deq
+  io.physicalCompletionValidMask := io.memPhysicalCompletionValidMask
+  io.physicalCompletionTokens := io.memPhysicalCompletionTokens
+  io.physicalCompletionCycles := VecInit(Seq.fill(params.numGenerators)(targetCycle)).asUInt
 
   io.accessReadCycle := 0.U
   io.accessReadEn := false.B
@@ -630,11 +661,9 @@ class TrafficGenRTLEngine(
     outputQueuesHaveWork ||
     roundHasFutureIssueWork ||
     io.accessStoreHasMore
-  io.hasPendingWork := Mux(
-    state === sIdle || state === sDrainOutputs,
-    lastHasPendingWork,
-    livePendingWork,
-  )
+  io.hasPendingWork := Mux(io.batchMode,
+    io.memActive || roundHasFutureIssueWork || io.accessStoreHasMore,
+    Mux(state === sIdle || state === sDrainOutputs, lastHasPendingWork, livePendingWork))
 
   // initialize the issue/completion ports to the issue nodes
   for (i <- 0 until params.numGenerators) {
@@ -651,8 +680,10 @@ class TrafficGenRTLEngine(
     completedQueuesCanAccept && completionBudgetAvailable
   val completionFires = Wire(Vec(params.numGenerators, Bool()))
   for (i <- 0 until params.numGenerators) {
-    io.completion(i).ready := completionCanFire
-    completionFires(i) := io.completion(i).valid && io.completion(i).ready
+    // Physical returns are observed at the backend response, independently of
+    // this legacy accounting queue. Batch mode drains any pre-migration tail.
+    io.completion(i).ready := io.batchMode || completionCanFire
+    completionFires(i) := !io.batchMode && io.completion(i).valid && io.completion(i).ready
   }
 
   // signals to indicate a round completion event has ocurred and why
@@ -826,10 +857,11 @@ class TrafficGenRTLEngine(
   val currentHeadStable = Wire(Vec(params.numGenerators, Bool()))
 
   // check that we are within the issue cycle window
-  val roundReachedMin = targetCycle >= io.minIssueCycle
+  val roundReachedMin = Mux(io.batchMode,
+    targetCycle > io.minIssueCycle, targetCycle >= io.minIssueCycle)
   val sessionTerminal = io.sessionStatus(5, 3).orR || io.trafficGenDone
   val issueWindowOpen = !roundReachedMin && !io.controlPending && !sessionTerminal &&
-    completionBudgetAvailable
+    (io.batchMode || completionBudgetAvailable)
 
   //// track which slot consumes the bridge has acknowledged:
   // unpack bridge acknowledgements (each slot has 2-bit generation counter, advanced when it dequeues slot FIFO)
@@ -844,12 +876,12 @@ class TrafficGenRTLEngine(
   // the slot is ancknowledged when the bridge response is valid, 
   //the engine has a pending consume, and slot generation has changed
   val accessReadAckNowMask = Mux(
-    io.accessReadRespValid,
+    io.accessReadRespValid && !batchEpochChanged,
     accessReadConsumePendingMask & accessReadGenerationChangedMask,
     0.U)
   // remove acknowledged consumes 
   val accessReadPendingAfterAck =
-    accessReadConsumePendingMask & ~accessReadAckNowMask
+    Mux(batchEpochChanged, 0.U, accessReadConsumePendingMask & ~accessReadAckNowMask)
   dontTouch(accessReadAckNowMask)
   // flat index of the slot that the lane is currently pointing to for issue
   val selectedAccessReadSlot = Wire(Vec(params.numGenerators, UInt(replaySlotIdxWidth.W)))
@@ -859,7 +891,7 @@ class TrafficGenRTLEngine(
     val selectedSlot = Wire(UInt(replaySlotIdxWidth.W))
     selectedSlot :=
       (lane * replaySlotsPerLane).U(replaySlotIdxWidth.W) +
-        accessReadLaneSlot(lane)
+        Mux(batchEpochChanged, 0.U, accessReadLaneSlot(lane))
     selectedAccessReadSlot(lane) := selectedSlot
     val issuedAccess = Wire(new RTLL2Access)
     issuedAccess := rtlAccessReadData(selectedSlot)
@@ -867,7 +899,7 @@ class TrafficGenRTLEngine(
     issuedAccess.cycleCount := targetCycle
     currentIssueAccess(lane) := issuedAccess
     currentHeadStable(lane) := io.accessReadDataValid(selectedSlot) &&
-      (!accessReadConsumePendingMask(selectedSlot) || accessReadAckNowMask(selectedSlot))
+      (batchEpochChanged || !accessReadConsumePendingMask(selectedSlot) || accessReadAckNowMask(selectedSlot))
     currentIssueValid(lane) := currentHeadStable(lane) &&
       rtlAccessReadData(selectedSlot).cycleCount <= targetCycle
   }
@@ -903,7 +935,7 @@ class TrafficGenRTLEngine(
   // this is in the case that all entries in the lane's bundle table are currently occupied, and the lane head access is a different bundle
   // additionally, in-flight accesses would not unblock the lane. Then we need to go into bundle table recovery mode,
   // wherein we exit and the bridge driver reorders accesses to free up a bundle table entry for the lane.
-  val bundleTableRecoveryTrigger = state === sIssueBatch && issueWindowOpen &&
+  val bundleTableRecoveryTrigger = !io.batchMode && state === sIssueBatch && issueWindowOpen &&
     !wakeExitPending && (bundleTableBlockedLanes.asUInt & currentIssueValid.asUInt).orR
   when(bundleTableRecoveryTrigger) {
     bundleTableRecoveryPending := true.B
@@ -911,23 +943,24 @@ class TrafficGenRTLEngine(
   // check whether any lane has a valid access to issue and if we can 
   val chunkHasValid = currentIssueValid.asUInt.orR
   val issueResourcesAvailable =
-    state === sIssueBatch &&
+    (Mux(io.batchMode, io.uploadReady, state === sIssueBatch)) &&
     issueWindowOpen &&
-    !bundleTableRecoveryPending &&
+    (io.batchMode || !bundleTableRecoveryPending) &&
     !bundleTableRecoveryTrigger &&
     chunkHasValid &&
     !io.accessReadPrefetchPauseReq &&
-    issuedBatchQueue.io.enq.ready
+    (io.batchMode || issuedBatchQueue.io.enq.ready)
 
   // present each lane's request to memory backend and detect if it issues successfully 
   val issueFires = Wire(Vec(params.numGenerators, Bool()))
   for (lane <- 0 until params.numGenerators) {
     io.issue(lane).valid := issueResourcesAvailable && currentIssueValid(lane) &&
-      issueHasTableEntry(lane)
+      (io.batchMode || issueHasTableEntry(lane))
     io.issue(lane).bits := currentIssueAccess(lane)
-    io.issue(lane).bits.mBundleId := issueAssignedEntry(lane)
+    io.issue(lane).bits.mBundleId := Mux(io.batchMode,
+      currentIssueAccess(lane).mBundleId, issueAssignedEntry(lane))
     issueFires(lane) := io.issue(lane).valid && io.issue(lane).ready
-    issueFiresForReducer(lane) := issueFires(lane)
+    issueFiresForReducer(lane) := issueFires(lane) && !io.batchMode
   }
   val issuedBatchMask = issueFires.asUInt
   val issueCanFire = issueFires.asUInt.orR
@@ -938,14 +971,15 @@ class TrafficGenRTLEngine(
   // Control requests and report capacity remain hard boundaries, so a new
   // launch does not wait behind a busy memory stream and reports cannot overrun.
   drainCompletionsThisCycle :=
-    (state === sDrainCompletions || state === sIssueBatch) && !io.controlPending && !sessionTerminal
+    !io.batchMode && (state === sDrainCompletions || state === sIssueBatch) && !io.controlPending && !sessionTerminal
   
   // enqueue the issued-access batch to the issued-batch queue for the bridge module
-  issuedBatchQueue.io.enq.valid := issueCanFire
+  issuedBatchQueue.io.enq.valid := issueCanFire && !io.batchMode
   issuedBatchQueue.io.enq.bits.batchId := issuedBatchId
   issuedBatchQueue.io.enq.bits.validMask := issuedBatchMask
   val issuedBatchPackedAccesses = VecInit((0 until params.numGenerators).map { lane =>
     val issued = Wire(new IssuedAccess)
+    issued.physicalToken := currentIssueAccess(lane).physicalToken
     issued.launchId := currentIssueAccess(lane).launchId
     issued.requestUid := currentIssueAccess(lane).id
     issued.cycleIssued := currentIssueAccess(lane).cycleCount
@@ -954,6 +988,8 @@ class TrafficGenRTLEngine(
     IssuedAccess.pack(issued)
   })
   issuedBatchQueue.io.enq.bits.accesses := issuedBatchPackedAccesses.asUInt
+  io.physicalIssueValidMask := issuedBatchMask
+  io.physicalIssueAccesses := issuedBatchPackedAccesses.asUInt
 
   // build the consume mask, to indicate to bridge module which lanes issued from which slots
   val accessReadSlotConsumeMask = (0 until params.numGenerators).map { lane =>
@@ -961,6 +997,7 @@ class TrafficGenRTLEngine(
       Fill(replaySlots, issueFires(lane))
   }.reduce(_ | _)
   io.accessReadConsumeMask := accessReadSlotConsumeMask
+  io.physicalConsumeMask := accessReadSlotConsumeMask
   // update pending consumes
   accessReadConsumePendingMask := accessReadPendingAfterAck | accessReadSlotConsumeMask
   // remember acknowledged generations for each slot, so we can detect when the bridge has consumed a slot
@@ -973,7 +1010,7 @@ class TrafficGenRTLEngine(
     "TrafficGenRTLEngine acknowledged a lane without a pending consume")
   for (lane <- 0 until params.numGenerators) {
     val selectedSlot = selectedAccessReadSlot(lane)
-    when(issueFires(lane) && accessReadConsumePendingMask(selectedSlot)) {
+    when(issueFires(lane) && accessReadConsumePendingMask(selectedSlot) && !batchEpochChanged) {
       assert(accessReadAckNowMask(selectedSlot),
         "TrafficGenRTLEngine issued a pending replay slot without its acknowledgement")
     }
@@ -1002,7 +1039,7 @@ class TrafficGenRTLEngine(
       "TrafficGenRTLEngine enqueued an empty issued-access batch")
     issuedBatchId := issuedBatchId + 1.U
   }
-  when(state === sIssueBatch) {
+  when(state === sIssueBatch && !io.batchMode) {
     assert(issuedBatchQueue.io.enq.fire === issueCanFire,
       "TrafficGenRTLEngine did not enqueue exactly one batch for an issue fire")
   }
@@ -1020,7 +1057,7 @@ class TrafficGenRTLEngine(
   }
 
   for (lane <- 0 until params.numGenerators) {
-    when(issueFires(lane)) {
+    when(issueFires(lane) && !io.batchMode) {
       assert(currentIssueAccess(lane).bundleIssueCount =/= 0.U,
         "TrafficGenRTLEngine issued an access with zero bundleIssueCount")
       assert(issueAssignedEntry(lane) < localBundleTableEntries.U,
@@ -1048,9 +1085,9 @@ class TrafficGenRTLEngine(
     (bundleTableRecoveryPending || bundleTableRecoveryTrigger) &&
     !roundMemoryHasWork && !completionAnyValid && !accessReadPendingAfterAck.orR
   val acceptingRound =
-    state === sIdle && io.startRound && io.uploadReady && !sessionTerminal
+    !io.batchMode && state === sIdle && io.startRound && io.uploadReady && !sessionTerminal
   val startingWorkload =
-    acceptingRound && !targetTimeStarted
+    (acceptingRound || (io.batchMode && io.uploadReady && !sessionTerminal)) && !targetTimeStarted
 
   if (params.traceFirstCycles > 0) {
     val traceCycle = Mux(startingWorkload, 0.U, targetCycle)
@@ -1065,8 +1102,8 @@ class TrafficGenRTLEngine(
   }
 
   io.accessReadCycle := targetCycle
-  io.accessReadEn := state === sIssueBatch && issueWindowOpen
-  io.accessReadBatchReady := state === sIssueBatch && issueWindowOpen
+  io.accessReadEn := (io.batchMode || state === sIssueBatch) && issueWindowOpen
+  io.accessReadBatchReady := (io.batchMode || state === sIssueBatch) && issueWindowOpen
 
   // The session's target-time epoch begins on the first accepted round. Until
   // then the socket scheduler's initialization cycle and the RTL both remain
@@ -1082,7 +1119,32 @@ class TrafficGenRTLEngine(
   }
   dontTouch(targetTimeStarted)
 
-  when(state === sIdle) {
+  when(io.batchMode) {
+    // The bridge checkpoints complete target tokens. There is no target-side
+    // round drain in batch mode: backend activity and target time continue at
+    // the next edge after resume, with the new replay epoch already visible.
+    state := sIdle
+    wakeExitPending := false.B
+    bundleTableRecoveryPending := false.B
+    bundleTableFullLaneMaskReg := 0.U
+    for (lane <- 0 until params.numGenerators; e <- 0 until localBundleTableEntries) {
+      bundleValid(lane)(e) := false.B
+      bundleOutstanding(lane)(e) := 0.U
+      bundleRemainingToIssue(lane)(e) := 0.U
+    }
+    when(batchEpochChanged) {
+      assert(outputQueuesEmpty,
+        "TrafficGen entered a batch epoch with legacy output records undrained")
+      for (slot <- 0 until replaySlots) {
+        lastAccessReadRespGenerations(slot) := accessReadRespGenerations(slot)
+      }
+      for (lane <- 0 until params.numGenerators) {
+        accessReadLaneSlot(lane) := Mux(issueFires(lane), 1.U, 0.U)
+      }
+      accessReadConsumePendingMask := accessReadSlotConsumeMask
+      io.roundStarted := true.B
+    }
+  }.elsewhen(state === sIdle) {
     when(acceptingRound) {
       roundCapacityBounded := io.accessStoreHasMore
       roundHadAccesses := io.accessStoreHasEntries
@@ -1195,7 +1257,7 @@ class TrafficGenRTLEngine(
   // Successful completion closes this session. Preserve its final cycle and
   // identity counters for diagnostics; only target reset starts another epoch.
   when(io.trafficGenDone || io.sessionStatus(3)) {
-    assert(state === sIdle,
+    assert(io.batchMode || state === sIdle,
       "TrafficGenRTLEngine session completed while a round was active")
     assert(!io.memActive && !bundleTableHasEntries,
       "TrafficGenRTLEngine session completed with unfinished bundles")
@@ -1344,6 +1406,8 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       }
 
       engine.io.uploadReady := io.uploadReady
+      engine.io.batchMode := io.batchMode
+      engine.io.replayEpoch := io.replayEpoch
       engine.io.minIssueCycle := io.minIssueCycle
       engine.io.startRound := io.startRound
       engine.io.trafficGenDone := io.trafficGenDone
@@ -1366,6 +1430,8 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       engine.io.accessStoreHasEntries := io.accessStoreHasEntries
       engine.io.accessStoreHasMore := io.accessStoreHasMore
       engine.io.memActive := io.memActive
+      engine.io.memPhysicalCompletionValidMask := io.memPhysicalCompletionValidMask
+      engine.io.memPhysicalCompletionTokens := io.memPhysicalCompletionTokens
       engine.io.memInflightAccesses := io.memInflightAccesses
       for (i <- 0 until params.numGenerators) {
         engine.io.completion(i).valid := io.completion(i).valid
@@ -1382,6 +1448,12 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
       io.currentCycleAfterIssue := engine.io.currentCycleAfterIssue
       io.dpiState := engine.io.dpiState
       io.issuedAccessBatch <> engine.io.issuedAccessBatch
+      io.physicalIssueValidMask := engine.io.physicalIssueValidMask
+      io.physicalIssueAccesses := engine.io.physicalIssueAccesses
+      io.physicalConsumeMask := engine.io.physicalConsumeMask
+      io.physicalCompletionValidMask := engine.io.physicalCompletionValidMask
+      io.physicalCompletionTokens := engine.io.physicalCompletionTokens
+      io.physicalCompletionCycles := engine.io.physicalCompletionCycles
       io.completedBundleIdWriteEn := engine.io.completedBundleIdWriteEn
       io.completedBundleIdWriteIdx := engine.io.completedBundleIdWriteIdx
       io.completedBundleIdWriteData := engine.io.completedBundleIdWriteData
@@ -1444,6 +1516,9 @@ class TrafficGenTL(params: TrafficGenParams, beatBytes: Int)(implicit p: Paramet
 }
 
 class TrafficGenMemIO(params: TrafficGenParams) extends Bundle {
+  val batchMode = Input(Bool())
+  // Accepted final memory response, before the legacy completion queue.
+  val physicalCompletion = Valid(UInt(64.W))
   val active = Output(Bool())
   val inflightAccessCount = Output(UInt(log2Ceil(params.memOutstanding + 1).W))
   val coreOffset = Input(UInt(32.W))
@@ -1597,18 +1672,20 @@ class TrafficGenMem(
       mem.c.valid := false.B
       mem.c.bits := DontCare
       mem.d.ready := dSourceValid && dRequestSent && dResponseValid &&
-        (!dLast || completionQueue.io.enq.ready)
+        (!dLast || io.batchMode || completionQueue.io.enq.ready)
       mem.e.valid := false.B
       mem.e.bits := DontCare
 
-      completionQueue.io.enq.valid := mem.d.valid && dSourceValid &&
+      completionQueue.io.enq.valid := !io.batchMode && mem.d.valid && dSourceValid &&
         dRequestSent && dResponseValid && dLast
       completionQueue.io.enq.bits := inflightAccesses(dSource)
       io.completion <> completionQueue.io.deq
+      io.physicalCompletion.valid := mem.d.fire && dLast
+      io.physicalCompletion.bits := inflightAccesses(dSource).physicalToken
       io.active := senderValid ||
         issueQueue.io.deq.valid ||
         inflightValid.asUInt.orR ||
-        completionQueue.io.deq.valid
+        (!io.batchMode && completionQueue.io.deq.valid)
       io.inflightAccessCount := PopCount(inflightValid)
 
       when(mem.a.fire) {
@@ -1629,7 +1706,7 @@ class TrafficGenMem(
         assert(!mem.d.bits.corrupt, "TrafficGenMem received a corrupt D response")
       }
       when(mem.d.fire && dLast) {
-        assert(completionQueue.io.enq.fire, "TrafficGenMem lost a completed access")
+        assert(io.batchMode || completionQueue.io.enq.fire, "TrafficGenMem lost a completed access")
         inflightValid(dSource) := false.B
         sentRequests(dSource) := false.B
       }
@@ -1821,7 +1898,7 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
       val dGrantReadyNoE = dSourceValid && sourceStates(dSource) === sWaitGrant
       val dReleaseAckReady = dSourceValid &&
         sourceStates(dSource) === sWaitReleaseAck &&
-        completionQueue.io.enq.ready
+        (io.batchMode || completionQueue.io.enq.ready)
 
       mem.e.valid := mem.d.valid && dIsGrant && dFirst && dGrantReadyNoE
       mem.e.bits := edge.GrantAck(mem.d.bits)
@@ -1933,7 +2010,8 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
       val cProbeCompletesAccess = cActiveIsProbe && cActiveProbeOwned
       val dReleaseAckCompletesAccess = mem.d.valid && dIsReleaseAck && dReleaseAckReady
       mem.c.valid := cActive &&
-        (!cProbeCompletesAccess || !cLast || (completionQueue.io.enq.ready && !dReleaseAckCompletesAccess))
+        (!cProbeCompletesAccess || !cLast ||
+          ((io.batchMode || completionQueue.io.enq.ready) && !dReleaseAckCompletesAccess))
 
       when(mem.c.fire && !cActiveIsProbe) {
         assert(Mux(cActiveReleaseDirty, releaseDirtyLegal, releaseCleanLegal),
@@ -1955,10 +2033,14 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
 
       val dCompletionFire = mem.d.fire && dIsReleaseAck && dSourceValid
       val cProbeCompletionFire = cDone && cActiveIsProbe && cActiveProbeOwned
-      completionQueue.io.enq.valid := dCompletionFire || cProbeCompletionFire
+      completionQueue.io.enq.valid := !io.batchMode && (dCompletionFire || cProbeCompletionFire)
       completionQueue.io.enq.bits := Mux(dCompletionFire,
         inflightAccesses(dSource),
         inflightAccesses(cActiveSource))
+      io.physicalCompletion.valid := dCompletionFire || cProbeCompletionFire
+      io.physicalCompletion.bits := Mux(dCompletionFire,
+        inflightAccesses(dSource).physicalToken,
+        inflightAccesses(cActiveSource).physicalToken)
 
       when(dCompletionFire) {
         inflightValid(dSource) := false.B
@@ -2009,7 +2091,7 @@ class TrafficGenMemL2(id: Int, beatBytes: Int, params: TrafficGenParams)(implici
       io.active := senderValid ||
         issueQueue.io.deq.valid ||
         inflightValid.asUInt.orR ||
-        completionQueue.io.deq.valid
+        (!io.batchMode && completionQueue.io.deq.valid)
       io.inflightAccessCount := PopCount(inflightValid)
     }
   }
@@ -2065,6 +2147,14 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.currentCycleAfterIssue <> trafficGenTL.module.io.currentCycleAfterIssue
       outerIO.bits.dpiState <> trafficGenTL.module.io.dpiState
       outerIO.bits.issuedAccessBatch <> trafficGenTL.module.io.issuedAccessBatch
+      outerIO.bits.physicalIssueValidMask := trafficGenTL.module.io.physicalIssueValidMask
+      outerIO.bits.physicalIssueAccesses := trafficGenTL.module.io.physicalIssueAccesses
+      outerIO.bits.physicalConsumeMask := trafficGenTL.module.io.physicalConsumeMask
+      outerIO.bits.physicalCompletionValidMask := trafficGenTL.module.io.physicalCompletionValidMask
+      outerIO.bits.physicalCompletionTokens := trafficGenTL.module.io.physicalCompletionTokens
+      outerIO.bits.physicalCompletionCycles := trafficGenTL.module.io.physicalCompletionCycles
+      trafficGenTL.module.io.batchMode := outerIO.bits.batchMode
+      trafficGenTL.module.io.replayEpoch := outerIO.bits.replayEpoch
       outerIO.bits.completedBundleIdWriteEn <> trafficGenTL.module.io.completedBundleIdWriteEn
       outerIO.bits.completedBundleIdWriteIdx <> trafficGenTL.module.io.completedBundleIdWriteIdx
       outerIO.bits.completedBundleIdWriteData <> trafficGenTL.module.io.completedBundleIdWriteData
@@ -2093,9 +2183,14 @@ trait CanHaveTrafficGen { this: BaseSubsystem =>
       outerIO.bits.uploadReady <> trafficGenTL.module.io.uploadReady
 
       trafficGenTL.module.io.memActive := generators.map(_.module.io.active).foldLeft(false.B)(_ || _)
+      trafficGenTL.module.io.memPhysicalCompletionValidMask :=
+        VecInit(generators.map(_.module.io.physicalCompletion.valid)).asUInt
+      trafficGenTL.module.io.memPhysicalCompletionTokens :=
+        VecInit(generators.map(_.module.io.physicalCompletion.bits)).asUInt
       trafficGenTL.module.io.memInflightAccesses := VecInit(generators.map(_.module.io.inflightAccessCount))
       generators.zipWithIndex.foreach { case (generator, i) =>
         generator.module.io.coreOffset := (BigInt(i) * params.regionStride).U
+        generator.module.io.batchMode := outerIO.bits.batchMode
         generator.module.io.req <> trafficGenTL.module.io.issue(i)
         trafficGenTL.module.io.completion(i) <> generator.module.io.completion
       }

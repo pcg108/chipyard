@@ -412,6 +412,8 @@ static void pack_l2_access(const trafficgen_l2_access_t &access,
                (static_cast<std::uint64_t>(access.bundle_generation) << 19) |
                (access.launch_id << 51);
     words[5] = access.launch_id >> 13;
+    words[5] |= access.physical_token << 51;
+    words[6] = access.physical_token >> 13;
     return;
   }
   words[3] = (static_cast<uint64_t>(access.m_set_index) << 32) |
@@ -436,6 +438,7 @@ unpack_issued_access(const uint64_t *words) {
   access.address = words[2];
   access.is_write = (words[3] & 0x1ULL) != 0;
   access.launch_id = (words[3] >> 1) | (words[4] << 63);
+  access.physical_token = (words[4] >> 1) | (words[5] << 63);
   return access;
 }
 
@@ -497,7 +500,7 @@ trafficgen_t::~trafficgen_t() = default;
 
 void trafficgen_t::init() {
   if (!use_rtl_engine)
-    throw std::runtime_error("TrafficGen socket protocol v2 requires the RTL engine; DPI multi-launch is unsupported");
+    throw std::runtime_error("TrafficGen socket protocol v7 requires the RTL engine; DPI LRC/multi-launch is unsupported");
   clear_round_log_entries(round_log_root, true);
   clear_round_log_entries(socket_round_log_root);
   std::ofstream lifecycle(round_log_root / "launches.csv");
@@ -506,6 +509,12 @@ void trafficgen_t::init() {
   std::ofstream controls(round_log_root / "controls.csv");
   if (!controls) throw std::runtime_error("TrafficGen cannot initialize control log");
   controls << "cycle,new_launches,pending_requests,outstanding_bundles,end_of_launches\n";
+  std::ofstream lrc_events(round_log_root / "lrc_events.csv");
+  if (!lrc_events) throw std::runtime_error("TrafficGen cannot initialize LRC event log");
+  lrc_events << "event,round,cycle,launch_id,request_uid,physical_id,recorded_service_id,bundle_id,address,is_write,action,source_ready_cycle\n";
+  std::ofstream lrc_boundaries(round_log_root / "lrc_boundaries.csv");
+  if (!lrc_boundaries) throw std::runtime_error("TrafficGen cannot initialize LRC boundary log");
+  lrc_boundaries << "round,hardware_boundary,cycle,flags,exit_reason\n";
   if (!boundary_log_path.empty()) {
     std::ofstream boundaries(boundary_log_path);
     if (!boundaries) throw std::runtime_error("TrafficGen cannot initialize boundary log");
@@ -530,6 +539,8 @@ void trafficgen_t::reset_workload_state() {
   issued_access_writeback_count = 0;
   issued_access_writeback_bytes_received = 0;
   issued_access_writeback_read_issued = false;
+  issued_lane_read_cursors.assign(lane_count, 0);
+  issued_lane_snapshot_counts.assign(lane_count, 0);
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
   current_round_all_l2_trace_steps.clear();
@@ -543,6 +554,15 @@ void trafficgen_t::reset_workload_state() {
   promoted_bundles.assign(lane_count, std::nullopt);
   bundle_assignment_by_request_uid.clear();
   bundle_tracker.clear();
+  lrc_ledger = trafficgen_lrc_ledger{};
+  tma_policy = trafficgen_tma_policy{};
+  tma_diagnostics = {}; tma_wake_cycles.clear(); ordinary_wake_cycles.clear();
+  lrc_new_round = false;
+  lrc_round_drain_only = false;
+  lrc_metadata_committed = false;
+  lrc_window_valid = false;
+  lrc_reuse_window = false;
+  lrc_pending_reports.clear();
   upload_written_to_bram = false;
   round_input_reserved_subpartitions.clear();
   state = trafficgen_state_t::IDLE;
@@ -636,7 +656,7 @@ void trafficgen_t::receive_scheduler_status() {
       throw std::runtime_error("TrafficGen launch acceptance/rejection before submission");
     if (next == DISPATCHED && slot.status != ACCEPTED)
       throw std::runtime_error("TrafficGen launch dispatch before acceptance");
-    if (next == COMPLETE && (slot.status < ACCEPTED || bundle_tracker.has_launch(id)))
+    if (next == COMPLETE && (slot.status < ACCEPTED || lrc_ledger.has_launch(id)))
       throw std::runtime_error("TrafficGen launch completed while requests remain");
     slot.status = next;
     std::ofstream log(round_log_root / "launches.csv", std::ios::app);
@@ -657,7 +677,7 @@ void trafficgen_t::receive_scheduler_status() {
     if (legacy_bootstrap_active)
       throw std::runtime_error("TrafficGen legacy launch rejected: " + rejected.reason);
   }
-  if (scheduler_status.idle && (!pending_access_cycle_by_id.empty() || bundle_tracker.has_pending()))
+  if (scheduler_status.idle && (!pending_access_cycle_by_id.empty() || lrc_ledger.has_pending() || tma_policy.pending()))
     throw std::runtime_error("TrafficGen scheduler is idle while client requests remain");
   session_truncated = scheduler_status.truncated;
   if (scheduler_status.truncated) {
@@ -667,6 +687,10 @@ void trafficgen_t::receive_scheduler_status() {
   if (scheduler_status.mainLoopComplete) {
     if (!close_sent || !scheduler_status.idle)
       throw std::runtime_error("TrafficGen scheduler completed before submission closed and work drained");
+    if (lrc_ledger.active_service_slots() || lrc_ledger.active_bundle_slots() ||
+        !lrc_pending_reports.empty() || read(mmio_addrs.lrc_service_count) ||
+        read(mmio_addrs.lrc_bundle_count) || read(mmio_addrs.lrc_timer_count) || read(mmio_addrs.lrc_report_count))
+      throw std::runtime_error("TrafficGen session completed with undrained native LRC monitor state");
     session_complete = true;
   }
 }
@@ -690,6 +714,15 @@ void trafficgen_t::finish_scheduler_boundary() {
   capture_launch_requests();
   publish_launch_status();
   if (session_complete) {
+    // The final public response and all reports have drained. End the policy's
+    // lifetime before publishing terminal status; this is not a scheduler round.
+    if (tma_policy.pending()) throw std::runtime_error("TrafficGen terminal session retains TMA wake groups");
+    if (!tma_policy.groups().empty() || tma_policy.edge_count()) {
+      tma_policy.replace({},lrc_ledger);
+      lrc_metadata_committed=false;
+      upload_lrc_metadata();
+      log_lrc_events();
+    }
     write(mmio_addrs.trafficgen_done, 1);
     write(mmio_addrs.resume_target, 1);
     gpu_model_socket_client->disconnect();
@@ -887,6 +920,7 @@ void trafficgen_t::build_next_l2_access_chunk() {
 }
 
 L2SubpartitionReservationsByCycle trafficgen_t::build_reserved_subpartitions_from_pending() const {
+  if (lrc_ledger.batch_active()) return lrc_ledger.reservations(last_reported_cycle);
 
   // create the {cycle : subpartition} reservation map from the un-issued accesses to send to scheduler
 
@@ -909,6 +943,14 @@ void trafficgen_t::depopulate_issued_accesses(
   trafficgen_bundle_recovery::remove_fresh_issued(
       l2_accesses, issued_accesses, pending_accesses_by_cycle,
       pending_access_cycle_by_id, require_complete_upload);
+  if (lrc_ledger.batch_active()) {
+    // Keep precisely the unissued part of the physical window. Rebuilding a
+    // maximum-size chunk here could admit requests never uploaded to hardware;
+    // retaining consumed members would break the eventual capacity check.
+    l2_accesses.erase(std::remove_if(l2_accesses.begin(), l2_accesses.end(),
+        [&](const auto &a) { return !pending_access_cycle_by_id.count({a.launch_id,a.id}); }),
+        l2_accesses.end());
+  }
   if (use_rtl_engine) {
     trafficgen_bundle_recovery::retire_issued_promotions(
         pending_accesses_by_cycle, promoted_bundles);
@@ -1120,6 +1162,7 @@ void trafficgen_t::log_engine_round_for_compare(
     const auto assignment =
         bundle_assignment_by_request_uid.find({access.launchId, access.mUniqueId});
     if (assignment == bundle_assignment_by_request_uid.end()) {
+      if (access.mBatchAction == LrcBatchAction::Attach || access.mBatchAction == LrcBatchAction::Reuse) continue;
       throw std::runtime_error(
           "TrafficGen missing bundle lane assignment while logging round");
     }
@@ -1177,7 +1220,40 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   min_issue_cycle = message.min_issue_cycle;
   std::vector<trafficgen_l2_access_t> fresh_accesses;
   fresh_accesses.reserve(message.allL2TraceSteps.size());
-  for (const auto &wire_access : message.allL2TraceSteps) {
+  const bool already_native = lrc_ledger.batch_active();
+  if (!use_rtl_engine && trafficgen_tma_policy::nonempty(message.tmaWakePolicy))
+    throw std::runtime_error("TrafficGen DPI backend does not support TMA wake policies");
+  const auto physical_accesses = lrc_ledger.add_schedule(message.allL2TraceSteps,
+      message.blockedWarpIds, last_reported_cycle, trafficgen_tma_policy::nonempty(message.tmaWakePolicy));
+  tma_policy.replace(message.tmaWakePolicy,lrc_ledger);
+  lrc_ledger.suppress_tma_wakes(tma_policy.known());
+  tma_diagnostics = {}; tma_wake_cycles.clear(); ordinary_wake_cycles.clear();
+  {
+    write_socket_snapshot((round_log_root / ("tma_policy_" + std::to_string(engine_round_number) + ".bin")).string(),
+                          message.tmaWakePolicy);
+    std::ofstream outstanding(round_log_root / ("tma_outstanding_" + std::to_string(engine_round_number) + ".csv"));
+    outstanding << "launch_id,request_uid\n";
+    for (const auto &id : message.tmaWakePolicy.outstandingRequests)
+      outstanding << id.launchId << ',' << id.requestUid << '\n';
+    if (!outstanding) throw std::runtime_error("TrafficGen cannot write TMA outstanding-request snapshot");
+    std::ofstream policy(round_log_root / ("tma_policy_" + std::to_string(engine_round_number) + ".csv"));
+    policy << "epoch,group,launch,cta,barrier,phase,transfer,conservative,ready_cycle,compiled_floor,member_launch,member_uid\n";
+    std::size_t slot=0;
+    for (const auto &g : tma_policy.groups()) {
+      const auto &p=g.source;
+      auto prefix = [&] { policy << tma_policy.epoch() << ',' << slot << ',' << p.launchId << ',' << p.destinationCta
+        << ',' << p.barrierAddress << ',' << p.phase << ',' << p.transferId << ',' << p.conservative
+        << ',' << p.readyCycle << ',' << g.floor << ','; };
+      if (p.requests.empty()) { prefix(); policy << ",\n"; }
+      for (const auto &id : p.requests) { prefix(); policy << id.launchId << ',' << id.requestUid << '\n'; }
+      ++slot;
+    }
+    if (!policy) throw std::runtime_error("TrafficGen cannot write TMA policy snapshot");
+  }
+  lrc_new_round = true;
+  lrc_round_drain_only = lrc_ledger.drain_only();
+  lrc_metadata_committed = false;
+  for (const auto &wire_access : physical_accesses) {
     trafficgen_l2_access_t access{};
     access.id = wire_access.mUniqueId;
     access.launch_id = wire_access.launchId;
@@ -1203,14 +1279,16 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
         "l2 access scheduler id");
     access.warp_id = checked_u32(
         static_cast<std::uint64_t>(wire_access.warpId), "l2 access warp id");
-    access.m_bundle_id = wire_access.mBundleId;
+    access.m_bundle_id = wire_access.mLrcEnabled ?
+        ((std::uint64_t{1} << 63) | wire_access.mPhysicalId) : wire_access.mBundleId;
     access.m_wake_relevant_bundle = wire_access.mWakeRelevantBundle;
     access.m_is_write = wire_access.mIsWrite;
     access.bundle_generation =
         checked_u32(engine_round_number, "bundle generation");
     fresh_accesses.push_back(access);
   }
-  bundle_tracker.add_schedule(fresh_accesses);
+  if (!lrc_ledger.batch_active()) bundle_tracker.add_schedule(fresh_accesses);
+  else bundle_tracker.clear();
   for (const auto &access : fresh_accesses) {
     if (!pending_access_cycle_by_id.emplace(trafficgen_request_key_t{access.launch_id, access.id}, access.cycle_count).second)
       throw std::runtime_error("TrafficGen duplicate pending request identity");
@@ -1219,8 +1297,13 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
 
-  refresh_pending_access_blocked_annotations();
-  if (use_rtl_engine) {
+  lrc_reuse_window = already_native && lrc_window_valid && physical_accesses.empty() &&
+      (!l2_accesses.empty() || pending_access_cycle_by_id.empty());
+  if (lrc_reuse_window) {
+    // Native wake interest lives in logical metadata. Neither physical lane
+    // annotations nor replay cursors change for Attach/Reuse/empty schedules.
+  } else if (use_rtl_engine) {
+    refresh_pending_access_blocked_annotations();
     assign_replay_lanes_and_bundle_counts();
     build_next_l2_access_chunk();
   } else {
@@ -1308,20 +1391,19 @@ trafficgen_t::process_issued_access_writeback_stream() {
   issued_access_writeback_entries.reserve(issued_access_writeback_count);
   std::size_t summed_count = 0;
   for (std::size_t lane = 0; lane < lane_count; ++lane) {
-    const std::uint32_t lane_count = read_issued_lane_count(lane);
-    const std::size_t lane_bytes = static_cast<std::size_t>(lane_count) * STREAM_WIDTH_BYTES;
-    if (lane_bytes > bank_stride_bytes) {
-      throw std::runtime_error("TrafficGen issued lane exceeds bank capacity");
-    }
-    summed_count += lane_count;
+    const auto first = issued_lane_read_cursors.at(lane);
+    const auto count = issued_lane_snapshot_counts.at(lane) - first;
+    const std::size_t lane_bytes = static_cast<std::size_t>(count) * STREAM_WIDTH_BYTES;
+    summed_count += count;
     if (lane_bytes == 0) continue;
     auto lane_data = make_aligned_bytes(lane_bytes);
     xdma_read_exact(
         xdma,
-        bram_base + raw_issued_access_writeback_store_offset + lane * bank_stride_bytes,
+        bram_base + raw_issued_access_writeback_store_offset + lane * bank_stride_bytes +
+            static_cast<std::size_t>(first) * STREAM_WIDTH_BYTES,
         lane_data.get(), lane_bytes,
         "XDMA read while reading banked issuedAccessWriteback");
-    for (std::uint32_t idx = 0; idx < lane_count; ++idx) {
+    for (std::uint32_t idx = 0; idx < count; ++idx) {
       const auto *words = reinterpret_cast<const std::uint64_t *>(
           lane_data.get() + static_cast<std::size_t>(idx) * STREAM_WIDTH_BYTES);
       auto access = unpack_issued_access(words);
@@ -1337,6 +1419,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
                      return lhs.cycle_issued < rhs.cycle_issued;
                    });
   issued_access_writeback_bytes_received = total_bytes;
+  issued_lane_read_cursors = issued_lane_snapshot_counts;
 
   std::cout << "[bridge driver] issuedAccessWriteback count="
             << issued_access_writeback_count << std::endl;
@@ -1347,6 +1430,13 @@ void trafficgen_t::write_schedule_to_bram() {
   if (upload_written_to_bram) {
     return;
   }
+  if (lrc_reuse_window) {
+    upload_lrc_metadata();
+    std::cout << "[bridge driver] retaining native replay window: remaining_entries="
+              << l2_accesses.size() << std::endl;
+    upload_written_to_bram = true;
+    return;
+  }
 
   // instead of a blocked warp map in the RTL engine, we annotate the pending and upload accesses with 
   // the blocked warp status from current round's blocked warp IDs
@@ -1355,6 +1445,9 @@ void trafficgen_t::write_schedule_to_bram() {
 
   // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O for XDMA
   auto &xdma = simif.get_cpu_managed_stream_io();
+  for (auto &access : l2_accesses)
+    access.physical_token = lrc_ledger.stage_service({access.launch_id,access.id});
+  upload_lrc_metadata();
 
   const size_t access_bytes = l2_accesses.size() * L2_ACCESS_STREAM_BYTES;
   if (access_bytes > access_window_bytes) {
@@ -1443,8 +1536,136 @@ void trafficgen_t::write_schedule_to_bram() {
   write(mmio_addrs.access_store_has_more,
         pending_access_cycle_by_id.size() > l2_accesses.size() ? 1 : 0);
   write(mmio_addrs.commit_upload, 1);
+  issued_lane_read_cursors.assign(lane_count, 0);
+  issued_lane_snapshot_counts.assign(lane_count, 0);
+  lrc_window_valid = lrc_ledger.batch_active();
 
   upload_written_to_bram = true;
+}
+
+void trafficgen_t::upload_lrc_metadata() {
+  if (lrc_metadata_committed) return;
+  if (read(mmio_addrs.lrc_service_capacity) != 65536 ||
+      read(mmio_addrs.lrc_bundle_capacity) != 65536 || read(mmio_addrs.lrc_timer_capacity) != 65536)
+    throw std::runtime_error("TrafficGen requires native LRC monitor with 65536 service/bundle/timer slots");
+  auto descriptors = lrc_ledger.descriptors(true);
+  const auto wake_descriptors = tma_policy.descriptors(lrc_ledger);
+  descriptors.insert(descriptors.end(),wake_descriptors.begin(),wake_descriptors.end());
+  auto &xdma = simif.get_cpu_managed_stream_io();
+  for (std::size_t offset = 0; offset < descriptors.size() || offset == 0; offset += 65536) {
+    const auto count = std::min<std::size_t>(65536, descriptors.size()-offset);
+    if (count) {
+      auto data = make_aligned_bytes(count * 64);
+      std::memcpy(data.get(), descriptors.data()+offset, count * 64);
+      xdma_write_exact(xdma, bram_base+LRC_METADATA_OFFSET, data.get(), count*64, "LRC metadata upload");
+    }
+    write(mmio_addrs.lrc_metadata_count, static_cast<std::uint32_t>(count));
+    write(mmio_addrs.lrc_commit_metadata, 1);
+    std::size_t polls = 0;
+    while (!read(mmio_addrs.lrc_metadata_ready))
+      if (++polls == 1000000) throw std::runtime_error("LRC metadata commit did not finish");
+    if (read(mmio_addrs.lrc_error)) throw std::runtime_error("LRC monitor rejected metadata");
+    if (!count) break;
+  }
+  write(mmio_addrs.lrc_enable, lrc_ledger.batch_active());
+  write(mmio_addrs.lrc_refill_only, !lrc_new_round);
+  write(mmio_addrs.lrc_drain_only, lrc_round_drain_only);
+  const auto horizon = lrc_ledger.arrival_horizon();
+  write(mmio_addrs.lrc_arrival_horizon_low, static_cast<std::uint32_t>(horizon));
+  write(mmio_addrs.lrc_arrival_horizon_high, static_cast<std::uint32_t>(horizon >> 32));
+  if (lrc_new_round) write(mmio_addrs.lrc_begin_round, 1);
+  lrc_ledger.descriptors_committed();
+  tma_policy.committed(lrc_ledger);
+  lrc_new_round = false;
+  lrc_metadata_committed = true;
+}
+
+void trafficgen_t::drain_lrc_reports() {
+  if (read(mmio_addrs.lrc_error)) throw std::runtime_error("LRC native monitor error");
+  const std::size_t count = read(mmio_addrs.lrc_report_count);
+  if (count > 131072) throw std::runtime_error("LRC native report window overflow");
+  std::vector<trafficgen_lrc_ledger::descriptor_t> records(count);
+  if (count) {
+    auto data = make_aligned_bytes(count * 64);
+    xdma_read_exact(simif.get_cpu_managed_stream_io(), bram_base+LRC_REPORT_OFFSET,
+                    data.get(), count*64, "LRC native reports");
+    std::memcpy(records.data(), data.get(), count*64);
+  }
+  lrc_pending_reports.insert(lrc_pending_reports.end(),records.begin(),records.end());
+  write(mmio_addrs.lrc_clear_reports,1);
+}
+
+void trafficgen_t::process_lrc_reports(std::uint64_t cycle) {
+  drain_lrc_reports();
+  for (const auto &r : lrc_pending_reports) {
+    const auto kind = trafficgen_lrc_ledger::bits(r,0,8);
+    const auto token = trafficgen_lrc_ledger::bits(r,8,64);
+    const auto at = trafficgen_lrc_ledger::bits(r,72,64);
+    if (at > cycle || (kind < 1 || kind > 4)) throw std::runtime_error("LRC invalid native event");
+    if (kind == 1) lrc_ledger.returned(token,at);
+  }
+  lrc_ledger.advance(cycle);
+  for (const auto &r : lrc_pending_reports)
+    if (trafficgen_lrc_ledger::bits(r,0,8) == 2) {
+      const auto id = trafficgen_lrc_ledger::bits(r,8,64), at = trafficgen_lrc_ledger::bits(r,72,64);
+      if (lrc_ledger.batch_active()) {
+        if (lrc_ledger.bundles().at(id).wake) ordinary_wake_cycles.insert(at);
+        lrc_ledger.complete_bundle(id,at);
+      }
+      else lrc_ledger.ordinary_native_retired(id,at);
+    }
+  for (const auto &r : lrc_pending_reports) {
+    const auto kind=trafficgen_lrc_ledger::bits(r,0,8);
+    if (kind<3) continue;
+    const auto id=trafficgen_lrc_ledger::bits(r,8,64), at=trafficgen_lrc_ledger::bits(r,72,64);
+    tma_policy.wake(id,at,kind==4,lrc_ledger);
+    tma_wake_cycles.insert(at);
+    if (kind==4) ++tma_diagnostics.transferWakeups; else ++tma_diagnostics.phaseWakeups;
+    std::ofstream log(round_log_root / "tma_wakes.csv",std::ios::app);
+    log << engine_round_number << ',' << (id>>32) << ',' << static_cast<std::uint32_t>(id) << ',' << at << ',' << kind << '\n';
+    if (!log) throw std::runtime_error("TrafficGen cannot write TMA wake log");
+  }
+  lrc_pending_reports.clear();
+  lrc_metadata_committed = false;
+}
+
+void trafficgen_t::log_lrc_events() {
+  const auto events = lrc_ledger.take_events();
+  const auto pending_requests = lrc_ledger.pending_request_count();
+  const auto pending_services = lrc_ledger.pending_service_count();
+  std::ofstream state(round_log_root / "lrc_state.json");
+  if (!state) throw std::runtime_error("TrafficGen cannot write LRC ledger state");
+  state << "{\"pending_requests\":" << pending_requests << ",\"pending_services\":" << pending_services
+        << ",\"pending_bundles\":" << lrc_ledger.bundles().size()
+        << ",\"active_service_slots\":" << lrc_ledger.active_service_slots()
+        << ",\"active_bundle_slots\":" << lrc_ledger.active_bundle_slots()
+        << ",\"service_high_water\":" << lrc_ledger.service_high_water()
+        << ",\"bundle_high_water\":" << lrc_ledger.bundle_high_water()
+        << ",\"hardware_service_count\":" << read(mmio_addrs.lrc_service_count)
+        << ",\"hardware_bundle_count\":" << read(mmio_addrs.lrc_bundle_count)
+        << ",\"hardware_timer_count\":" << read(mmio_addrs.lrc_timer_count)
+        << ",\"hardware_report_count\":" << read(mmio_addrs.lrc_report_count)
+        << ",\"hardware_service_high_water\":" << read(mmio_addrs.lrc_service_high_water)
+        << ",\"hardware_bundle_high_water\":" << read(mmio_addrs.lrc_bundle_high_water)
+        << ",\"hardware_timer_high_water\":" << read(mmio_addrs.lrc_timer_high_water)
+        << ",\"hardware_report_high_water\":" << read(mmio_addrs.lrc_report_high_water)
+        << ",\"tma_pending\":" << tma_policy.pending()
+        << ",\"tma_groups\":" << read(mmio_addrs.tma_group_count)
+        << ",\"tma_edges\":" << read(mmio_addrs.tma_edge_count)
+        << ",\"tma_timers\":" << read(mmio_addrs.tma_timer_count)
+        << ",\"tma_group_high_water\":" << read(mmio_addrs.tma_group_high_water)
+        << ",\"tma_edge_high_water\":" << read(mmio_addrs.tma_edge_high_water)
+        << ",\"tma_timer_high_water\":" << read(mmio_addrs.tma_timer_high_water)
+        << ",\"boundary_flags\":" << read(mmio_addrs.lrc_boundary_flags) << "}\n";
+  if (events.empty()) return;
+  std::ofstream output(round_log_root / "lrc_events.csv",std::ios::app);
+  if (!output) throw std::runtime_error("TrafficGen cannot append LRC event log");
+  for (const auto &e : events)
+    output << e.event << ',' << engine_round_number << ',' << e.cycle << ',' << e.launch << ','
+           << e.uid << ',' << e.physical << ',' << e.recorded << ',' << e.bundle << ','
+           << e.address << ',' << e.write << ',' << trafficgen_lrc_ledger::action_name(e.action) << ','
+           << e.source_ready_cycle << '\n';
+  if (!output) throw std::runtime_error("TrafficGen failed writing LRC events");
 }
 
 void trafficgen_t::tick() {
@@ -1525,6 +1746,12 @@ void trafficgen_t::tick_impl() {
 
     break;
   case trafficgen_state_t::ISSUING_TRAFFIC:
+    if (read(mmio_addrs.lrc_report_drain_required)) {
+      // The bridge holds an unprocessed target token. Drain only the report
+      // FIFO; its issues are decoded at the eventual completed boundary.
+      drain_lrc_reports();
+      break;
+    }
     // Wait for the target to finish generating memory traffic for the current round.
 
     // The target is already stopped at the token containing roundComplete.
@@ -1549,7 +1776,19 @@ void trafficgen_t::tick_impl() {
 
       // read issued accesses from bridge module 
       if (!issued_access_writeback_read_issued) {
-        issued_access_writeback_count = static_cast<uint32_t>(read(mmio_addrs.issued_access_writeback_count));
+        const auto total = static_cast<std::uint32_t>(read(mmio_addrs.issued_access_writeback_count));
+        const auto lane_capacity = access_window_bytes / lane_count / STREAM_WIDTH_BYTES;
+        std::size_t summed = 0, fresh = 0;
+        for (std::size_t lane = 0; lane < lane_count; ++lane) {
+          const auto count = read_issued_lane_count(lane);
+          if (count > lane_capacity || count < issued_lane_read_cursors.at(lane))
+            throw std::runtime_error("TrafficGen issued lane count regressed or exceeded capacity");
+          issued_lane_snapshot_counts.at(lane) = count;
+          summed += count;
+          fresh += count - issued_lane_read_cursors.at(lane);
+        }
+        if (summed != total) throw std::runtime_error("TrafficGen cumulative issued lane counts do not match total");
+        issued_access_writeback_count = static_cast<std::uint32_t>(fresh);
         issued_access_writeback_stream_bytes.assign(static_cast<size_t>(issued_access_writeback_count) * STREAM_WIDTH_BYTES, 0);
         issued_access_writeback_bytes_received = 0;
         issued_access_writeback_entries.clear();
@@ -1573,6 +1812,12 @@ void trafficgen_t::tick_impl() {
       const std::uint32_t round_exit_reason =
           static_cast<std::uint32_t>(read(mmio_addrs.round_exit_reason));
       ++hardware_boundary_number;
+      {
+        std::ofstream log(round_log_root / "lrc_boundaries.csv",std::ios::app);
+        if (!log) throw std::runtime_error("TrafficGen cannot append LRC boundary log");
+        log << engine_round_number << ',' << hardware_boundary_number << ',' << target_cycle_after_issue
+            << ',' << read(mmio_addrs.lrc_boundary_flags) << ',' << round_exit_reason << '\n';
+      }
       if (round_exit_reason != kRoundExitScheduling &&
           round_exit_reason != kRoundExitCapacity &&
           round_exit_reason != kRoundExitBundleTableFull &&
@@ -1587,10 +1832,19 @@ void trafficgen_t::tick_impl() {
       for (const auto &point : issued_access_writeback_entries)
         if (point.cycle_issued > target_cycle_after_issue)
           throw std::runtime_error("TrafficGen issue lies after result cycle");
-      bundle_tracker.record_issued(issued_access_writeback_entries);
+      for (const auto &point : issued_access_writeback_entries)
+        lrc_ledger.issued({point.launch_id,point.request_uid},point.physical_token,point.cycle_issued);
+      process_lrc_reports(target_cycle_after_issue);
+      if (!lrc_ledger.batch_active()) bundle_tracker.record_issued(issued_access_writeback_entries);
       const std::vector<std::uint64_t> fresh_completed(completed_bundle_ids.begin(),
                                                        completed_bundle_ids.begin() + completed_bundle_count);
-      bundle_tracker.complete(fresh_completed);
+      if (!lrc_ledger.batch_active()) {
+        bundle_tracker.complete(fresh_completed);
+        for (const auto id : fresh_completed) {
+          if (lrc_ledger.bundles().at(id).wake) ordinary_wake_cycles.insert(target_cycle_after_issue);
+          lrc_ledger.complete_bundle(id,target_cycle_after_issue);
+        }
+      }
       accumulated_issued_accesses.insert(accumulated_issued_accesses.end(),
                                          issued_access_writeback_entries.begin(),
                                          issued_access_writeback_entries.end());
@@ -1624,6 +1878,7 @@ void trafficgen_t::tick_impl() {
       }
       if (!control_waiting && (round_exit_reason == kRoundExitCapacity ||
           round_exit_reason == kRoundExitBundleTableFull)) {
+        lrc_reuse_window = false;
         if (pending_accesses_by_cycle.empty()) {
           throw std::runtime_error(
               "TrafficGen engine reported an internal refill exit without another "
@@ -1658,24 +1913,33 @@ void trafficgen_t::tick_impl() {
           read(mmio_addrs.has_pending_work) != 0;
 
       TrafficGenResultMessage message;
-      message.trafficGenResult.issuedAccesses.reserve(
-          accumulated_issued_accesses.size());
-      for (const auto &issued : accumulated_issued_accesses) {
-        IssuedAccessPoint issued_access_point{};
-        issued_access_point.launchId = issued.launch_id;
-        issued_access_point.requestUid = issued.request_uid;
-        issued_access_point.cycleIssued = issued.cycle_issued;
-        issued_access_point.address = issued.address;
-        issued_access_point.isWrite = issued.is_write;
-        message.trafficGenResult.issuedAccesses.push_back(
-            issued_access_point);
+      message.trafficGenResult = lrc_ledger.take_result(target_cycle_after_issue);
+      tma_diagnostics.ordinaryWakeups = ordinary_wake_cycles.size();
+      for (const auto &point : message.trafficGenResult.completedAccesses)
+        if (tma_policy.known().count({point.launchId,point.requestUid}) &&
+            !tma_wake_cycles.count(point.cycleIssued) && !ordinary_wake_cycles.count(point.cycleIssued))
+          ++tma_diagnostics.tmaCompletionsWithoutWakeup;
+      const auto flags=read(mmio_addrs.lrc_boundary_flags);
+      if (!tma_diagnostics.ordinaryWakeups && !tma_diagnostics.phaseWakeups && !tma_diagnostics.transferWakeups) {
+        if (!lrc_ledger.batch_active()) {
+          if (!engine_has_pending_work && !lrc_ledger.has_pending() && pending_access_cycle_by_id.empty())
+            ++tma_diagnostics.drainReturns;
+          else if (target_cycle_after_issue >= min_issue_cycle) ++tma_diagnostics.deadlineReturns;
+          else ++tma_diagnostics.issueBoundaryReturns;
+        } else if (!lrc_ledger.lrc_commands_active() && (flags & 8)) ++tma_diagnostics.drainReturns;
+        else if (flags & 2) ++tma_diagnostics.deadlineReturns;
+        else if (flags & 4) ++tma_diagnostics.issueBoundaryReturns;
+        else if (flags & 8) ++tma_diagnostics.drainReturns;
       }
-      message.trafficGenResult.completedBundleIds =
-          accumulated_completed_bundle_ids;
-      message.trafficGenResult.currentCycleAfterIssue =
-          target_cycle_after_issue;
+      message.trafficGenResult.wakeDiagnostics = tma_diagnostics;
+      accumulated_issued_accesses.clear();
+      for (const auto &point : message.trafficGenResult.issuedAccesses)
+        accumulated_issued_accesses.push_back({point.requestUid,point.launchId,point.cycleIssued,
+                                              point.address,point.isWrite,0});
+      accumulated_completed_bundle_ids = message.trafficGenResult.completedBundleIds;
       message.hasPendingWork = engine_has_pending_work ||
-          !pending_access_cycle_by_id.empty() || bundle_tracker.has_pending();
+          !pending_access_cycle_by_id.empty() || lrc_ledger.has_pending() || tma_policy.pending();
+      log_lrc_events();
       log_engine_round_for_compare(accumulated_issued_accesses,
                                    accumulated_completed_bundle_ids,
                                    target_cycle_after_issue);

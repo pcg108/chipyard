@@ -30,7 +30,7 @@ int main() {
   wire::TrafficGenInitializationMessage init;
   init.currentCycle = high + 1;
   auto gpu_init = gpu_decode<GPU::TrafficGenInitializationMessage>(wire::serialize_message(init));
-  assert(gpu_init.currentCycle == init.currentCycle && gpu_init.protocolVersion == 2);
+  assert(gpu_init.currentCycle == init.currentCycle && gpu_init.protocolVersion == 7);
   wire::RoundControlMessage control;
   control.currentCycle = high + 2;
   control.launches = {{high + 10, high + 100, 1}, {high + 11, high + 101, 2}};
@@ -59,6 +59,8 @@ int main() {
     access.mKernelFolder = "same_recorded_kernel";
     schedule.allL2TraceSteps.push_back(access); schedule.blockedWarpIds.insert(access.GetWarpKey());
   }
+  schedule.tmaWakePolicy.outstandingRequests = {{high+100,7},{high+101,7}};
+  schedule.tmaWakePolicy.groups = {{high+100,19,high+31,high+32,high+33,true,high+34,{{high+100,7},{high+101,7}}}};
   auto received = wire::deserialize_message<wire::SchedulerRoundMessage>(gpu_encode(schedule));
   assert(received.allL2TraceSteps.size() == 2 && received.blockedWarpIds.size() == 2 && received.min_issue_cycle == high + 20);
   for (unsigned i = 0; i < 2; ++i) {
@@ -74,6 +76,14 @@ int main() {
   // match on both output and input, including nested vector/set item versions.
   auto roundtrip = gpu_decode<GPU::SchedulerRoundMessage>(wire::serialize_message(received));
   assert(roundtrip.allL2TraceSteps[1].launchId == high + 101 && roundtrip.blockedWarpIds.size() == 2);
+  const auto &g = roundtrip.tmaWakePolicy.groups.at(0);
+  assert(g.launchId == high+100 && g.destinationCta == 19 && g.barrierAddress == high+31);
+  assert(g.phase == high+32 && g.transferId == high+33 && g.conservative && g.readyCycle == high+34);
+  assert(g.requests.size() == 2 && g.requests[1].launchId == high+101 && g.requests[1].requestUid == 7);
+  assert(roundtrip.tmaWakePolicy.outstandingRequests == schedule.tmaWakePolicy.outstandingRequests);
+  received.tmaWakePolicy = {};
+  const auto empty = gpu_decode<GPU::SchedulerRoundMessage>(wire::serialize_message(received));
+  assert(empty.tmaWakePolicy.groups.empty() && empty.tmaWakePolicy.outstandingRequests.empty());
   wire::TrafficGenResultMessage result;
   result.trafficGenResult.issuedAccesses = {{7, high + 5, high + 0x100, true, high + 100}, {7, high + 6, high + 0x100, false, high + 101}};
   result.trafficGenResult.completedBundleIds = {high + 200, high + 201};
@@ -87,9 +97,46 @@ int main() {
   must_fail([&] { gpu_decode<GPU::SchedulingRoundStateMessage>(wire::serialize_message(result)); });
   for (unsigned mode = 0; mode < 3; ++mode) {
     std::ostringstream out(std::ios::binary); boost::archive::binary_oarchive archive(out);
-    std::uint32_t magic = mode == 0 ? 0 : wire::kSocketMagic, version = mode == 1 ? 1 : 2, kind = mode == 2 ? 5 : 2;
+    std::uint32_t magic = mode == 0 ? 0 : wire::kSocketMagic, version = mode == 1 ? 2 : 7, kind = mode == 2 ? 5 : 2;
     archive & magic; archive & version; archive & kind; archive << status;
     must_fail([&] { wire::deserialize_message<wire::SchedulingRoundStateMessage>(out.str()); });
   }
-  std::cout << "TrafficGen protocol v2 official producer/consumer tests passed\n";
+  // Every LRC extension is checked through the independent official serializer.
+  auto &a = schedule.allL2TraceSteps.front();
+  a.mLrcEnabled = true; a.mHasLrcService = true; a.mLrcServiceId = high+501;
+  a.mLrcIssueCycle = high+502; a.mLrcLatency = high+503;
+  a.mPhysicalId = high+504; a.mSourceReadyCycle = high+505; a.mPriorRoundJoin = true;
+  a.mBatchAction = GPU::LrcBatchAction::Attach; a.mContributors = {a};
+  const auto lrc = wire::deserialize_message<wire::SchedulerRoundMessage>(gpu_encode(schedule));
+  const auto &m = lrc.allL2TraceSteps.front();
+  assert(m.mLrcEnabled && m.mHasLrcService && m.mLrcServiceId == high+501);
+  assert(m.mLrcIssueCycle == high+502 && m.mLrcLatency == high+503 && m.mPhysicalId == high+504);
+  assert(m.mSourceReadyCycle == high+505 && m.mPriorRoundJoin && m.mBatchAction == wire::LrcBatchAction::Attach);
+  assert(m.mContributors.size() == 1 && m.mContributors.front().launchId == a.launchId);
+  const auto lrc_roundtrip = gpu_decode<GPU::SchedulerRoundMessage>(wire::serialize_message(lrc));
+  assert(lrc_roundtrip.allL2TraceSteps.front().mContributors.front().mPhysicalId == high+504);
+  auto &r = result.trafficGenResult;
+  r.physicalAccesses = {{high+1,high+2,high+3,high+4,high+5,true,high+6,true}};
+  r.physicalCompletions = {{high+1,high+2,high+6,high+7,{high+3,high+8}}};
+  r.sourceReadyAccesses = r.issuedAccesses; r.completedAccesses = r.issuedAccesses; r.reusedAccesses = r.issuedAccesses;
+  r.lrcStats = {1,2,3,4,5,6,7,8,9}; r.lrcStatsByLaunch[high+6] = r.lrcStats;
+  r.wakeDiagnostics = {high+11,high+12,high+13,high+14,high+15,high+16,high+17};
+  const auto extended = gpu_decode<GPU::TrafficGenResultMessage>(wire::serialize_message(result));
+  assert(extended.trafficGenResult.physicalAccesses.front().isLrcService);
+  assert(extended.trafficGenResult.physicalCompletions.front().requestUids.back() == high+8);
+  assert(extended.trafficGenResult.lrcStatsByLaunch.at(high+6).reusedContributors == 9);
+  assert(extended.trafficGenResult.completedAccesses.size() == 2 && extended.trafficGenResult.reusedAccesses.size() == 2);
+  const auto back = wire::deserialize_message<wire::TrafficGenResultMessage>(gpu_encode(extended));
+  assert(back.trafficGenResult.physicalCompletions.front().cycleCompleted == high+7);
+  assert(extended.trafficGenResult.wakeDiagnostics.phaseWakeups == high+11);
+  const auto &d = back.trafficGenResult.wakeDiagnostics;
+  assert(d.phaseWakeups == high+11 && d.transferWakeups == high+12 && d.tmaCompletionsWithoutWakeup == high+13);
+  assert(d.ordinaryWakeups == high+14 && d.deadlineReturns == high+15 && d.issueBoundaryReturns == high+16 && d.drainReturns == high+17);
+  for (std::uint32_t version : {2U,6U,8U}) {
+    std::ostringstream out(std::ios::binary); boost::archive::binary_oarchive archive(out);
+    std::uint32_t magic = wire::kSocketMagic, kind = 2;
+    archive & magic & version & kind; archive << status;
+    must_fail([&] { wire::deserialize_message<wire::SchedulingRoundStateMessage>(out.str()); });
+  }
+  std::cout << "TrafficGen protocol v7 official producer/consumer tests passed\n";
 }

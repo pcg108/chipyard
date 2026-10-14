@@ -22,6 +22,7 @@ import freechips.rocketchip.tilelink.{TLBundle}
 import org.chipsalliance.diplomacy.nodes.{HeterogeneousBag}
 import firechip.bridgeinterfaces.{
   CompletedBundleIds,
+  IssuedAccess,
   IssuedAccessBatch,
   L2Access,
   RTLL2Access,
@@ -147,6 +148,14 @@ class TrafficGenPortPeripheralIO(numLanes: Int, useRTL: Boolean) extends Bundle 
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
   val issuedAccessBatch = Decoupled(new IssuedAccessBatch(numLanes))
+  val physicalIssueValidMask = Output(UInt(numLanes.W))
+  val physicalIssueAccesses = Output(UInt((numLanes * IssuedAccess.streamWidthBits).W))
+  val physicalConsumeMask = Output(UInt(replaySlots.W))
+  val physicalCompletionValidMask = Output(UInt(numLanes.W))
+  val physicalCompletionTokens = Output(UInt((numLanes * 64).W))
+  val physicalCompletionCycles = Output(UInt((numLanes * 64).W))
+  val batchMode = Input(Bool())
+  val replayEpoch = Input(UInt(32.W))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))
