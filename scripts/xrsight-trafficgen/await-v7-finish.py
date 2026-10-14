@@ -15,7 +15,7 @@ while True:
         sys.exit(1)
     if status['state'] == 'bitstream_build_finished':
         os.execv('/bin/bash', ['bash', '-c',
-            'source "$1/env.sh"; exec python3 "$1/scripts/xrsight-trafficgen/finish-v7.py"',
+            'set -e; source "$1/env.sh"; exec "$1/.conda-env/bin/python3" "$1/scripts/xrsight-trafficgen/finish-v7.py"',
             'finish-v7', str(root)])
     # A dead build supervisor is not authorization to restart it.
     manager = int((work / 'continuation.pid').read_text())

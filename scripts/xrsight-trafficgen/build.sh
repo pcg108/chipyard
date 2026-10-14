@@ -6,7 +6,9 @@ stage=${1:-elaborate}
 source "$root/env.sh"
 export FS_DIR="$root/sims/firesim"
 export FIRESIM_ENV_SOURCED=1 FIRESIM_SOURCED=1
-export PATH="/home/prashanth/chipyard/.vecadd-sim/espresso-build:$FS_DIR/deploy:$PATH"
+# The model tests prepend /usr/bin. Re-activating an already-active Conda
+# environment can leave that ordering intact; restore the build environment.
+export PATH="$root/.conda-env/bin:/home/prashanth/chipyard/.vecadd-sim/espresso-build:$FS_DIR/deploy:$PATH"
 export TMPDIR="$work/tmp"
 export SBT_OPTS="-Dsbt.supershell=false -Dsbt.server.forcestart=true"
 export COURSIER_CACHE=/home/prashanth/.cache/coursier/v1
