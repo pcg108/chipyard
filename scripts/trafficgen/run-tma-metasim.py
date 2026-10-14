@@ -35,7 +35,9 @@ def main():
     parser.add_argument('--kernel', type=int, choices=(6632,6668), default=6632)
     parser.add_argument('--port', type=int, default=50052)
     parser.add_argument('--max-cycles', type=int, default=300000000)
-    parser.add_argument('--timeout', type=int, default=7200)
+    # The accepted smaller-target 6632 replay already took 9,284 seconds.
+    # Match that run's explicit twelve-hour limit for the combined target.
+    parser.add_argument('--timeout', type=int, default=43200)
     parser.add_argument('--design', default='FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig')
     parser.add_argument('--fpga', action='store_true', help='Use a freshly programmed physical U250 with --simulator DRIVER')
     parser.add_argument('--policy-decoder', type=Path, required=True,

@@ -14,6 +14,8 @@ p=argparse.ArgumentParser()
 p.add_argument('--build-output',type=Path,required=True)
 p.add_argument('--smoke-result',type=Path,required=True)
 p.add_argument('--output',type=Path,required=True)
+p.add_argument('--validation-root',type=Path,required=True,
+               help='Fresh build workspace containing provenance and validation evidence')
 p.add_argument('--xrsight',type=Path,default=Path('/home/prashanth/illixr_example_zephyr'))
 a=p.parse_args()
 root=Path(__file__).resolve().parents[2]
@@ -27,6 +29,10 @@ reports=build/'vivado_proj/reports'
 skew=list((build/'vivado_proj/firesim.runs/impl_1').glob('overall_fpga_top_bus_skew_postroute_physopted.rpt'))
 require(len(skew)==1,'Missing final bus-skew report')
 smoke=json.loads(a.smoke_result.read_text());require(smoke['status']=='passed','Combined smoke has not passed')
+validation_root=a.validation_root.resolve()
+fresh_elaboration=validation_root/'validation/elaboration.json'
+fresh_sources=validation_root/'provenance/build-source.json'
+require(fresh_elaboration.is_file() and fresh_sources.is_file(),'Missing fresh build evidence')
 record={
     'timing':parse_final_timing(reports/'final_timing_summary.rpt'),
     'routing':parse_final_route(reports/'final_route_status.rpt'),
@@ -65,10 +71,17 @@ record['driver_files']={name:evidence(path) for path,name in contents}
 for name in ['gemmini_params_illixr.h','gemmini_params_illixr_int8.h']:
     shutil.copy2(root/name,out/name)
 source_manifest=json.loads((root/'scripts/xrsight-trafficgen/build-manifest.json').read_text())
+source_manifest['baseline_source_checkouts']=source_manifest.pop('source_checkouts')
+source_manifest['fresh_source_provenance']=json.loads(fresh_sources.read_text())
 source_manifest['build_source_commit']=record['source_commit']
 source_manifest['validation'].update(combined_target_metasimulation='passed',bitstream='passed_final_timing_and_routing')
 (out/'source-manifest.json').write_text(json.dumps(source_manifest,indent=2)+'\n')
-shutil.copy2(root/'scripts/xrsight-trafficgen/source-record/elaboration.json',out/'elaboration.json')
+shutil.copy2(fresh_elaboration,out/'elaboration.json')
+shutil.copy2(fresh_sources,out/'build-source.json')
+for name in ('tma-elaboration.json',):
+    shutil.copy2(validation_root/'validation'/name,out/name)
+for mode in ('reference-6632','metasim-6632'):
+    shutil.copy2(validation_root/mode/'validation.json',out/(mode+'-validation.json'))
 shutil.copy2(a.smoke_result,out/'smoke-result.json')
 shutil.copy2(build/'firesim.tar.gz',out/'firesim.tar.gz')
 record['bitstream']=evidence(out/'firesim.tar.gz');record['driver_archive']=evidence(out/'driver.tar.gz')
@@ -77,7 +90,7 @@ runtime_dest=root/'sims/firesim/sim/custom-runtime-configs'/runtime.name
 runtime_dest.parent.mkdir(parents=True,exist_ok=True)
 if runtime_dest.exists(): require(runtime_dest.read_bytes()==runtime.read_bytes(),'Conflicting runtime config')
 else: shutil.copy2(runtime,runtime_dest)
-alias='alveo_u250_quad_rocket_dual_gemmini_saturn_trafficgen_abi3'
+alias='alveo_u250_quad_rocket_dual_gemmini_saturn_trafficgen_v7'
 (out/'config_hwdb.yaml').write_text(json.dumps({alias:{
     'bitstream_tar':(out/'firesim.tar.gz').as_uri(),
     'driver_tar':(out/'driver.tar.gz').as_uri(),
