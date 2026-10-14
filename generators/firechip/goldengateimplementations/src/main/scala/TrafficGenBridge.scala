@@ -26,6 +26,9 @@ object TrafficGenBRAMAddressMap {
   val rawCompletedBundleIdsOffset: BigInt       = BigInt("04480000", 16)
   val lrcMetadataOffset: BigInt = BigInt("05000000", 16)
   val lrcReportOffset: BigInt = BigInt("05800000", 16)
+  // Logical tables retain their capacities; metadata is installed in paused chunks.
+  val lrcMetadataEntries = 4096
+  val lrcReportPayloadBits = 136 // kind, 64-bit identity, 64-bit cycle
 }
 
 class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
@@ -127,20 +130,21 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     RAMStyleHint(lrcMonitor.services, RAMStyles.BLOCK)
     RAMStyleHint(lrcMonitor.bundles, RAMStyles.BLOCK)
     RAMStyleHint(lrcMonitor.heap.mem, RAMStyles.BLOCK)
-    val lrcMetadata = SyncReadMem(65536, UInt(512.W))
-    val lrcReports = SyncReadMem(131072, UInt(512.W))
+    val lrcMetadataIndexBits = log2Ceil(TrafficGenBRAMAddressMap.lrcMetadataEntries)
+    val lrcMetadata = SyncReadMem(TrafficGenBRAMAddressMap.lrcMetadataEntries, UInt(512.W))
+    val lrcReports = SyncReadMem(131072, UInt(TrafficGenBRAMAddressMap.lrcReportPayloadBits.W))
     RAMStyleHint(lrcMetadata, RAMStyles.BLOCK)
     RAMStyleHint(lrcReports, RAMStyles.BLOCK)
     val lrcMetadataCount = RegInit(0.U(32.W))
     val lrcCommitMetadata = WireDefault(false.B)
     val lrcMetadataBusy = RegInit(false.B)
-    val lrcMetadataCursor = RegInit(0.U(17.W))
+    val lrcMetadataCursor = RegInit(0.U((lrcMetadataIndexBits + 1).W))
     val lrcMetaReadPending = RegInit(false.B)
     val lrcMetaValid = RegInit(false.B)
     val lrcMetaBits = Reg(UInt(512.W))
     val lrcMetaRead = lrcMetadataBusy && lrcMetadataCursor < lrcMetadataCount &&
       !lrcMetaReadPending && !lrcMetaValid
-    val lrcMetaReadBits = lrcMetadata.read(lrcMetadataCursor(15, 0), lrcMetaRead)
+    val lrcMetaReadBits = lrcMetadata.read(lrcMetadataCursor(lrcMetadataIndexBits - 1, 0), lrcMetaRead)
     lrcMetaReadPending := lrcMetaRead
     when(lrcMetaReadPending) { lrcMetaBits := lrcMetaReadBits; lrcMetaValid := true.B }
     val tmaMetadata = lrcMetaBits(7,0) >= 4.U
@@ -154,7 +158,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     when(lrcCommitMetadata) {
       assert(boundaryPaused && !lrcMetadataBusy, "LRC metadata commit requires a paused boundary")
-      assert(lrcMetadataCount <= 65536.U, "LRC metadata staging capacity exceeded")
+      assert(lrcMetadataCount <= TrafficGenBRAMAddressMap.lrcMetadataEntries.U, "LRC metadata staging capacity exceeded")
       lrcMetadataBusy := true.B; lrcMetadataCursor := 0.U
     }
     when(lrcMetadataBusy && lrcMetadataCursor === lrcMetadataCount &&
@@ -203,7 +207,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     completionReports.io.in(1) <> tmaMonitor.io.report
     completionReports.io.out.ready := lrcReportCount < 131072.U
     when(completionReports.io.out.fire) {
-      lrcReports.write(lrcReportCount(16, 0), completionReports.io.out.bits)
+      assert(completionReports.io.out.bits(511, TrafficGenBRAMAddressMap.lrcReportPayloadBits) === 0.U,
+        "LRC/TMA report exceeds packed payload width")
+      lrcReports.write(lrcReportCount(16, 0), completionReports.io.out.bits(TrafficGenBRAMAddressMap.lrcReportPayloadBits - 1, 0))
       lrcReportCount := lrcReportCount + 1.U
     }
     when(lrcClearReports) {
@@ -212,7 +218,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }
     val lrcReportReadEnable = WireDefault(false.B)
     val lrcReportReadIndex = WireDefault(0.U(17.W))
-    val lrcReportReadBits = lrcReports.read(lrcReportReadIndex, lrcReportReadEnable)
+    // Preserve the existing one-report-per-512-bit DMA beat ABI.
+    val lrcReportReadBits = lrcReports.read(lrcReportReadIndex, lrcReportReadEnable).pad(512)
     val lrcMonitorCanRun = lrcMonitoring && !boundaryPaused && !accessReadTargetPaused &&
       !lrcMetadataBusy && !lrcReportDrainRequired && hPort.toHost.hValid && hPort.fromHost.hReady
     lrcMonitor.io.tokenValid := lrcMonitorCanRun &&
@@ -887,7 +894,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val writeRawAccess = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset, accessWindowBytes)
     val writeRawIssued = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
     val writeRawCompleted = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
-    val writeLrcMetadata = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset, BigInt(65536) * 64)
+    val writeLrcMetadata = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset,
+      BigInt(TrafficGenBRAMAddressMap.lrcMetadataEntries) * 64)
 
     bramAxi.w.ready := axiWriteActive && !axiWriteRespValid
 
@@ -897,7 +905,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       when(writeLrcMetadata) {
         assert(boundaryPaused && !lrcMetadataBusy, "LRC staging write raced metadata processing")
         assert(bramAxi.w.bits.strb.andR, "LRC metadata requires complete 512-bit descriptor writes")
-        lrcMetadata.write(beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset)(15, 0), bramAxi.w.bits.data)
+        lrcMetadata.write(beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset)(lrcMetadataIndexBits - 1, 0), bramAxi.w.bits.data)
       }
       when(writeRawAccess) {
         val flatIdx = beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset)

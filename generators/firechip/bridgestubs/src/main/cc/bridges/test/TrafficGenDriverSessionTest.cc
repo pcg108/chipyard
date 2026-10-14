@@ -41,6 +41,7 @@ struct MockTarget : simif_t, CPUManagedStreamIO {
   unsigned reports_round = 0;
   unsigned completion_count_reads = 0;
   std::vector<std::size_t> completion_read_sizes;
+  std::vector<std::size_t> metadata_chunk_sizes;
   std::uint64_t cycle = 0;
   unsigned slot_index = 0, physical_round = 0, session_flags = 0, staged_flags = 0;
   bool paused = false, start = false, next_round = false, closed = false, done = false;
@@ -192,7 +193,11 @@ struct MockTarget : simif_t, CPUManagedStreamIO {
   CPUManagedStreamIO &get_cpu_managed_stream_io() override { return *this; }
   uint32_t mmio_read(size_t addr) override { return read(addr); }
   size_t cpu_managed_axi4_write(size_t addr, const char *data, size_t bytes) override {
-    if (addr == 0x05000000) { assert(paused && bytes <= 65536*64); return bytes; }
+    if (addr == 0x05000000) {
+      assert(paused && bytes && bytes <= 4096*64 && bytes % 64 == 0);
+      metadata_chunk_sizes.push_back(bytes / 64);
+      return bytes;
+    }
     if (addr < issued_offset) for (std::size_t offset = 0; offset < bytes; offset += 64) {
       std::uint64_t a[8]{}; std::memcpy(a,data+offset,64);
       const auto launch = (a[4]>>51) | (a[5]<<13);
@@ -313,7 +318,8 @@ void run(bool truncate, bool disconnect = false) {
 
 struct CompletionCountTarget : MockTarget {
   const unsigned completion_count;
-  explicit CompletionCountTarget(unsigned count) : MockTarget(9 * 64), completion_count(count) {}
+  explicit CompletionCountTarget(unsigned count) :
+      MockTarget(std::max(9U, std::min(count, 32768U)) * 64), completion_count(count) {}
   void run_round() override {
     ++physical_round;
     const unsigned valid_count = completion_count <= 32768 ? completion_count : 0;
@@ -331,7 +337,7 @@ struct CompletionCountTarget : MockTarget {
       const std::uint64_t bundle = bundle_a + i;
       std::memcpy(memory.data() + completed_offset + i * 8, &bundle, sizeof(bundle));
     }
-    cycle = 200;
+    cycle = std::max(200U, 102U + valid_count);
     regs[mmio.issued_access_writeback_count] = valid_count;
     regs[mmio.issued_lane_count_value] = valid_count;
     regs[mmio.completed_bundle_count] = completion_count;
@@ -354,7 +360,7 @@ void run_completion_count(unsigned count) {
         const auto control = server->RecvMessage<GPU::RoundControlMessage>();
         assert(control.endOfLaunches && control.launches.size() == 1);
         GPU::SchedulerRoundMessage schedule;
-        schedule.min_issue_cycle = 200;
+        schedule.min_issue_cycle = std::max(200U, 102U + count);
         if (!invalid)
           for (unsigned i = 0; i < count; ++i)
             schedule.allL2TraceSteps.push_back(access(launch_a, 10, 100 + i, bundle_a + i, 101 + i));
@@ -366,13 +372,13 @@ void run_completion_count(unsigned count) {
           assert(disconnected);
         } else {
           const auto result = server->RecvMessage<GPU::TrafficGenResultMessage>();
-          assert(!result.hasPendingWork && result.trafficGenResult.currentCycleAfterIssue == 200);
+          assert(!result.hasPendingWork && result.trafficGenResult.currentCycleAfterIssue == std::max(200U, 102U + count));
           assert(result.trafficGenResult.issuedAccesses.size() == count);
           assert(result.trafficGenResult.completedBundleIds.size() == count);
           for (unsigned i = 0; i < count; ++i)
             assert(result.trafficGenResult.completedBundleIds[i] == bundle_a + i);
           GPU::SchedulingRoundStateMessage status;
-          status.currentCycle = 200; status.mainLoopComplete = true; status.idle = true;
+          status.currentCycle = std::max(200U, 102U + count); status.mainLoopComplete = true; status.idle = true;
           status.acceptedLaunchIds = {launch_a}; status.completedLaunchIds = {launch_a};
           server->SendMessage(status);
         }
@@ -388,6 +394,11 @@ void run_completion_count(unsigned count) {
   driver.init(); target.queue(0, launch_a, 10, 100); target.closed = true;
   for (unsigned ticks = 0; ticks < 1000 && !target.done && !driver.terminate(); ++ticks) driver.tick();
   assert(target.completion_count_reads == 1 && target.physical_round == 1);
+  if (count == 4097) {
+    // More logical metadata than one staging window, with one public round.
+    assert(target.metadata_chunk_sizes.size() >= 3);
+    assert(target.metadata_chunk_sizes[0] == 4096 && target.metadata_chunk_sizes[1] == 4096);
+  }
   if (invalid) {
     assert(driver.terminate() && driver.exit_code() != 0 && !target.done);
     assert(target.session_flags & 32);
@@ -817,7 +828,7 @@ void run_retained_window() {
 int main() {
   run(false); run(true); run(false, true);
   run_completion_count(0); run_completion_count(1); run_completion_count(9);
-  run_completion_count(32769);
+  run_completion_count(4097); run_completion_count(32769);
   run_upload_cache(false); run_upload_cache(true);
   run_legacy_start(true); run_legacy_start(false); run_legacy_start(true, true);
   run_lrc(); run_retained_window();

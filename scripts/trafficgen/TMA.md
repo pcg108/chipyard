@@ -47,7 +47,7 @@ while paused and after previous reports have been consumed.
 
 All records are 512-bit little-endian bitfields; unspecified bits are zero.
 Existing LRC operations 1, 2, and 3 are unchanged. New operations use the same
-65,536-beat staging window at bridge-relative address `0x05000000`.
+4,096-beat staging window at bridge-relative address `0x05000000`.
 A DMA write only changes staging RAM. `lrc_commit_metadata` installs its valid
 prefix while paused; the target cannot execute between chunks. A final TMA
 commit publishes the new policy epoch.
@@ -70,6 +70,7 @@ fan-out is limited to four.
 
 Reports reuse the 131,072-beat buffer at bridge-relative `0x05800000`.
 Every report contains kind at 7:0, identity at 71:8, and cycle at 135:72.
+RAM stores these 136 payload bits; DMA reads zero-pad each report to 512 bits.
 
 | Kind | Identity | Cycle |
 |---|---|---|
@@ -101,23 +102,23 @@ boundary at C. Ordinary sessions with neither feature retain the existing path.
 ## Storage inventory
 
 Rows below describe packed raw RAM payloads, excluding registers, inferred FPGA
-packing, and the existing target backend/cache state. No existing LRC or staging
-buffer is resized.
+packing, and the existing target backend/cache state. Logical table and report
+capacities are unchanged. Metadata staging uses smaller paused upload chunks.
 
 | Store | Rows | Bits/row | Raw bytes |
 |---|---:|---:|---:|
 | LRC services | 65,536 | 325 | 2,662,400 |
 | LRC public bundles | 65,536 | 212 | 1,736,704 |
 | LRC deferred heap | 65,536 | 144 | 1,179,648 |
-| Shared metadata staging | 65,536 | 512 | 4,194,304 |
-| Shared reports | 131,072 | 512 | 8,388,608 |
+| Shared metadata staging | 4,096 | 512 | 262,144 |
+| Shared reports | 131,072 | 136 | 2,228,224 |
 | **New TMA service heads** | **65,536** | **115** | **942,080** |
 | **New TMA dependency edges** | **262,144** | **31** | **1,015,808** |
 | **New TMA wake groups** | **4,096** | **98** | **50,176** |
 | **New TMA deferred heap** | **4,096** | **76** | **38,912** |
 
 The four new stores total **2,046,976 bytes (1.952 MiB)**. All nine completion,
-metadata, and report stores total 20,208,640 bytes. Existing bridge access-upload
+metadata, and report stores total 10,116,096 bytes. Existing bridge access-upload
 banks retain 32,768 packed 435-bit rows (1,781,760 bytes), and issued-writeback
 banks retain 32,768 packed 321-bit rows (1,314,816 bytes). Their DMA windows
 use 512-bit beats; the RAM payloads omit beat padding.

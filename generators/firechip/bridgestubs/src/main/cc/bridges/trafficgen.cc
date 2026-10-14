@@ -51,6 +51,9 @@ constexpr std::uint32_t kRoundExitControl = 3;
 
 constexpr std::uint32_t kGpuModelSocketAddr = INADDR_LOOPBACK;
 constexpr std::size_t kXDMABufferAlignment = 4096;
+// Must match TrafficGenBRAMAddressMap.lrcMetadataEntries. Execution stays paused
+// across every chunk; TMA policy publication remains the final descriptor.
+constexpr std::size_t kLrcMetadataEntries = 4096;
 constexpr const char *kRoundLogBase = "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0";
 constexpr const char *kSocketRoundLogRoot =
     "/home/prashanth/FIRESIM_RUNS_DIR/sim_slot_0/bridge_socket_round_logs";
@@ -1552,8 +1555,8 @@ void trafficgen_t::upload_lrc_metadata() {
   const auto wake_descriptors = tma_policy.descriptors(lrc_ledger);
   descriptors.insert(descriptors.end(),wake_descriptors.begin(),wake_descriptors.end());
   auto &xdma = simif.get_cpu_managed_stream_io();
-  for (std::size_t offset = 0; offset < descriptors.size() || offset == 0; offset += 65536) {
-    const auto count = std::min<std::size_t>(65536, descriptors.size()-offset);
+  for (std::size_t offset = 0; offset < descriptors.size() || offset == 0; offset += kLrcMetadataEntries) {
+    const auto count = std::min<std::size_t>(kLrcMetadataEntries, descriptors.size()-offset);
     if (count) {
       auto data = make_aligned_bytes(count * 64);
       std::memcpy(data.get(), descriptors.data()+offset, count * 64);

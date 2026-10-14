@@ -18,6 +18,7 @@ parser.add_argument("build", type=pathlib.Path)
 parser.add_argument("--output", type=pathlib.Path)
 parser.add_argument("--command-file", type=pathlib.Path)
 parser.add_argument("--build-log", type=pathlib.Path)
+parser.add_argument("--rtl-only", action="store_true", help="Audit generated FPGA RTL without requiring a Verilator build")
 args = parser.parse_args()
 build = args.build.resolve()
 repo = pathlib.Path(__file__).resolve().parents[2]
@@ -129,8 +130,8 @@ if sv is not None:
     timers = memory_group("65536 admission timer heap entries", heap_mems, "mem", 65536, 144)
     check("each native table retains one packed BRAM word for its RAMStyleHint",
           set(services) == {"services"} and set(bundles) == {"bundles"} and set(timers) == {"mem"})
-    memory_group("65536 atomic metadata staging records", bridge_mems, "lrcMetadata", 65536, 512)
-    memory_group("131072 report records", bridge_mems, "lrcReports", 131072, 512)
+    memory_group("4096 atomic metadata staging records", bridge_mems, "lrcMetadata", 4096, 512)
+    memory_group("131072 report records", bridge_mems, "lrcReports", 131072, 136)
     replay = memory_group("32768 privately refilled physical upload records", bridge_mems,
                           "accessStores", 2048, total_entries=32768)
     check("all physical upload banks preserve 435 bits", bool(replay) and all(r["width"] == 435 for r in replay.values()))
@@ -166,20 +167,21 @@ if sv is not None:
     # FPGA mapping is deliberately outside this phase's acceptance criteria.
     del sv
 
-command = read(args.command_file or build / "command.sh")
-if command is not None:
-    check("build explicitly enables Verilator assertions", "EXTRA_VERILATOR_FLAGS=--assert" in command, command.strip())
-log = args.build_log or build / "build.log"
-if log.is_file():
-    invocations = [line.strip() for line in log.read_text(errors="replace").splitlines()
-                   if re.search(r"(?:^|/)verilator\s", line) and "-Mdir" in line]
-    if invocations:
-        check("actual Verilator invocation enables assertions", all("--assert" in line for line in invocations), invocations)
-    else:
-        missing.append("Verilator invocation in build.log (build still generating RTL)")
+if not args.rtl_only:
+    command = read(args.command_file or build / "command.sh")
+    if command is not None:
+        check("build explicitly enables Verilator assertions", "EXTRA_VERILATOR_FLAGS=--assert" in command, command.strip())
+    log = args.build_log or build / "build.log"
+    if log.is_file():
+        invocations = [line.strip() for line in log.read_text(errors="replace").splitlines()
+                       if re.search(r"(?:^|/)verilator\s", line) and "-Mdir" in line]
+        if invocations:
+            check("actual Verilator invocation enables assertions", all("--assert" in line for line in invocations), invocations)
+        else:
+            missing.append("Verilator invocation in build.log (build still generating RTL)")
 
 failed = [item["name"] for item in checks if not item["passed"]]
-result = {"build": str(build), "status": "FAIL" if failed else "INCOMPLETE" if missing else "PASS",
+result = {"build": str(build), "rtl_only": args.rtl_only, "status": "FAIL" if failed else "INCOMPLETE" if missing else "PASS",
           "failed": failed, "missing": missing, "checks": checks, "artifacts": artifacts,
           "limits": "Static ABI and elaboration checks; functional timing is covered by component/channel/metasim tests. "
                     "Channel latency is verified from the fresh bridge annotation, not inferred from SV FIFO names."}
