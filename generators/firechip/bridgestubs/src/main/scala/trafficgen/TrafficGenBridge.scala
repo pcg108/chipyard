@@ -23,7 +23,21 @@ class TrafficGenBridge()(implicit p: Parameters) extends BlackBox
   )
 
   val io = IO(new TrafficGenBridgeTargetIO(trafficGenParams.numGenerators, useRTL))
-  val bridgeIO = HostPort(io)
+  // The ordinary channels keep HostPort's existing one-cycle latency. The
+  // physical event snapshot must describe the current target cycle: a delayed
+  // snapshot would let C+1 execute before the monitor can stop on a wake at C.
+  // Keeping fromHost at latency one means releasing the held C snapshot supplies
+  // the next replay epoch and descriptors for C+1, without advancing target time
+  // while the host updates logical dependency metadata.
+  val bridgeIO = new HostPortIO(io) {
+    override def bridgeChannels(): Seq[BridgeChannel] =
+      super.bridgeChannels().map {
+        case channel: PipeBridgeChannel
+            if useRTL && channel.name.startsWith("trafficgen_physical") =>
+          channel.copy(latency = 0)
+        case channel => channel
+      }
+  }
   val constructorArg = Some(bridgeKey)
 
   generateAnnotations()
@@ -54,6 +68,14 @@ object TrafficGenBridge {
     ep.io.trafficgen.currentCycleAfterIssue := trafficGenIO.currentCycleAfterIssue
     ep.io.trafficgen.dpiState := trafficGenIO.dpiState
     ep.io.trafficgen.issuedAccessBatch <> trafficGenIO.issuedAccessBatch
+    ep.io.trafficgen.physicalIssueValidMask := trafficGenIO.physicalIssueValidMask
+    ep.io.trafficgen.physicalIssueAccesses := trafficGenIO.physicalIssueAccesses
+    ep.io.trafficgen.physicalConsumeMask := trafficGenIO.physicalConsumeMask
+    ep.io.trafficgen.physicalCompletionValidMask := trafficGenIO.physicalCompletionValidMask
+    ep.io.trafficgen.physicalCompletionTokens := trafficGenIO.physicalCompletionTokens
+    ep.io.trafficgen.physicalCompletionCycles := trafficGenIO.physicalCompletionCycles
+    trafficGenIO.batchMode := ep.io.trafficgen.batchMode
+    trafficGenIO.replayEpoch := ep.io.trafficgen.replayEpoch
     ep.io.trafficgen.completedBundleIdWriteEn := trafficGenIO.completedBundleIdWriteEn
     ep.io.trafficgen.completedBundleIdWriteIdx := trafficGenIO.completedBundleIdWriteIdx
     ep.io.trafficgen.completedBundleIdWriteData := trafficGenIO.completedBundleIdWriteData

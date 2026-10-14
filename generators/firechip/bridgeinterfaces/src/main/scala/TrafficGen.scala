@@ -82,6 +82,8 @@ object L2Access {
   * stores and target-side queues do not pay for unused fields.
   */
 class RTLL2Access extends Bundle {
+  // Dense host-owned service identity, independent of the original trace UID.
+  val physicalToken = UInt(64.W)
   val launchId = UInt(64.W)
   val id = UInt(64.W)
   val address = UInt(64.W)
@@ -98,9 +100,10 @@ class RTLL2Access extends Bundle {
 }
 
 object RTLL2Access {
-  val streamWidthBits = 371
+  val streamWidthBits = 435
 
   def pack(access: RTLL2Access): UInt = Cat(
+    access.physicalToken,
     access.launchId,
     access.bundleGeneration,
     access.bundleIssueCount,
@@ -126,12 +129,14 @@ object RTLL2Access {
     access.bundleIssueCount := bits(274, 259)
     access.bundleGeneration := bits(306, 275)
     access.launchId := bits(370, 307)
+    access.physicalToken := bits(434, 371)
     access
   }
 }
 
 /** The only per-access fields returned by either traffic-generator engine. */
 class IssuedAccess extends Bundle {
+  val physicalToken = UInt(64.W)
   val launchId = UInt(64.W)
   val requestUid = UInt(64.W)
   val cycleIssued = UInt(64.W)
@@ -140,9 +145,10 @@ class IssuedAccess extends Bundle {
 }
 
 object IssuedAccess {
-  val streamWidthBits = 257
+  val streamWidthBits = 321
 
   def pack(access: IssuedAccess): UInt = Cat(
+    access.physicalToken,
     access.launchId,
     access.isWrite,
     access.address,
@@ -158,6 +164,7 @@ object IssuedAccess {
     access.address := bits(191, 128)
     access.isWrite := bits(192)
     access.launchId := bits(256, 193)
+    access.physicalToken := bits(320, 257)
     access
   }
 }
@@ -222,6 +229,16 @@ class TrafficGenPortIO(numLanes: Int, useRTL: Boolean) extends Bundle {
   val currentCycleAfterIssue = Output(UInt(64.W))
   val dpiState = Output(UInt(32.W))
   val issuedAccessBatch = Decoupled(new IssuedAccessBatch(numLanes))
+  // These are events in the current target token, not independently consumed
+  // streams. The bridge must reserve capture space before accepting the token.
+  val physicalIssueValidMask = Output(UInt(numLanes.W))
+  val physicalIssueAccesses = Output(UInt((numLanes * IssuedAccess.streamWidthBits).W))
+  val physicalConsumeMask = Output(UInt(replaySlots.W))
+  val physicalCompletionValidMask = Output(UInt(numLanes.W))
+  val physicalCompletionTokens = Output(UInt((numLanes * 64).W))
+  val physicalCompletionCycles = Output(UInt((numLanes * 64).W))
+  val batchMode = Input(Bool())
+  val replayEpoch = Input(UInt(32.W))
   val completedBundleIdWriteEn = Output(Bool())
   val completedBundleIdWriteIdx = Output(UInt(CompletedBundleIds.idxWidth.W))
   val completedBundleIdWriteData = Output(UInt(64.W))

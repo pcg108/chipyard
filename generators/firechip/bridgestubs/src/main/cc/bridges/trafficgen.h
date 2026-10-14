@@ -7,6 +7,8 @@
 #include "trafficgen_bundle_recovery.h"
 #include "trafficgen_bundle_tracking.h"
 #include "trafficgen_socket_protocol.h"
+#include "trafficgen_lrc_ledger.h"
+#include "trafficgen_tma_policy.h"
 
 #include <array>
 #include <cstddef>
@@ -63,6 +65,32 @@ struct TRAFFICGENBRIDGEMODULE_struct {
   uint64_t slot_status;
   uint64_t session_status;
   uint64_t commit_launch_status;
+  uint64_t lrc_enable;
+  uint64_t lrc_metadata_count;
+  uint64_t lrc_commit_metadata;
+  uint64_t lrc_metadata_ready;
+  uint64_t lrc_begin_round;
+  uint64_t lrc_drain_only;
+  uint64_t lrc_arrival_horizon_low;
+  uint64_t lrc_arrival_horizon_high;
+  uint64_t lrc_report_count;
+  uint64_t lrc_clear_reports;
+  uint64_t lrc_error;
+  uint64_t lrc_service_capacity;
+  uint64_t lrc_bundle_capacity;
+  uint64_t lrc_timer_capacity;
+  uint64_t lrc_refill_only;
+  uint64_t lrc_report_drain_required;
+  uint64_t lrc_service_count;
+  uint64_t lrc_bundle_count;
+  uint64_t lrc_timer_count;
+  uint64_t lrc_service_high_water;
+  uint64_t lrc_bundle_high_water;
+  uint64_t lrc_timer_high_water;
+  uint64_t lrc_report_high_water;
+  uint64_t lrc_boundary_flags;
+  uint64_t tma_group_count, tma_edge_count, tma_timer_count;
+  uint64_t tma_group_high_water, tma_edge_high_water, tma_timer_high_water;
 };
 
 using L2SubpartitionReservationsByCycle =
@@ -90,6 +118,7 @@ struct trafficgen_l2_access_t {
   uint16_t bundle_issue_count = 1;
   uint32_t bundle_generation = 0;
   std::size_t assigned_lane = 0;
+  std::uint64_t physical_token = 0;
 };
 
 struct trafficgen_issued_access_point_t {
@@ -98,6 +127,7 @@ struct trafficgen_issued_access_point_t {
   std::uint64_t cycle_issued = 0;
   std::uint64_t address = 0;
   bool is_write = false;
+  std::uint64_t physical_token = 0;
 };
 
 struct trafficgen_bundle_assignment_t {
@@ -189,6 +219,22 @@ private:
   std::unordered_map<trafficgen_request_key_t, trafficgen_bundle_assignment_t, trafficgen_request_key_hash>
       bundle_assignment_by_request_uid;
   trafficgen_bundle_tracker bundle_tracker;
+  trafficgen_lrc_ledger lrc_ledger;
+  trafficgen_tma_policy tma_policy;
+  trafficgen_socket::TrafficWakeDiagnostics tma_diagnostics;
+  std::set<std::uint64_t> tma_wake_cycles, ordinary_wake_cycles;
+  bool lrc_new_round = false;
+  bool lrc_round_drain_only = false;
+  bool lrc_metadata_committed = false;
+  bool lrc_window_valid = false;
+  bool lrc_reuse_window = false;
+  std::vector<trafficgen_lrc_ledger::descriptor_t> lrc_pending_reports;
+  static constexpr std::uint64_t LRC_METADATA_OFFSET = 0x05000000;
+  static constexpr std::uint64_t LRC_REPORT_OFFSET = 0x05800000;
+  void upload_lrc_metadata();
+  void process_lrc_reports(std::uint64_t cycle);
+  void drain_lrc_reports();
+  void log_lrc_events();
   OrderedL2SubpartitionReservationsByCycle round_input_reserved_subpartitions;
   std::array<uint64_t, COMPLETED_BUNDLE_ID_COUNT> completed_bundle_ids{};
   uint32_t completed_bundle_count = 0;
@@ -198,6 +244,10 @@ private:
   uint32_t issued_access_writeback_count = 0;
   size_t issued_access_writeback_bytes_received = 0;
   bool issued_access_writeback_read_issued = false;
+  // Native windows survive metadata-only socket rounds. Issued banks append
+  // until a real commit_upload; only their unread suffix belongs to a boundary.
+  std::vector<std::uint32_t> issued_lane_read_cursors;
+  std::vector<std::uint32_t> issued_lane_snapshot_counts;
   std::vector<trafficgen_issued_access_point_t> accumulated_issued_accesses;
   std::vector<std::uint64_t> accumulated_completed_bundle_ids;
 

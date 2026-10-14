@@ -1,4 +1,24 @@
-# TrafficGen protocol-v2 sessions
+# TrafficGen protocol-v7 sessions
+
+The current bridge targets GPU-model commit
+`7b6abcafe312c21e87393181410eb2f2aea1d938` with Boost 1.85, socket protocol 7,
+L2Access archive version 2, and result archive version 4. Incompatible framing
+versions, including 2 and 6, are rejected. The launch MMIO ABI remains 3.
+
+See [TMA/mbarrier execution and metadata ABI](TMA.md) for the implementation,
+storage inventory, worked completion example, and Phase 2 validation commands.
+
+## Phase 1 baseline (archived protocol-v6 configuration)
+
+The following describes the preserved Phase 1 baseline and its pinned source.
+Use the v7 scripts above for the current bridge.
+
+
+The supported GPU model is commit
+`01ca4420d030af39c1245ac89815e20d32563c32`. Both endpoints use Boost 1.85,
+protocol version 6, L2Access archive version 2, and result archive version 3.
+Protocol versions 2 and 7 are rejected. This phase implements LRC; TMA and
+mbarriers require a later protocol update. The target launch MMIO ABI remains 3.
 
 The RTL TrafficGen bridge uses one scheduler socket connection for a session.
 Target software can submit additional kernels while earlier launches still have
@@ -10,16 +30,96 @@ complete before that launch can release its reserved SM resources to another
 launch. Within its reservation, a launch retains the original early CTA reuse
 approximation and dependency wake-up behavior.
 
+## LRC execution
+
+The driver registers the entire logical schedule before publishing any physical
+requests. `Issue` allocates a physical service; `Attach` adds contributors to
+that service; `Reuse` completes a new original at its admission cycle using an
+already returned service. Only `Issue` creates memory traffic or a subpartition
+reservation. Original request identities remain qualified by launch ID.
+
+The RTL request carries a separate 64-bit physical token, making the packed
+request 435 bits within the existing 512-bit upload beat. The issue timestamp
+is the accepted engine-to-memory-lane request; return timestamps come from the
+backend's accepted final response before any legacy completion queue delay.
+
+The synthesizable bridge owns completion and wake decisions. Its BRAM service,
+bundle, and deferred-completion tables each default to 65,536 entries. Physical
+services carry up to four distinct bundle references with generation checks.
+A bundle completes after all its distinct services return and its latest
+contributor admission cycle arrives. Repeated originals sharing one service
+and bundle count as one hardware dependency. The driver retains full contributor
+records and reconstructs v6 results using these native reports.
+
+Metadata uploads commit while target execution is paused. Physical descriptors
+continue to use 32,768-request private refill windows. Metadata capacity errors
+fail explicitly before execution. Native event processing and BRAM bookkeeping
+stall host clocks without advancing target time; physical returns do not require
+scheduler exchanges. The bridge processes all same-cycle events before a wake,
+inclusive deadline, issue/admission boundary, or full-drain stop. Drain-only
+classification is fixed at the start of each socket round.
+
+Ordinary traffic retains its cooperative boundary behavior until the first LRC
+command activates batch mode. Existing queued and outstanding ordinary services
+are tracked from session start and migrate without reissue. The DPI backend
+does not support these socket sessions.
+
+### Kernel 6668 validation
+
+Extract and build the pinned model in a separate directory using Chipyard's
+Boost 1.85; keep the main GPU model checkout intact. The model's unmodified
+`mobile8_hopper.config` specifies `issueLatencyScale=2.0` and
+`memoryIssueStretchScale=1.0`. Given an existing pinned build:
+
+```bash
+scripts/trafficgen/build-lrc-reference.sh /path/to/pinned-source /path/to/pinned-build
+GPU_MODEL_ROOT=/path/to/pinned-source GPU_MODEL_BUILD=/path/to/pinned-build \
+  scripts/test-trafficgen-socket-v6.sh
+python3 scripts/trafficgen/run-lrc-metasim.py /path/to/fresh-reference-run \
+  --reference --model-source /path/to/pinned-source --model-build /path/to/pinned-build
+scripts/trafficgen/build-lrc-metasim.sh /path/to/fresh-metasim-build
+python3 scripts/trafficgen/run-lrc-metasim.py /path/to/fresh-rtl-run \
+  --simulator /path/to/fresh-metasim-build/VFireSim \
+  --model-source /path/to/pinned-source --model-build /path/to/pinned-build
+```
+
+The runner uses a single-entry registry for the local corrected-GTO Gemma 6668
+capture, builds a local single-launch workload, closes submissions, and requires
+successful full drain. `--dataset`, `--port`, and `--timeout` select independent
+data, socket, and wall-time limits. The default dataset is the sibling GPU
+model's `hopper-gemma` directory. The fresh metasim uses
+`FireSimRocketWithRTLTrafficGenL2PutGetNoTracerVBoundaryOnlyConfig`, 16 replay
+lanes, eight outstanding requests per lane, and the existing address mapping.
+
+Acceptance requires 98,304 original reads and 32,768 original writes, with
+69,611 physical reads and 32,768 physical writes. The independent checker checks
+capture identities and membership, exactly-once admission/completion events,
+actual return-based completion timing, absence of premature bundle completion,
+and drained driver/hardware state. Timeout and truncation fail. Run artifacts
+include configuration and dataset hashes, commands, event CSVs, boundary flags,
+occupancy high-water marks, validation JSON, and physical-traffic plots. Timing
+against the recorded capture is reported separately from count and membership
+acceptance.
+
 At a paused boundary, the driver validates the completion count and reads only
 the valid prefix of the completion BRAM, rounded to a 64-byte beat. An empty
 report performs no DMA. This avoids transferring the full 256 KiB buffer for
 every short scheduling round while preserving target timing.
 
-The driver also retains the last successfully written request payload for each
-lane. It skips a request DMA only when the complete packed bytes and length are
-unchanged; the target only reads that BRAM region. Every upload still writes its
-counts and control metadata and performs the normal commit/start handshake.
-The payload cache belongs to the driver session and is not reset by a new launch.
+In native LRC mode, a socket round with no fresh physical Issue retains the
+current replay window, including its lane cursors and target epoch. Attach,
+Reuse, and wake updates still commit their logical metadata before execution
+resumes. The driver reads only each issued bank's unread suffix and keeps the
+window's remaining members separate from requests awaiting a private refill.
+A fresh physical Issue, a capacity refill, or the first transition into native
+mode performs a real upload; an exhausted window also refills when host requests
+remain. Retained windows require no request DMA or upload commit.
+
+For real uploads, the driver retains the last successfully written payload for
+each lane and skips DMA when its complete packed bytes and length are unchanged.
+These uploads still write counts and control metadata and perform the normal
+commit/start handshake, including ordinary sessions. The payload cache belongs
+to the driver session and is not reset by a new launch.
 
 ## Preserving the single-kernel baseline
 
@@ -109,7 +209,7 @@ slots and never asserts successful global done.
 
 The exchange is initialization, then repeated **server status → client control
 → server schedule → client result**. Frames retain the big-endian 64-bit length
-and carry the v2 magic/version/message tag in their Boost-serialized payload.
+and carry the protocol magic/version/message tag in their Boost-serialized payload.
 Use matching Boost serialization versions when rebuilding both endpoints.
 
 ## Trace mixes and fixtures
@@ -119,13 +219,13 @@ and `reuse`. Single mode atomically submits slot 0 and closes submissions, then 
 both kernel and session completion. It uses Rodinia registry ID `1106` by
 default; `KERNEL_REGISTRY_ID` selects another entry for single mode only.
 This version needs an ABI-3 bitstream for atomic single submission. The socket
-protocol remains version 2; use the compatibility scheduler built alongside it.
+protocol is version 6; use the pinned scheduler built with matching Boost.
 The ordinary submit and close registers retain their previous behavior.
 
 For exact comparisons using the historical single-kernel hello ELF, pass
 `+trafficgen-legacy-registry-id=1106` to the simulator (replace the registry ID
 for another dataset). Its old `0x5004` start write is translated into one closed
-v2 launch. A legacy start without this option fails explicitly. Rejection of
+launch. A legacy start without this option fails explicitly. Rejection of
 that implicit launch also fails the host session, because the historical hello
 cannot inspect per-slot rejection. This preserves
 the old application's active CPU instruction/MMIO/HTIF stream; using a different
@@ -291,7 +391,7 @@ cmake -S "$gpu" -B "$gpu_build" -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
 cmake --build "$gpu_build" --parallel 8
 ctest --test-dir "$gpu_build" --output-on-failure
 scripts/test-trafficgen-synthetic.sh
-scripts/test-trafficgen-socket-v2.sh
+scripts/test-trafficgen-socket-v6.sh
 scripts/test-trafficgen-snapshots.sh
 scripts/test-trafficgen-lane-assignment.sh
 scripts/test-trafficgen-bundle-recovery.sh

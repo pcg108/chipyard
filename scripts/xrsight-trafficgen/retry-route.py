@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 p = argparse.ArgumentParser(description=__doc__)
-p.add_argument('--work', type=Path, default=Path('/scratch/prashanth_xrsight_trafficgen_20261011'))
+p.add_argument('--work', type=Path, default=Path('/scratch/prashanth_xrsight_trafficgen_v7_20261013'))
 p.add_argument('--execute-after-approval', action='store_true',
                help='Start one retry only after explicit user approval of the resource-stop recovery')
 a = p.parse_args()

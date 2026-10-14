@@ -10,7 +10,7 @@ import sys
 import time
 
 p=argparse.ArgumentParser()
-p.add_argument('--work',type=Path,default=Path('/scratch/prashanth_xrsight_trafficgen_20261011'))
+p.add_argument('--work',type=Path,default=Path('/scratch/prashanth_xrsight_trafficgen_v7_20261013'))
 p.add_argument('--after-elaboration-guard',type=Path)
 p.add_argument('--after-smoke-result',type=Path,
                help='Resume FPGA build after a passing smoke run of unchanged hardware')

@@ -24,6 +24,11 @@ object TrafficGenBRAMAddressMap {
   val rawAccessStoreOffset: BigInt              = BigInt("02000000", 16)
   val rawIssuedAccessWritebackStoreOffset: BigInt = BigInt("03000000", 16)
   val rawCompletedBundleIdsOffset: BigInt       = BigInt("04480000", 16)
+  val lrcMetadataOffset: BigInt = BigInt("05000000", 16)
+  val lrcReportOffset: BigInt = BigInt("05800000", 16)
+  // Logical tables retain their capacities; metadata is installed in paused chunks.
+  val lrcMetadataEntries = 4096
+  val lrcReportPayloadBits = 136 // kind, 64-bit identity, 64-bit cycle
 }
 
 class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
@@ -74,11 +79,171 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val trafficGenDone = RegInit(false.B)
     val trafficGenDonePulse = Wire(Bool())
     trafficGenDonePulse := false.B
+    val lrcTokenPermit = WireDefault(true.B)
+    val tokenEffects = Wire(Bool())
 
     val fire = hPort.toHost.hValid &&
       hPort.fromHost.hReady &&
       !boundaryPaused &&
-      !accessReadTargetPaused
+      !accessReadTargetPaused && lrcTokenPermit
+    tokenEffects := fire
+
+    // Metadata commits and native completion accounting run exclusively in
+    // host cycles. HostPort's current target token remains held until every
+    // same-cycle return and timer has committed.
+    val lrcEnable = RegInit(false.B)
+    val lrcMonitoring = RegInit(false.B)
+    val lrcDrainOnly = RegInit(false.B)
+    val lrcRefillOnly = RegInit(false.B)
+    val lrcArrivalLow = RegInit(0.U(32.W))
+    val lrcArrivalHigh = RegInit(0.U(32.W))
+    val lrcArrivalHorizon = Cat(lrcArrivalHigh, lrcArrivalLow)
+    val lrcBeginRound = WireDefault(false.B)
+    val lrcRoundActive = RegInit(false.B)
+    val lrcParkedToken = RegInit(false.B)
+    // Legacy SimpleTrafficGen returns one cycle after its last issue without
+    // retiring that next cycle. Park the next raw token before either monitor
+    // sees it; resume processes it under the replacement public wake policy.
+    val legacyIssueBoundaryPending = RegInit(false.B)
+    val legacyUnaccountedBoundary = RegInit(false.B)
+    val lrcOrdinaryParked = RegInit(false.B)
+    val lrcOrdinaryResume = lrcOrdinaryParked && !lrcEnable
+    val lrcCheckpointPending = RegInit(false.B)
+    val lrcCheckpointActive = RegInit(false.B)
+    val lrcCheckpointCycle = Reg(UInt(64.W))
+    val lrcRecheck = WireDefault(false.B)
+    val lrcReplayEpoch = RegInit(0.U(32.W))
+    val lrcUnissued = RegInit(0.U(32.W))
+    val lrcBoundaryFlags = RegInit(0.U(32.W))
+    val lrcReset = WireDefault(false.B)
+    val lrcMonitor = withReset(reset.asBool || lrcReset) { Module(new LrcCompletionMonitor(key.numLanes)) }
+    val tmaMonitor = withReset(reset.asBool || lrcReset) { Module(new TmaWakeMonitor(key.numLanes)) }
+    RAMStyleHint(tmaMonitor.heads, RAMStyles.BLOCK)
+    RAMStyleHint(tmaMonitor.edges, RAMStyles.BLOCK)
+    RAMStyleHint(tmaMonitor.groups, RAMStyles.BLOCK)
+    RAMStyleHint(tmaMonitor.heap.mem, RAMStyles.BLOCK)
+    val accountingReady = lrcMonitor.io.tokenReady && tmaMonitor.io.tokenReady
+    val accountingIdle = lrcMonitor.io.metadataIdle && tmaMonitor.io.metadataIdle
+    val accountingPending = lrcMonitor.io.pending || tmaMonitor.io.pending
+    val accountingWake = lrcMonitor.io.wake || tmaMonitor.io.wake
+    val honorDeadline = !lrcDrainOnly || tmaMonitor.io.honorDeadline
+    RAMStyleHint(lrcMonitor.services, RAMStyles.BLOCK)
+    RAMStyleHint(lrcMonitor.bundles, RAMStyles.BLOCK)
+    RAMStyleHint(lrcMonitor.heap.mem, RAMStyles.BLOCK)
+    val lrcMetadataIndexBits = log2Ceil(TrafficGenBRAMAddressMap.lrcMetadataEntries)
+    val lrcMetadata = SyncReadMem(TrafficGenBRAMAddressMap.lrcMetadataEntries, UInt(512.W))
+    val lrcReports = SyncReadMem(131072, UInt(TrafficGenBRAMAddressMap.lrcReportPayloadBits.W))
+    RAMStyleHint(lrcMetadata, RAMStyles.BLOCK)
+    RAMStyleHint(lrcReports, RAMStyles.BLOCK)
+    val lrcMetadataCount = RegInit(0.U(32.W))
+    val lrcCommitMetadata = WireDefault(false.B)
+    val lrcMetadataBusy = RegInit(false.B)
+    val lrcMetadataCursor = RegInit(0.U((lrcMetadataIndexBits + 1).W))
+    val lrcMetaReadPending = RegInit(false.B)
+    val lrcMetaValid = RegInit(false.B)
+    val lrcMetaBits = Reg(UInt(512.W))
+    val lrcMetaRead = lrcMetadataBusy && lrcMetadataCursor < lrcMetadataCount &&
+      !lrcMetaReadPending && !lrcMetaValid
+    val lrcMetaReadBits = lrcMetadata.read(lrcMetadataCursor(lrcMetadataIndexBits - 1, 0), lrcMetaRead)
+    lrcMetaReadPending := lrcMetaRead
+    when(lrcMetaReadPending) { lrcMetaBits := lrcMetaReadBits; lrcMetaValid := true.B }
+    val tmaMetadata = lrcMetaBits(7,0) >= 4.U
+    lrcMonitor.io.metadata.valid := lrcMetaValid && !tmaMetadata
+    tmaMonitor.io.metadata.valid := lrcMetaValid && tmaMetadata
+    tmaMonitor.io.metadata.bits := lrcMetaBits
+    lrcMonitor.io.metadata.bits := lrcMetaBits
+    when(lrcMonitor.io.metadata.fire || tmaMonitor.io.metadata.fire) {
+      lrcMetaValid := false.B
+      lrcMetadataCursor := lrcMetadataCursor + 1.U
+    }
+    when(lrcCommitMetadata) {
+      assert(boundaryPaused && !lrcMetadataBusy, "LRC metadata commit requires a paused boundary")
+      assert(lrcMetadataCount <= TrafficGenBRAMAddressMap.lrcMetadataEntries.U, "LRC metadata staging capacity exceeded")
+      lrcMetadataBusy := true.B; lrcMetadataCursor := 0.U
+    }
+    when(lrcMetadataBusy && lrcMetadataCursor === lrcMetadataCount &&
+      !lrcMetaReadPending && !lrcMetaValid && accountingIdle) {
+      lrcMetadataBusy := false.B; lrcMonitoring := true.B
+    }
+    val lrcMetadataReady = !lrcMetadataBusy && accountingIdle
+    val lrcReportCount = RegInit(0.U(32.W))
+    val lrcServiceHighWater = RegInit(0.U(32.W))
+    val lrcBundleHighWater = RegInit(0.U(32.W))
+    val lrcTimerHighWater = RegInit(0.U(32.W))
+    val lrcReportHighWater = RegInit(0.U(32.W))
+    lrcServiceHighWater := Mux(lrcMonitor.io.serviceCount > lrcServiceHighWater,
+      lrcMonitor.io.serviceCount, lrcServiceHighWater)
+    lrcBundleHighWater := Mux(lrcMonitor.io.bundleCount > lrcBundleHighWater,
+      lrcMonitor.io.bundleCount, lrcBundleHighWater)
+    lrcTimerHighWater := Mux(lrcMonitor.io.timerCount > lrcTimerHighWater,
+      lrcMonitor.io.timerCount, lrcTimerHighWater)
+    lrcReportHighWater := Mux(lrcReportCount > lrcReportHighWater,
+      lrcReportCount, lrcReportHighWater)
+    // These new event channels have zero target latency; the legacy status
+    // channels retain their existing one-cycle latency.
+    val lrcCurrentCycle = target.physicalCompletionCycles(63, 0)
+    // Ordinary HostPort status is delayed one target token. Keep physical
+    // pretracking on that same public cycle until a native batch takes over.
+    val lrcOrdinaryReturnMask = RegInit(0.U(key.numLanes.W))
+    val lrcOrdinaryReturnTokens = Reg(UInt((key.numLanes * 64).W))
+    val lrcOrdinaryReturnCycles = Reg(UInt((key.numLanes * 64).W))
+    when(fire && !lrcEnable) {
+      lrcOrdinaryReturnMask := target.physicalCompletionValidMask
+      lrcOrdinaryReturnTokens := target.physicalCompletionTokens
+      lrcOrdinaryReturnCycles := target.physicalCompletionCycles
+    }
+    // Reserve enough output space for every live bundle timer plus all raw
+    // returns on the token before starting its indivisible accounting pass.
+    val lrcReportCapacity = Module(new LrcReportCapacityGate(key.numLanes))
+    lrcReportCapacity.io.enabled := lrcMonitoring && !boundaryPaused && !lrcParkedToken
+    lrcReportCapacity.io.tokenIdle := lrcMonitor.io.tokenIdle && tmaMonitor.io.tokenIdle
+    lrcReportCapacity.io.count := lrcReportCount + tmaMonitor.io.groupCount
+    lrcReportCapacity.io.bundles := lrcMonitor.io.bundleCount
+    lrcReportCapacity.io.returns := Mux(lrcEnable, target.physicalCompletionValidMask, lrcOrdinaryReturnMask)
+    val lrcReportDrainRequired = lrcReportCapacity.io.drainRequired
+    val lrcClearReports = WireDefault(false.B)
+    val completionReports = Module(new Arbiter(UInt(512.W), 2))
+    completionReports.io.in(0) <> lrcMonitor.io.report
+    completionReports.io.in(1) <> tmaMonitor.io.report
+    completionReports.io.out.ready := lrcReportCount < 131072.U
+    when(completionReports.io.out.fire) {
+      assert(completionReports.io.out.bits(511, TrafficGenBRAMAddressMap.lrcReportPayloadBits) === 0.U,
+        "LRC/TMA report exceeds packed payload width")
+      lrcReports.write(lrcReportCount(16, 0), completionReports.io.out.bits(TrafficGenBRAMAddressMap.lrcReportPayloadBits - 1, 0))
+      lrcReportCount := lrcReportCount + 1.U
+    }
+    when(lrcClearReports) {
+      assert(boundaryPaused || lrcReportDrainRequired, "LRC report clear requires a paused boundary")
+      lrcReportCount := 0.U
+    }
+    val lrcReportReadEnable = WireDefault(false.B)
+    val lrcReportReadIndex = WireDefault(0.U(17.W))
+    // Preserve the existing one-report-per-512-bit DMA beat ABI.
+    val lrcReportReadBits = lrcReports.read(lrcReportReadIndex, lrcReportReadEnable).pad(512)
+    val lrcMonitorCanRun = lrcMonitoring && !boundaryPaused && !accessReadTargetPaused &&
+      !lrcMetadataBusy && !lrcReportDrainRequired && hPort.toHost.hValid && hPort.fromHost.hReady
+    lrcMonitor.io.tokenValid := lrcMonitorCanRun &&
+      (lrcCheckpointPending || (!lrcParkedToken && !lrcCheckpointActive && !legacyIssueBoundaryPending))
+    lrcMonitor.io.recheck := lrcRecheck
+    lrcMonitor.io.cycle := Mux(lrcCheckpointPending || lrcCheckpointActive, lrcCheckpointCycle,
+      Mux(lrcEnable, lrcCurrentCycle, target.currentCycleAfterIssue))
+    lrcMonitor.io.returns := Mux(lrcCheckpointPending || lrcCheckpointActive, 0.U,
+      Mux(lrcEnable, target.physicalCompletionValidMask, lrcOrdinaryReturnMask))
+    lrcMonitor.io.tokens := Mux(lrcEnable, target.physicalCompletionTokens,
+      lrcOrdinaryReturnTokens).asTypeOf(Vec(key.numLanes, UInt(64.W)))
+    lrcMonitor.io.returnCycles := Mux(lrcEnable, target.physicalCompletionCycles,
+      lrcOrdinaryReturnCycles).asTypeOf(Vec(key.numLanes, UInt(64.W)))
+    lrcMonitor.io.tokenConsumed := fire && lrcMonitoring
+    lrcTokenPermit := !lrcMetadataBusy && (!lrcMonitoring || accountingReady)
+    tmaMonitor.io.tokenValid := lrcMonitor.io.tokenValid
+    tmaMonitor.io.recheck := lrcMonitor.io.recheck
+    tmaMonitor.io.cycle := lrcMonitor.io.cycle
+    tmaMonitor.io.returns := lrcMonitor.io.returns
+    tmaMonitor.io.tokens := lrcMonitor.io.tokens
+    tmaMonitor.io.returnCycles := lrcMonitor.io.returnCycles
+    tmaMonitor.io.tokenConsumed := lrcMonitor.io.tokenConsumed
+    target.batchMode := lrcEnable
+    target.replayEpoch := lrcReplayEpoch
 
     private val launchSlots = 4
     val launchRegistryIds = RegInit(VecInit(Seq.fill(launchSlots)(0.U(64.W))))
@@ -96,9 +261,12 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val sessionStatus = RegInit(0.U(32.W))
     val commitLaunchStatus = WireDefault(false.B)
 
-    target.launchStatusIds := launchStatusIds.asUInt
-    target.launchStatuses := launchStatuses.asUInt
-    target.sessionStatus := sessionStatus
+    val priorLaunchStatusIds = RegEnable(launchStatusIds.asUInt, 0.U, fire && !lrcEnable)
+    val priorLaunchStatuses = RegEnable(launchStatuses.asUInt, 0.U, fire && !lrcEnable)
+    val priorSessionStatus = RegEnable(sessionStatus, 0.U, fire && !lrcEnable)
+    target.launchStatusIds := Mux(lrcOrdinaryResume, priorLaunchStatusIds, launchStatusIds.asUInt)
+    target.launchStatuses := Mux(lrcOrdinaryResume, priorLaunchStatuses, launchStatuses.asUInt)
+    target.sessionStatus := Mux(lrcOrdinaryResume, priorSessionStatus, sessionStatus)
     when(commitLaunchStatus) {
       assert(boundaryPaused, "TrafficGenBridge published launch status while target was running")
       for (slot <- 0 until launchSlots) {
@@ -125,7 +293,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       (unacknowledgedLaunches.orR || unacknowledgedClose)
     val legacyStartBoundary = fire && target.startTrafficGen
 
-    when(fire) {
+    when(tokenEffects) {
       for (slot <- 0 until launchSlots) {
         launchRegistryIds(slot) := target.launchRegistryIds(64 * slot + 63, 64 * slot)
         launchIds(slot) := target.launchIds(64 * slot + 63, 64 * slot)
@@ -148,7 +316,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(trafficGenDonePulse) {
       trafficGenDone := true.B
     }
-    target.trafficGenDone := trafficGenDone
+    val priorTrafficGenDone = RegEnable(trafficGenDone, false.B, fire && !lrcEnable)
+    target.trafficGenDone := Mux(lrcOrdinaryResume, priorTrafficGenDone, trafficGenDone)
 
 
     // Bridge protocol width and number of independent access-store banks.
@@ -203,34 +372,39 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val issuedBatchExpectedId = RegInit(0.U(32.W))
 
     // Convert the packed target batch into one issued-access record per lane.
-    val issuedBatchPackedLanes = target.issuedAccessBatch.bits.accesses.asTypeOf(Vec(replayLanes, UInt(issuedStreamWidth.W)))
-    val issuedBatchIncomingCount = PopCount(target.issuedAccessBatch.bits.validMask)
+    val issuedCaptureMask = Mux(lrcEnable, target.physicalIssueValidMask, target.issuedAccessBatch.bits.validMask)
+    val issuedBatchPackedLanes = Mux(lrcEnable, target.physicalIssueAccesses,
+      target.issuedAccessBatch.bits.accesses).asTypeOf(Vec(replayLanes, UInt(issuedStreamWidth.W)))
+    val issuedBatchIncomingCount = PopCount(issuedCaptureMask)
 
     // check that every valid lane in incoming issued batch has space in corresponding writeback lane bank
     // e.g. batch doesn't contain that lane, or lane write-back bank not full
     val issuedBatchFits = VecInit((0 until replayLanes).map { lane =>
-      !target.issuedAccessBatch.bits.validMask(lane) ||
+      !issuedCaptureMask(lane) ||
         issuedAccessWritebackLaneCounts(lane) < laneBankDepth.U
     }).asUInt.andR
 
     // ensure that bridge has space to capture issued-batch 
     target.issuedAccessBatch.ready := fire && issuedBatchFits
     // fire signal for issued batch
-    val issuedBatchCapture = target.issuedAccessBatch.valid && target.issuedAccessBatch.ready
-    when(fire && target.issuedAccessBatch.valid) {
+    val issuedBatchCapture = Mux(lrcEnable, tokenEffects && target.physicalIssueValidMask.orR,
+      target.issuedAccessBatch.valid && target.issuedAccessBatch.ready)
+    when(tokenEffects && Mux(lrcEnable, target.physicalIssueValidMask.orR, target.issuedAccessBatch.valid)) {
       assert(issuedBatchFits,
         "TrafficGenBridge issued-access batch exceeded the writeback store capacity")
     }
 
     when(issuedBatchCapture) {
-      assert(target.issuedAccessBatch.bits.validMask.orR, "TrafficGenBridge captured an empty issued-access batch")
-      assert(target.issuedAccessBatch.bits.batchId === issuedBatchExpectedId, "TrafficGenBridge captured an out-of-order issued-access batch")
-      issuedBatchExpectedId := issuedBatchExpectedId + 1.U
+      assert(issuedCaptureMask.orR, "TrafficGenBridge captured an empty issued-access batch")
+      when(!lrcEnable) {
+        assert(target.issuedAccessBatch.bits.batchId === issuedBatchExpectedId, "TrafficGenBridge captured an out-of-order issued-access batch")
+        issuedBatchExpectedId := issuedBatchExpectedId + 1.U
+      }
       
       // write into writeback store and increment lane counts
       issuedAccessWritebackCount := issuedAccessWritebackCount + issuedBatchIncomingCount
       for (lane <- 0 until replayLanes) {
-        when(target.issuedAccessBatch.bits.validMask(lane)) {
+        when(issuedCaptureMask(lane)) {
           issuedAccessWritebackStores(lane).write(
             issuedAccessWritebackLaneCounts(lane)(laneBankIdxWidth - 1, 0),
             issuedBatchPackedLanes(lane))
@@ -284,11 +458,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     completedBundleIdsWriteMask.foreach(_ := false.B)
 
     // target writes the completedBundleCount to help bridge driver read
-    when(fire && target.completedBundleCountWriteEn) {
+    when(tokenEffects && target.completedBundleCountWriteEn && !lrcEnable) {
       completedBundleCount := target.completedBundleCountWriteData
     }
     // write index and data to write into completedBundleIds
-    when(fire && target.completedBundleIdWriteEn) {
+    when(tokenEffects && target.completedBundleIdWriteEn && !lrcEnable) {
       val beatIdx = target.completedBundleIdWriteIdx >> log2Ceil(CompletedBundleIds.idsPerBeat)
       val laneIdx = target.completedBundleIdWriteIdx(log2Ceil(CompletedBundleIds.idsPerBeat) - 1, 0)
       val writeData = Wire(Vec(CompletedBundleIds.idsPerBeat, UInt(64.W)))
@@ -484,13 +658,14 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadFetchPending(lane) := (accessReadFetchPending(lane) && !pendingResponseAccepted) || selectedFetchValid
 
       // select the 3 consume bits belonging to current lane from full 3N consume mask
-      val laneConsumeMask = target.accessReadConsumeMask(laneBase + replaySlotsPerLane - 1, laneBase)
-      when(fire) {
+      val consumeMask = Mux(lrcEnable, target.physicalConsumeMask, target.accessReadConsumeMask)
+      val laneConsumeMask = consumeMask(laneBase + replaySlotsPerLane - 1, laneBase)
+      when(tokenEffects) {
         assert(PopCount(laneConsumeMask) <= 1.U,
           "TrafficGenBridge consumed more than one slot from a replay lane")
       }
       // check that target consumed expected slot in the lane
-      when(fire && laneConsumeMask.orR) {
+      when(tokenEffects && laneConsumeMask.orR) {
         assert(laneConsumeMask ===
           UIntToOH(accessReadExpectedConsumeSlot(lane), replaySlotsPerLane),
           "TrafficGenBridge consumed replay slots out of lane order")
@@ -502,11 +677,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
         val flat = laneBase + slot
         val queue = accessReadQueues(flat)
         // remove the head from the slot that target consumed 
-        accessReadConsume(flat) := fire && target.accessReadConsumeMask(flat)
+        accessReadConsume(flat) := tokenEffects && consumeMask(flat)
         queue.io.deq.ready := accessReadConsume(flat)
         when(accessReadConsume(flat)) {
           assert(queue.io.deq.valid, "TrafficGenBridge consumed an invalid prefetched replay slot")
-          assert(queue.io.deq.bits(191, 128) <= target.accessReadCycle, "TrafficGenBridge consumed a replay slot before its scheduled cycle")
+          assert(queue.io.deq.bits(191, 128) <= Mux(lrcEnable, lrcCurrentCycle, target.accessReadCycle), "TrafficGenBridge consumed a replay slot before its scheduled cycle")
         }
         // check if the slot is exhausted 
         accessReadSlotDone(flat) :=
@@ -531,6 +706,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     // pause if any unfinished slot has an empty FIFO
     val accessReadNeedsPause =
       (accessReadPrefillPending || accessReplayActive) && accessReadHeadMissing.asUInt.orR
+    // Native replay does not spend a target cycle acknowledging a host BRAM
+    // refill. Completion accounting may finish while this gate remains shut.
     val issuedBatchSafeToPause = !target.issuedAccessBatch.valid || issuedBatchCapture
 
     // present current replay state to target
@@ -619,6 +796,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessStoreMaxCycle := uploadMaxCycle
       accessStoreHasEntries := uploadCount =/= 0.U
       accessStoreHasMore := uploadHasMore
+      lrcUnissued := uploadCount
+      lrcReplayEpoch := lrcReplayEpoch + 1.U
       for (flat <- 0 until replaySlots) {
         accessReadCursors(flat) := (flat % replaySlotsPerLane).U
       }
@@ -635,9 +814,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       accessReadTargetPaused := false.B
     }
 
-    target.uploadReady := uploadReady
+    target.uploadReady := uploadReady && !(lrcOrdinaryParked && !lrcEnable)
 
-    when(fire && target.roundStarted) {
+    when(tokenEffects && target.roundStarted && !lrcEnable) {
       uploadReady := false.B
       accessReplayActive := true.B
     }
@@ -649,7 +828,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val minIssueCycleLow = RegInit(0.U(32.W))
     val minIssueCycleHigh = RegInit(0.U(32.W))
     val minIssueCycle = Cat(minIssueCycleHigh, minIssueCycleLow)
-    target.minIssueCycle := minIssueCycle
+    target.minIssueCycle := Mux(lrcEnable && lrcDrainOnly, ~0.U(64.W), minIssueCycle)
     target.accessStoreCount := accessStoreCount
     target.accessStoreMaxCycle := accessStoreMaxCycle
     target.accessStoreHasEntries := accessStoreHasEntries
@@ -715,12 +894,19 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val writeRawAccess = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset, accessWindowBytes)
     val writeRawIssued = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
     val writeRawCompleted = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
+    val writeLrcMetadata = inBramRange(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset,
+      BigInt(TrafficGenBRAMAddressMap.lrcMetadataEntries) * 64)
 
     bramAxi.w.ready := axiWriteActive && !axiWriteRespValid
 
     // each W beat writes directly into the SyncReadMem
     val axiWriteLastBeat = axiWriteBeatsRemaining === 1.U
     when(bramAxi.w.fire) {
+      when(writeLrcMetadata) {
+        assert(boundaryPaused && !lrcMetadataBusy, "LRC staging write raced metadata processing")
+        assert(bramAxi.w.bits.strb.andR, "LRC metadata requires complete 512-bit descriptor writes")
+        lrcMetadata.write(beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.lrcMetadataOffset)(lrcMetadataIndexBits - 1, 0), bramAxi.w.bits.data)
+      }
       when(writeRawAccess) {
         val flatIdx = beatIndex(axiWriteAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset)
         // Match the divisor to the XDMA-derived index width.  Besides making
@@ -762,8 +948,9 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       axiReadRouteAccess ::
       axiReadRouteIssued ::
       axiReadRouteCompleted ::
+      axiReadRouteLrcReport ::
       Nil
-    ) = Enum(4)
+    ) = Enum(5)
 
     val axiReadActive = RegInit(false.B)
     val axiReadAddr = Reg(UInt(bramAddrBits.W))
@@ -801,8 +988,11 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     val readRawAccess = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawAccessStoreOffset, accessWindowBytes)
     val readRawIssued = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawIssuedAccessWritebackStoreOffset, accessWindowBytes)
     val readRawCompleted = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.rawCompletedBundleIdsOffset, completedWindowBytes)
+    val readLrcReport = inBramRange(axiReadAddr, TrafficGenBRAMAddressMap.lrcReportOffset, BigInt(131072) * 64)
     val axiReadIssue = axiReadActive && !axiReadPending && !axiReadRespValid
     val axiReadLastIssue = axiReadBeatsRemaining === 1.U
+    lrcReportReadEnable := axiReadIssue && readLrcReport
+    lrcReportReadIndex := beatIndex(axiReadAddr, TrafficGenBRAMAddressMap.lrcReportOffset)(16, 0)
 
     // generate the appropriate index and enable for the XDMA read into issued access and completed bundle IDs
     val axiIssuedFlatIdx = beatIndex(
@@ -835,6 +1025,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           readRawAccess -> axiReadRouteAccess,
           readRawIssued -> axiReadRouteIssued,
           readRawCompleted -> axiReadRouteCompleted,
+          readLrcReport -> axiReadRouteLrcReport,
         ),
       )
       axiReadAddr := axiReadAddr + bramBeatBytes.U
@@ -852,6 +1043,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
           axiReadRouteAccess -> axiAccessReadBits,
           axiReadRouteIssued -> axiIssuedReadBits,
           axiReadRouteCompleted -> axiCompletedReadBits.asUInt,
+          axiReadRouteLrcReport -> lrcReportReadBits,
         ),
       )
       axiReadLastReg := axiReadPendingLast
@@ -882,11 +1074,18 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(startRoundRisingEdge) {
       startRoundPending := true.B
       currentRound := currentRound + 1.U
+      when(lrcEnable) { lrcRoundActive := true.B; accessReplayActive := true.B }
     }
-    when(fire && target.roundStarted) {
+    when(tokenEffects && target.roundStarted && !lrcEnable) {
       startRoundPending := false.B
     }
-    target.startRound := startRoundPending
+    // A native start is acknowledged by the first fully accounted snapshot or
+    // release of the preceding parked snapshot. Its delayed legacy roundStarted
+    // signal is intentionally not used to reset native boundary state.
+    when(lrcEnable && startRoundPending && (tokenEffects || fire)) {
+      startRoundPending := false.B
+    }
+    target.startRound := startRoundPending && !(lrcOrdinaryParked && !lrcEnable)
 
     // Expose completion only after the final target batch has crossed HostPort
     // and all lane-bank writes from that batch have committed.
@@ -902,7 +1101,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     when(resumeTarget) {
       boundaryCycleValid := false.B
     }
-    when(fire && target.roundStarted) {
+    when(fire && target.roundStarted && !lrcEnable) {
       roundCompleteLatched := false.B
       roundCompletePending := false.B
       boundaryCycleValid := false.B
@@ -911,7 +1110,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     }.elsewhen(roundCompletePending && !issuedWriteCommitPending) {
       roundCompleteLatched := true.B
       roundCompletePending := false.B
-    }.elsewhen(fire && target.roundComplete) {
+    }.elsewhen(tokenEffects && target.roundComplete && !lrcEnable) {
       roundCompletePending := true.B
       boundaryCycle := target.currentCycleAfterIssue
       boundaryCycleValid := true.B
@@ -927,6 +1126,137 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       roundExitReason := TrafficGenRoundExitReason.control
       bundleTableFullLaneMask := 0.U
     }
+
+    val lrcIssuedThisCycle = PopCount(target.physicalIssueValidMask)
+    val lrcUnissuedAfter = lrcUnissued - lrcIssuedThisCycle
+    val lrcIssueBoundary = lrcUnissuedAfter === 0.U && !accessStoreHasMore &&
+      lrcCurrentCycle >= lrcArrivalHorizon
+    val lrcPrivateRefill = lrcUnissuedAfter === 0.U && accessStoreHasMore
+    val lrcSchedulingFence = accountingWake ||
+      (honorDeadline && lrcCurrentCycle >= minIssueCycle) ||
+      Mux(lrcDrainOnly, !accountingPending, lrcIssueBoundary && tmaMonitor.io.batchSemantics)
+    val lrcAccountingReady = accountingReady && !lrcMetadataBusy &&
+      !lrcReportDrainRequired && !accessReadNeedsPause && !accessReadTargetPaused &&
+      !boundaryPaused && hPort.toHost.hValid && hPort.fromHost.hReady
+    val lrcOrdinaryFence = key.useRTL.B && lrcMonitoring && !lrcEnable &&
+      lrcAccountingReady && target.roundComplete && !lrcOrdinaryParked
+    val lrcFenceDecision = Module(new LrcNativeFence)
+    lrcFenceDecision.io.enabled := lrcEnable
+    lrcFenceDecision.io.accounted := lrcAccountingReady
+    lrcFenceDecision.io.parked := lrcParkedToken
+    lrcFenceDecision.io.checkpoint := lrcCheckpointPending || lrcCheckpointActive
+    lrcFenceDecision.io.active := lrcRoundActive
+    lrcFenceDecision.io.controlPending := unacknowledgedLaunches.orR || unacknowledgedClose
+    lrcFenceDecision.io.scheduling := lrcSchedulingFence
+    lrcFenceDecision.io.refill := lrcPrivateRefill
+    val lrcFence = lrcFenceDecision.io.fence
+    lrcTokenPermit := !lrcMetadataBusy && !lrcReportDrainRequired &&
+      (!lrcMonitoring || accountingReady) && (!lrcEnable || !accessReadNeedsPause) &&
+      !lrcFence && !lrcOrdinaryFence && !lrcCheckpointPending && !lrcCheckpointActive
+    tokenEffects := Mux(lrcEnable, lrcAccountingReady && !lrcParkedToken &&
+      !lrcCheckpointPending && !lrcCheckpointActive,
+      lrcOrdinaryFence || (fire && !lrcOrdinaryParked))
+    when(tokenEffects && lrcEnable && lrcRoundActive) {
+      legacyUnaccountedBoundary := false.B
+      assert(lrcIssuedThisCycle <= lrcUnissued, "LRC physical issue exceeded uploaded descriptors")
+      lrcUnissued := lrcUnissuedAfter
+    }
+    when(fire && lrcEnable && lrcRoundActive && !tmaMonitor.io.batchSemantics &&
+      !lrcDrainOnly && lrcIssueBoundary && !accountingWake && lrcCurrentCycle < minIssueCycle) {
+      legacyIssueBoundaryPending := true.B
+    }
+    when(lrcEnable && legacyIssueBoundaryPending && !boundaryPaused &&
+      hPort.toHost.hValid && hPort.fromHost.hReady && !lrcMetadataBusy) {
+      assert(!fire, "Legacy TMA issue boundary consumed an unaccounted token")
+      legacyUnaccountedBoundary := true.B
+      boundaryCycle := lrcCurrentCycle
+      boundaryCycleValid := true.B
+      boundaryPaused := true.B
+      roundCompletePending := true.B
+      roundExitReason := TrafficGenRoundExitReason.scheduling
+      bundleTableFullLaneMask := 0.U
+      lrcBoundaryFlags := Mux(!accountingPending, 8.U,
+        Mux(lrcCurrentCycle >= minIssueCycle, 2.U, 4.U))
+      lrcRoundActive := false.B
+      accessReplayActive := false.B
+    }
+    when(lrcEnable && (lrcBeginRound || startRoundRisingEdge)) {
+      legacyIssueBoundaryPending := false.B
+      assert(boundaryPaused, "LRC start requires the previous boundary fence")
+      roundCompleteLatched := false.B
+      roundCompletePending := false.B
+      lrcCheckpointCycle := boundaryCycle
+      // A legacy issue boundary parked C+1 before accounting any of it. Feed
+      // that complete raw token to both monitors under the new policy, rather
+      // than allowing a floor-only checkpoint to wake ahead of C+1 returns.
+      lrcCheckpointPending := !legacyUnaccountedBoundary
+      lrcCheckpointActive := false.B
+    }
+    when(lrcCheckpointPending && lrcMonitorCanRun && accountingIdle) {
+      // stateDone retains the already-accounted target snapshot; stateIdle is
+      // possible when entering native mode at the initial control boundary.
+      lrcRecheck := lrcMonitor.io.tokenReady
+      lrcCheckpointPending := false.B
+      lrcCheckpointActive := true.B
+    }
+    val lrcCheckpointFence = accountingWake ||
+      (honorDeadline && lrcCheckpointCycle >= minIssueCycle) ||
+      Mux(lrcDrainOnly, !accountingPending,
+        lrcUnissued === 0.U && !accessStoreHasMore && lrcCheckpointCycle >= lrcArrivalHorizon)
+    when(lrcCheckpointActive && lrcAccountingReady) {
+      lrcCheckpointActive := false.B
+      when(lrcCheckpointFence) {
+        boundaryCycle := lrcCheckpointCycle
+        boundaryCycleValid := true.B
+        boundaryPaused := true.B
+        roundCompletePending := true.B
+        roundExitReason := TrafficGenRoundExitReason.scheduling
+        bundleTableFullLaneMask := 0.U
+        lrcBoundaryFlags := Cat(0.U(25.W), tmaMonitor.io.transferWake, tmaMonitor.io.phaseWake, false.B, lrcDrainOnly && !accountingPending,
+          !lrcDrainOnly && lrcUnissued === 0.U && !accessStoreHasMore && lrcCheckpointCycle >= lrcArrivalHorizon,
+          honorDeadline && lrcCheckpointCycle >= minIssueCycle, lrcMonitor.io.wake)
+        lrcRoundActive := false.B
+      }.elsewhen(!lrcParkedToken) {
+        // The ordinary boundary's raw C+1 snapshot has not been accounted.
+        // Start it on the next host edge, under the newly committed metadata.
+        lrcRecheck := true.B
+        lrcMonitor.io.cycle := lrcCurrentCycle
+        lrcMonitor.io.returns := target.physicalCompletionValidMask
+      }
+    }
+    when(lrcOrdinaryFence) {
+      // Publish ordinary cycle C, leaving raw C+1 held for either the legacy
+      // resume delay or native completion accounting with the next metadata.
+      lrcOrdinaryParked := true.B
+    }
+    when(fire && lrcOrdinaryParked) {
+      lrcOrdinaryParked := false.B
+    }
+    when(lrcFence) {
+      // Account C once, but keep its token parked. On resume the new epoch's
+      // fromHost inputs accompany consumption of C, so the latency-one wire
+      // channel cannot produce an old-epoch C+1 issue after a hard wake.
+      boundaryCycle := lrcCurrentCycle
+      boundaryCycleValid := true.B
+      boundaryPaused := true.B
+      roundCompletePending := true.B
+      roundExitReason := Mux(lrcFenceDecision.io.control, TrafficGenRoundExitReason.control,
+        Mux(lrcSchedulingFence, TrafficGenRoundExitReason.scheduling, TrafficGenRoundExitReason.capacity))
+      bundleTableFullLaneMask := 0.U
+      lrcBoundaryFlags := Cat(0.U(25.W), tmaMonitor.io.transferWake, tmaMonitor.io.phaseWake, lrcPrivateRefill,
+        lrcDrainOnly && !accountingPending,
+        !lrcDrainOnly && lrcIssueBoundary,
+        honorDeadline && lrcCurrentCycle >= minIssueCycle,
+        lrcMonitor.io.wake)
+      lrcRoundActive := false.B
+      accessReplayActive := false.B
+      lrcParkedToken := true.B
+      when(lrcFenceDecision.io.idleControl) {
+        startTrafficGenLatched := true.B
+        trafficGenDone := false.B
+      }
+    }
+    when(fire && lrcParkedToken) { lrcParkedToken := false.B }
 
     val boundaryPausedPrev = RegNext(boundaryPaused, false.B)
     val boundaryCycleValidPrev = RegNext(boundaryCycleValid, false.B)
@@ -948,11 +1278,33 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
 
     val targetReset = fire && hPort.hBits.reset
+    lrcReset := targetReset
 
     hPort.toHost.hReady := fire
     hPort.fromHost.hValid := fire
 
     when(targetReset) {
+      lrcEnable := false.B
+      legacyIssueBoundaryPending := false.B
+      legacyUnaccountedBoundary := false.B
+      lrcMonitoring := false.B
+      lrcRoundActive := false.B
+      lrcParkedToken := false.B
+      lrcOrdinaryParked := false.B
+      lrcCheckpointPending := false.B
+      lrcCheckpointActive := false.B
+      lrcOrdinaryReturnMask := 0.U
+      lrcMetadataBusy := false.B
+      lrcMetaReadPending := false.B
+      lrcMetaValid := false.B
+      lrcReportCount := 0.U
+      lrcServiceHighWater := 0.U
+      lrcBundleHighWater := 0.U
+      lrcTimerHighWater := 0.U
+      lrcReportHighWater := 0.U
+      lrcReplayEpoch := 0.U
+      lrcUnissued := 0.U
+      lrcBoundaryFlags := 0.U
       accessReadReset := true.B
       accessReadTargetPaused := false.B
       for (flat <- 0 until replaySlots) {
@@ -1024,7 +1376,8 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
 
     // for bridge driver to read to determine if target is still running the previous traffic pattern
     genROReg(target.targetBusy, "target_busy")
-    genROReg(target.hasPendingWork, "has_pending_work")
+    genROReg(Mux(lrcEnable, accountingPending || lrcUnissued =/= 0.U ||
+      (boundaryCycle < lrcArrivalHorizon), target.hasPendingWork), "has_pending_work")
     Pulsify(genWORegInit(trafficGenDonePulse, "trafficgen_done", false.B), pulseLength = 1)
 
     // Boundary pauses are entered synchronously from target tokens and exited
@@ -1065,7 +1418,7 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
     genWORegInit(minIssueCycleHigh, "min_issue_cycle_high", 0.U)
 
     val reportedCycleAfterIssue = Mux(
-      boundaryCycleValid, boundaryCycle, target.currentCycleAfterIssue)
+      boundaryCycleValid, boundaryCycle, Mux(lrcEnable, lrcCurrentCycle, target.currentCycleAfterIssue))
     genROReg(reportedCycleAfterIssue(31, 0), "current_cycle_after_issue_low")
     genROReg(reportedCycleAfterIssue(63, 32), "current_cycle_after_issue_high")
     genROReg(roundExitReason, "round_exit_reason")
@@ -1117,6 +1470,47 @@ class TrafficGenBridgeModule(key: TrafficGenBridgeKey)(implicit p: Parameters)
       stagedSessionStatus := value
     }
     Pulsify(genWORegInit(commitLaunchStatus, "commit_launch_status", false.B), pulseLength = 1)
+
+    // Native v6 descriptor/report ABI. Keep this append-only order synchronized
+    // with trafficgen.h. Staging records and reports are documented in
+    // LrcCompletionMonitor; their windows use complete 512-bit XDMA beats.
+    genWORegInit(lrcEnable, "lrc_enable", false.B)
+    genWORegInit(lrcMetadataCount, "lrc_metadata_count", 0.U)
+    Pulsify(genWORegInit(lrcCommitMetadata, "lrc_commit_metadata", false.B), pulseLength = 1)
+    genROReg(lrcMetadataReady, "lrc_metadata_ready")
+    Pulsify(genWORegInit(lrcBeginRound, "lrc_begin_round", false.B), pulseLength = 1)
+    genWORegInit(lrcDrainOnly, "lrc_drain_only", false.B)
+    genWORegInit(lrcArrivalLow, "lrc_arrival_horizon_low", 0.U)
+    genWORegInit(lrcArrivalHigh, "lrc_arrival_horizon_high", 0.U)
+    genROReg(lrcReportCount, "lrc_report_count")
+    Pulsify(genWORegInit(lrcClearReports, "lrc_clear_reports", false.B), pulseLength = 1)
+    genROReg(lrcMonitor.io.error | (tmaMonitor.io.error << 16)(31,0), "lrc_error")
+    genROReg(65536.U(32.W), "lrc_service_capacity")
+    genROReg(65536.U(32.W), "lrc_bundle_capacity")
+    genROReg(65536.U(32.W), "lrc_timer_capacity")
+    genWORegInit(lrcRefillOnly, "lrc_refill_only", false.B)
+    genROReg(lrcReportDrainRequired, "lrc_report_drain_required")
+    genROReg(lrcMonitor.io.serviceCount.pad(32), "lrc_service_count")
+    genROReg(lrcMonitor.io.bundleCount.pad(32), "lrc_bundle_count")
+    genROReg(lrcMonitor.io.timerCount.pad(32), "lrc_timer_count")
+    genROReg(lrcServiceHighWater, "lrc_service_high_water")
+    genROReg(lrcBundleHighWater, "lrc_bundle_high_water")
+    genROReg(lrcTimerHighWater, "lrc_timer_high_water")
+    genROReg(lrcReportHighWater, "lrc_report_high_water")
+    genROReg(lrcBoundaryFlags, "lrc_boundary_flags")
+    val tmaGroupHighWater = RegInit(0.U(32.W))
+    val tmaEdgeHighWater = RegInit(0.U(32.W))
+    val tmaTimerHighWater = RegInit(0.U(32.W))
+    tmaGroupHighWater := Mux(tmaMonitor.io.groupCount > tmaGroupHighWater, tmaMonitor.io.groupCount, tmaGroupHighWater)
+    tmaEdgeHighWater := Mux(tmaMonitor.io.edgeCount > tmaEdgeHighWater, tmaMonitor.io.edgeCount, tmaEdgeHighWater)
+    tmaTimerHighWater := Mux(tmaMonitor.io.timerCount > tmaTimerHighWater, tmaMonitor.io.timerCount, tmaTimerHighWater)
+    when(targetReset) { tmaGroupHighWater:=0.U; tmaEdgeHighWater:=0.U; tmaTimerHighWater:=0.U }
+    genROReg(tmaMonitor.io.groupCount.pad(32), "tma_group_count")
+    genROReg(tmaMonitor.io.edgeCount.pad(32), "tma_edge_count")
+    genROReg(tmaMonitor.io.timerCount.pad(32), "tma_timer_count")
+    genROReg(tmaGroupHighWater, "tma_group_high_water")
+    genROReg(tmaEdgeHighWater, "tma_edge_high_water")
+    genROReg(tmaTimerHighWater, "tma_timer_high_water")
 
 
 

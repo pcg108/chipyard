@@ -63,6 +63,7 @@ class TrafficGenPutGetSpec extends AnyFlatSpec with ChiselScalatestTester {
                             address: BigInt, mask: BigInt, data: BigInt)
 
   private def pokeAccess(bits: RTLL2Access, access: Access): Unit = {
+    bits.physicalToken.poke((access.id + 0x10000).U)
     bits.id.poke(access.id.U)
     bits.address.poke(access.address.U)
     bits.cycleCount.poke(access.cycle.U)
@@ -76,6 +77,7 @@ class TrafficGenPutGetSpec extends AnyFlatSpec with ChiselScalatestTester {
   }
 
   private def initialize(dut: TrafficGenPutGetHarnessImp): Unit = {
+    dut.io.batchMode.poke(false.B)
     dut.io.req.valid.poke(false.B)
     pokeAccess(dut.io.req.bits, Access(0, 0))
     dut.io.coreOffset.poke(0.U)
@@ -381,6 +383,49 @@ class TrafficGenPutGetSpec extends AnyFlatSpec with ChiselScalatestTester {
       respond(dut, nextFirst)
       consumeCompletion(dut, next)
       dut.io.active.expect(false.B)
+    }
+  }
+
+  it should "report a physical return on the final D handshake before legacy dequeue" in {
+    test(LazyModule(new TrafficGenPutGetHarness()).module) { dut =>
+      initialize(dut)
+      val access = Access(121, 0xb000, write = false)
+      enqueue(dut, access)
+      val packet = acceptA(dut)
+      driveResponse(dut, packet, write = false)
+      waitFor(dut, dut.tl.d.ready.peek().litToBoolean)
+      dut.io.physicalCompletion.valid.expect(true.B)
+      dut.io.physicalCompletion.bits.expect((access.id + 0x10000).U)
+      dut.io.completion.valid.expect(false.B)
+      dut.clock.step()
+      dut.tl.d.valid.poke(false.B)
+      dut.io.physicalCompletion.valid.expect(false.B)
+      dut.io.completion.valid.expect(true.B)
+      dut.clock.step(3)
+      dut.io.physicalCompletion.valid.expect(false.B)
+      consumeCompletion(dut, access)
+    }
+  }
+
+  it should "retire batch responses without filling the legacy completion queue" in {
+    test(LazyModule(new TrafficGenPutGetHarness()).module) { dut =>
+      initialize(dut)
+      dut.io.batchMode.poke(true.B)
+      // Never consume the old completion interface. Native batch completion
+      // must still recycle sources and release same-sector ownership.
+      for (index <- 0 until 12) {
+        val access = Access(130 + index, 0xc000)
+        enqueue(dut, access)
+        val packet = acceptA(dut)
+        driveResponse(dut, packet)
+        dut.tl.d.ready.expect(true.B)
+        dut.io.physicalCompletion.valid.expect(true.B)
+        dut.io.physicalCompletion.bits.expect((access.id + 0x10000).U)
+        dut.clock.step()
+        dut.tl.d.valid.poke(false.B)
+        dut.io.completion.valid.expect(false.B)
+        dut.io.active.expect(false.B)
+      }
     }
   }
 
