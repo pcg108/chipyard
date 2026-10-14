@@ -37,7 +37,12 @@ for col,(label,rows,issue,ret) in enumerate(series):
         axes[0,col].plot(issued,np.arange(1,len(issued)+1),color=color,label=kind+' issued')
         axes[0,col].plot(finished,np.arange(1,len(finished)+1),'--',color=color,label=kind+' returned')
         axes[1,col].hist([r[ret]-r[issue] for r in subset],bins=80,histtype='step',color=color,label=kind)
-    axes[0,col].set(title=label,xlabel='Target / capture cycle',ylabel='Cumulative physical transactions')
+    if col == 0:
+        subtitle=f"Capture final cycle {runs[0][1]['recorded_capture_final_cycle']:,}"
+    else:
+        validation=runs[col-1][1]
+        subtitle=f"Final cycle {validation['final_cycle']:,}; {validation['complete_policy_snapshots']:,} scheduling rounds"
+    axes[0,col].set(title=label+'\n'+subtitle,xlabel='Target / capture cycle',ylabel='Cumulative physical transactions')
     axes[1,col].set(xlabel='Issue-to-return latency (cycles)',ylabel='Physical transactions')
     for row in range(2):axes[row,col].grid(alpha=.2);axes[row,col].legend(fontsize=8)
 fig.suptitle('Hopper Gemma kernel 6632 — TMA + mbarriers + LRC\n'
