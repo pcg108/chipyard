@@ -182,7 +182,9 @@ class TmaWakeMonitor(val lanes: Int, val servicesCount: Int = 65536,
   when(gWrite) { groups.write(gWriteAddr,gWriteData) }
   def writeHead(index: UInt, value: UInt): Unit = { hWrite:=true.B; hWriteAddr:=index; hWriteData:=value }
   def writeGroup(index: UInt, value: UInt): Unit = { gWrite:=true.B; gWriteAddr:=index; gWriteData:=value }
-  def fail(code: Int): Unit = { error := code.U; assert(false.B,"TMA wake metadata or completion invariant failed") }
+  // Match the LRC monitor: expose a sticky error to the bridge/driver and block
+  // execution. A constant-false assertion is rejected by Vivado elaboration.
+  def fail(code: Int): Unit = { error := code.U }
   def queueTimer(value: TmaGroupRow, index: UInt, resume: UInt): Unit = {
     row := value; slot := index; afterPush := resume; state := pushTimer
   }
