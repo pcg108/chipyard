@@ -4,7 +4,9 @@
 Run with the Chipyard environment sourced, after continue-v7.py succeeds.
 Every failed gate stops; this script performs no implementation recovery.
 """
+import argparse
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -20,7 +22,20 @@ target = 'FireSimQuadRocketDualGemminiSaturnTrafficGenConfig'
 quintuplet = f'xilinx_alveo_u250-firesim-FireSim-{target}-BaseXilinxAlveoU250Config'
 build = work / 'builds/platforms/xilinx_alveo_u250' / ('cl_' + quintuplet)
 status = json.loads((work / 'pipeline-status.json').read_text())
-assert status['state'] == 'bitstream_build_finished', status
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--resume-package', action='store_true',
+                    help='Resume a packaging failure after the completed final DRC')
+args = parser.parse_args()
+fpga_lock = None
+priority = work / 'FPGA_REQUESTED.json'
+if args.resume_package:
+    assert status['state'] == 'failed' and status['stage'] == 'package', status
+    assert 'final-drc' in status['completed_stages']
+    assert 'XRSIGHT_FINAL_DRC_ERRORS 0' in (work / 'logs/final-drc.log').read_text()
+    assert json.loads((work / 'guard-final-drc/guard-result.json').read_text())['command_exit_code'] == 0
+    status.pop('error', None)
+else:
+    assert status['state'] == 'bitstream_build_finished', status
 assert not (work / 'STOPPED_NO_AUTORESTART.json').exists()
 
 
@@ -57,10 +72,13 @@ try:
     project = build / 'vivado_proj'
     checkpoint = project / 'firesim.runs/impl_1/overall_fpga_top_postroute_physopt.dcp'
     assert checkpoint.is_file(), checkpoint
-    run('final-drc', ['/ecad/tools/xilinx/Vivado/2022.1/bin/vivado', '-mode', 'batch',
-                     '-nojournal', '-log', str(work / 'logs/final-drc-vivado.log'),
-                     '-source', str(pkg / 'check-final-drc.tcl'), '-tclargs', str(checkpoint),
-                     str(project / 'reports/final_drc.rpt')])
+    if args.resume_package:
+        assert checkpoint.stat().st_mtime < (project / 'reports/final_drc.rpt').stat().st_mtime
+    else:
+        run('final-drc', ['/ecad/tools/xilinx/Vivado/2022.1/bin/vivado', '-mode', 'batch',
+                         '-nojournal', '-log', str(work / 'logs/final-drc-vivado.log'),
+                         '-source', str(pkg / 'check-final-drc.tcl'), '-tclargs', str(checkpoint),
+                         str(project / 'reports/final_drc.rpt')])
     output = work / 'deliverables'
     run('package', [sys.executable, str(pkg / 'package-build.py'), '--build-output', str(build),
                     '--smoke-result', str(work / 'validation/combined-smoke/result.json'),
@@ -75,6 +93,10 @@ try:
         path = Path(evidence['path'])
         assert sha(path) == evidence['sha256']
         shutil.copy2(path, slot / name)
+    priority.write_text(json.dumps({'pid': os.getpid(), 'purpose': 'Hopper kernel 6632 physical validation'}) + '\n')
+    save(stage='waiting_for_fpga', fpga_coordination='Ampere sweeps yield between kernels')
+    fpga_lock = Path('/tmp/prashanth-xrsight-u250.lock').open('a')
+    fcntl.flock(fpga_lock, fcntl.LOCK_EX)
     # Check all XDMA devices because the installed reload helper unloads the
     # shared module. Never displace another process using a device.
     for device in Path('/dev').glob('xdma*'):
@@ -117,3 +139,8 @@ try:
 except BaseException as error:
     save(state='failed', error=repr(error))
     raise
+finally:
+    if priority.exists() and json.loads(priority.read_text()).get('pid') == os.getpid():
+        priority.unlink()
+    if fpga_lock is not None:
+        fpga_lock.close()
