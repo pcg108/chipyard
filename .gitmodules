@@ -24,7 +24,7 @@
 	url = https://github.com/ucb-bar/FFTGenerator.git
 [submodule "generators/gemmini"]
 	path = generators/gemmini
-	url = https://github.com/ucb-bar/gemmini.git
+	url = https://github.com/pcg108/gemmini.git
 [submodule "generators/hardfloat"]
 	path = generators/hardfloat
 	url = https://github.com/ucb-bar/berkeley-hardfloat.git
@@ -54,7 +54,7 @@
 	url = https://github.com/chipsalliance/rocket-chip-blocks.git
 [submodule "generators/rocket-chip-inclusive-cache"]
 	path = generators/rocket-chip-inclusive-cache
-	url = https://github.com/chipsalliance/rocket-chip-inclusive-cache.git
+	url = https://github.com/pcg108/rocket-chip-inclusive-cache.git
 [submodule "generators/shuttle"]
 	path = generators/shuttle
 	url = git@github.com:pcg108/shuttle.git
@@ -63,7 +63,7 @@
 	url = https://github.com/ucb-bar/testchipip.git
 [submodule "sims/firesim"]
 	path = sims/firesim
-	url = https://github.com/firesim/firesim.git
+	url = https://github.com/pcg108/firesim.git
 [submodule "software/baremetal-ide"]
 	path = software/baremetal-ide
 	url = https://github.com/ucb-bar/Baremetal-IDE.git

@@ -2,7 +2,7 @@
   "alveo_u250_quad_rocket_dual_gemmini_saturn_trafficgen_abi3": {
     "PLATFORM": "xilinx_alveo_u250",
     "TARGET_PROJECT": "firesim",
-    "TARGET_PROJECT_MAKEFRAG": "/home/prashanth/chipyard/.worktrees/xrsight-trafficgen-v7/chipyard/generators/firechip/chip/src/main/makefrag/firesim",
+    "TARGET_PROJECT_MAKEFRAG": "@CHIPYARD@/generators/firechip/chip/src/main/makefrag/firesim",
     "DESIGN": "FireSim",
     "TARGET_CONFIG": "FireSimQuadRocketDualGemminiSaturnTrafficGenConfig",
     "PLATFORM_CONFIG": "BaseXilinxAlveoU250Config",
@@ -13,6 +13,6 @@
     },
     "post_build_hook": null,
     "metasim_customruntimeconfig": null,
-    "bit_builder_recipe": "/home/prashanth/chipyard/.worktrees/xrsight-trafficgen-v7/chipyard/sims/firesim/deploy/bit-builder-recipes/xilinx_alveo_u250.yaml"
+    "bit_builder_recipe": "@CHIPYARD@/sims/firesim/deploy/bit-builder-recipes/xilinx_alveo_u250.yaml"
   }
 }
