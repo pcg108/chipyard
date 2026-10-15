@@ -2,7 +2,7 @@
   "build_farm": {
     "base_recipe": "build-farm-recipes/externally_provisioned.yaml",
     "recipe_arg_overrides": {
-      "default_build_dir": "/scratch/prashanth_xrsight_trafficgen_v7_20261013/builds",
+      "default_build_dir": "@WORK@/builds",
       "build_farm_hosts": [
         "localhost"
       ]

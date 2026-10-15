@@ -3,7 +3,7 @@
   "xrsight_source": "/home/prashanth/illixr_example_zephyr",
   "xrsight_revision": "5d3c912ed912c08a9e646279b15b4b48b680f879",
   "source_checkouts": {
-    ".": "1461d707dda94050e0ca185a9645a0b8daa74350",
+    ".": "131e04efc20ddaad6547df24d127fdbdd3a2b46b",
     "fpga/fpga-shells": "17bd8d286297468a0256b15f908be08396cf804e",
     "generators/ara": "96daf15d3c54ac4975ea2bdc869f95bccdf90a1e",
     "generators/ara/ara": "df5b8d4cd4a335e8531a4db8b78c829fb7fb4030",
@@ -54,7 +54,7 @@
     "generators/vexiiriscv/VexiiRiscv": "b9f015acde910a75612e6598f56567fb549e4604",
     "generators/vexiiriscv/VexiiRiscv/ext/SpinalHDL": "fc89224e30e9122905da5b706fd5d1ee02332489",
     "generators/vexiiriscv/VexiiRiscv/ext/rvls": "2c8665ea418a6829686417615efeeb79023a5cf5",
-    "sims/firesim": "7dd0b16ec97c0d02efcb47aa431d9a949dbb026b",
+    "sims/firesim": "282ed1ae3588f323b48f6efe8e9d6c8860bee27f",
     "sims/firesim/platforms/f1/aws-fpga": "53223d71ce20f02925c74b81da3e6ff0deb79fe2",
     "sims/firesim/platforms/f1/aws-fpga/SDAccel/examples/xilinx_2019.1": "0ec1aef54f3bf17c78581630d687b13fadae9616",
     "sims/firesim/platforms/f1/aws-fpga/Vitis/examples/xilinx_2019.2": "bb80c8ec699c3131e8874735bd99475ac6fe2ec7",
@@ -98,5 +98,8 @@
   "artifact_root": "/scratch/prashanth_xrsight_trafficgen_v7_20261013",
   "validation": {},
   "gpu_model_commit": "7b6abcafe312c21e87393181410eb2f2aea1d938",
-  "protocol_version": 7
+  "protocol_version": 7,
+  "source_checkouts_scope": "Source revisions for the completed v7 hardware build, not the current checkout HEAD.",
+  "working_bitstream_sha256": "b92278c331f5603bc5b1eb63784a0424c5a5b3abae39cee6b834443855d893d0",
+  "working_rtl_sha256": "1de273dd001b427aa831c3dfe5a0e142c1f20bb21092e547466006f571363a36"
 }

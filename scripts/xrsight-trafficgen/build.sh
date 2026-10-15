@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 set -eo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-work=${XRSIGHT_TG_WORK:-/scratch/prashanth_xrsight_trafficgen_v7_20261013}
+work=${XRSIGHT_TG_WORK:-"$root/.xrsight-build"}
+mkdir -p "$work"
+work=$(cd -- "$work" && pwd)
+mkdir -p "$work/tmp" "$work/logs"
 stage=${1:-elaborate}
 source "$root/env.sh"
 export FS_DIR="$root/sims/firesim"
 export FIRESIM_ENV_SOURCED=1 FIRESIM_SOURCED=1
 # The model tests prepend /usr/bin. Re-activating an already-active Conda
 # environment can leave that ordering intact; restore the build environment.
-export PATH="$root/.conda-env/bin:/home/prashanth/chipyard/.vecadd-sim/espresso-build:$FS_DIR/deploy:$PATH"
+export PATH="$root/.conda-env/bin:$work/espresso-build:$FS_DIR/deploy:$PATH"
 export TMPDIR="$work/tmp"
 export SBT_OPTS="-Dsbt.supershell=false -Dsbt.server.forcestart=true"
-export COURSIER_CACHE=/home/prashanth/.cache/coursier/v1
+export COURSIER_CACHE=${COURSIER_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/coursier/v1}
 pkg="$root/scripts/xrsight-trafficgen"
 target=FireSimQuadRocketDualGemminiSaturnTrafficGenConfig
 make_args=(-C "$FS_DIR/sim" PLATFORM=xilinx_alveo_u250 TARGET_PROJECT=firesim
@@ -25,9 +28,11 @@ case "$stage" in
   metasim) command=(make "${make_args[@]}"
     "EXTRA_VERILATOR_FLAGS=--assert -Wno-WIDTHEXPAND -Wno-UNSIGNED" verilator) ;;
   driver) command=(make "${make_args[@]}" xilinx_alveo_u250) ;;
-  bitstream) command=(python3 "$pkg/firesim_manager.py" --chipyard "$root" --
-    buildbitstream -b "$pkg/config_build.yaml" -r "$pkg/config_build_recipes.yaml"
-    -a "$pkg/config_hwdb.yaml") ;;
+  bitstream)
+    python3 "$pkg/configure-build.py" --work "$work"
+    command=(python3 "$pkg/firesim_manager.py" --chipyard "$root" --
+    buildbitstream -b "$work/config/config_build.yaml" -r "$work/config/config_build_recipes.yaml"
+    -a "$work/config/config_hwdb.yaml") ;;
   *) echo "usage: $0 {elaborate|metasim|driver|bitstream}" >&2; exit 2 ;;
 esac
 attempt=$(date -u +%Y%m%dT%H%M%SZ)

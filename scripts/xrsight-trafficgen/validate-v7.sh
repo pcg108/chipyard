@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -eo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-work=${XRSIGHT_TG_WORK:-/scratch/prashanth_xrsight_trafficgen_v7_20261013}
+work=${XRSIGHT_TG_WORK:-"$root/.xrsight-build"}
+mkdir -p "$work/tmp"
+work=$(cd -- "$work" && pwd)
 source "$root/env.sh"
 export GPU_MODEL_ROOT="$work/model-src" GPU_MODEL_BUILD="$work/model-build"
 export BOOST_ROOT="$root/.conda-env" TMPDIR="$work/tmp" CXX=/usr/bin/c++
