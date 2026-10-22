@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstring>
 #include <future>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <unistd.h>
@@ -227,7 +228,7 @@ void server_run(GPU::SocketServerTransport &server, bool truncate, bool disconne
   status.currentCycle = 2000; status.mainLoopComplete = true; status.acceptedLaunchIds.clear(); status.completedLaunchIds.clear();
   status.rejectedLaunches = {{launch_bad, "unknown registryId"}}; server.SendMessage(status);
 }
-void run(bool truncate, bool disconnect = false) {
+void run(bool truncate, bool disconnect = false, bool summary = false) {
   auto server = std::make_unique<GPU::SocketServerTransport>(0);
   const auto port = server->GetPort();
   auto peer = std::async(std::launch::async,
@@ -242,6 +243,7 @@ void run(bool truncate, bool disconnect = false) {
   // their recoverable per-slot rejection behavior.
   const std::vector<std::string> args{"+trafficgen-socket-port=" + std::to_string(port),
                                      "+trafficgen-legacy-registry-id=1106",
+                                     std::string("+trafficgen-log-mode=") + (summary ? "summary" : "detailed"),
                                      "+trafficgen-round-log-dir=" + std::string(directory)};
   trafficgen_t driver(target, target.mmio, 0, args, 0, 0, 64, 128, 64, completed_bytes, 1, 1);
   driver.init(); target.queue(0, launch_a, 10, 100);
@@ -259,6 +261,18 @@ void run(bool truncate, bool disconnect = false) {
   assert(target.completion_count_reads == target.physical_round);
   assert(target.completion_read_sizes == (truncate || disconnect
       ? std::vector<std::size_t>{} : std::vector<std::size_t>{64, 64}));
+  driver.finish();
+  if (summary) {
+    std::ifstream file(std::filesystem::path(directory) / "summary.json");
+    assert(file);
+    const std::string report((std::istreambuf_iterator<char>(file)), {});
+    assert(report.find("\"status\": \"complete\"") != std::string::npos);
+    assert(report.find("\"completed_launches\": 3") != std::string::npos);
+    assert(report.find("\"rejected_launches\": 1") != std::string::npos);
+    assert(report.find("\"pending_requests\": 0") != std::string::npos);
+    for (const auto &entry : std::filesystem::directory_iterator(directory))
+      assert(entry.path().filename().string().rfind("round_", 0) != 0);
+  }
   peer.get(); std::filesystem::remove_all(directory);
 }
 
@@ -520,7 +534,7 @@ void run_legacy_start(bool configured, bool rejected = false) {
 }
 
 int main() {
-  run(false); run(true); run(false, true);
+  run(false); run(false, false, true); run(true); run(false, true);
   run_completion_count(0); run_completion_count(1); run_completion_count(9);
   run_completion_count(32769);
   run_upload_cache(false); run_upload_cache(true);

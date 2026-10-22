@@ -7,6 +7,7 @@
 #include "core/simif.h"
 
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <algorithm>
 #include <boost/archive/binary_iarchive.hpp>
 #include <boost/archive/binary_oarchive.hpp>
@@ -68,22 +69,6 @@ std::string hex_u64(std::uint64_t value) {
   std::ostringstream oss;
   oss << "0x" << std::hex << value;
   return oss.str();
-}
-
-struct FreeDeleter {
-  void operator()(std::uint8_t *ptr) const { std::free(ptr); }
-};
-
-using AlignedBytes = std::unique_ptr<std::uint8_t, FreeDeleter>;
-
-AlignedBytes make_aligned_bytes(std::size_t size) {
-  void *ptr = nullptr;
-  const int rc = posix_memalign(&ptr, kXDMABufferAlignment, size);
-  if (rc != 0) {
-    throw std::runtime_error("posix_memalign failed: " +
-                             std::string(std::strerror(rc)));
-  }
-  return AlignedBytes(static_cast<std::uint8_t *>(ptr));
 }
 
 void xdma_write_exact(CPUManagedStreamIO &xdma,
@@ -340,6 +325,12 @@ public:
           errno_message("failed to create gpu_model socket"));
     }
 
+    const int enabled = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0) {
+      const auto message = errno_message("failed to set TCP_NODELAY");
+      disconnect();
+      throw std::runtime_error(message);
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -491,6 +482,10 @@ trafficgen_t::trafficgen_t(simif_t &simif,
       ? std::filesystem::path(kSocketRoundLogRoot)
       : round_log_root / "socket_inputs";
   boundary_log_path = plusarg_value(args, "trafficgen-boundary-log");
+  const auto logging = plusarg_value(args, "trafficgen-log-mode");
+  if (!logging.empty() && logging != "summary" && logging != "detailed")
+    throw std::invalid_argument("TrafficGen log mode must be summary or detailed");
+  summary_logging = logging == "summary";
 }
 
 trafficgen_t::~trafficgen_t() = default;
@@ -499,7 +494,7 @@ void trafficgen_t::init() {
   if (!use_rtl_engine)
     throw std::runtime_error("TrafficGen socket protocol v2 requires the RTL engine; DPI multi-launch is unsupported");
   clear_round_log_entries(round_log_root, true);
-  clear_round_log_entries(socket_round_log_root);
+  if (!summary_logging) clear_round_log_entries(socket_round_log_root);
   std::ofstream lifecycle(round_log_root / "launches.csv");
   if (!lifecycle) throw std::runtime_error("TrafficGen cannot initialize lifecycle log");
   lifecycle << "cycle,event,launch_id,registry_id,slot\n";
@@ -554,7 +549,7 @@ void trafficgen_t::connect_gpu_model_socket() {
   }
 
   gpu_model_socket_client->connect_loopback(socket_port);
-  std::cout << "[bridge driver] connected to gpu_model_socket at 127.0.0.1:"
+  if (!summary_logging) std::cout << "[bridge driver] connected to gpu_model_socket at 127.0.0.1:"
             << static_cast<unsigned>(socket_port) << std::endl;
 
   const std::uint64_t current_target_cycle =
@@ -567,7 +562,7 @@ void trafficgen_t::connect_gpu_model_socket() {
   message.currentCycle = current_target_cycle;
   last_reported_cycle = current_target_cycle;
   gpu_model_socket_client->send_frame(serialize_message(message));
-  std::cout << "[bridge driver] sent initial target cycle to gpu_model_socket: cycle="
+  if (!summary_logging) std::cout << "[bridge driver] sent initial target cycle to gpu_model_socket: cycle="
             << current_target_cycle << std::endl;
 }
 
@@ -597,6 +592,8 @@ void trafficgen_t::capture_launch_requests() {
     if (!id || close_sent || launch_records.count(id) ||
         (slot.status != FREE && slot.status != COMPLETE && slot.status != REJECTED && slot.status != ABORTED))
       throw std::runtime_error("TrafficGen invalid or reused launch slot identity=" + std::to_string(id));
+    if (launch_records.size() >= 16384)
+      throw std::runtime_error("TrafficGen session launch budget exhausted (16384)");
     slot = {id, registry, QUEUED};
     launch_records.emplace(id, launch_record_t{index, registry});
   }
@@ -639,11 +636,13 @@ void trafficgen_t::receive_scheduler_status() {
     if (next == COMPLETE && (slot.status < ACCEPTED || bundle_tracker.has_launch(id)))
       throw std::runtime_error("TrafficGen launch completed while requests remain");
     slot.status = next;
+    if (next == COMPLETE) ++summary_completed_launches;
+    if (next == REJECTED) ++summary_rejected_launches;
     std::ofstream log(round_log_root / "launches.csv", std::ios::app);
     if (!log) throw std::runtime_error("TrafficGen cannot write launch lifecycle log");
     log << scheduler_status.currentCycle << ',' << event << ',' << id << ','
         << record->second.registry_id << ',' << record->second.slot << '\n';
-    std::cout << "[bridge driver] launch=" << id << " registry=" << record->second.registry_id
+    if (!summary_logging) std::cout << "[bridge driver] launch=" << id << " registry=" << record->second.registry_id
               << " slot=" << record->second.slot << ' ' << event << std::endl;
   };
   for (auto id : scheduler_status.acceptedLaunchIds) update(id, ACCEPTED, "accepted");
@@ -669,6 +668,7 @@ void trafficgen_t::receive_scheduler_status() {
       throw std::runtime_error("TrafficGen scheduler completed before submission closed and work drained");
     session_complete = true;
   }
+  if (summary_logging) write_summary();
 }
 
 void trafficgen_t::fail_session(const std::string &reason) {
@@ -709,12 +709,12 @@ void trafficgen_t::finish_scheduler_boundary() {
 }
 
 void trafficgen_t::send_reserved_subpartitions_snapshot(
-    const L2SubpartitionReservationsByCycle &reservations) {
+    L2SubpartitionReservationsByCycle reservations) {
   capture_launch_requests();
   RoundControlMessage message;
   message.currentCycle = read_target_cycle();
   boundary_start_cycle = message.currentCycle;
-  message.reservedSubpartitionsByCycle = reservations;
+  message.reservedSubpartitionsByCycle = std::move(reservations);
   for (std::size_t index = 0; index < launch_slots.size(); ++index) {
     const auto &slot = launch_slots[index];
     if (slot.status == QUEUED) message.launches.push_back({slot.registry_id, slot.launch_id, index + 1});
@@ -880,7 +880,7 @@ void trafficgen_t::build_next_l2_access_chunk() {
     }
   }
 
-  std::cout << "[bridge driver] built L2 access chunk: chunk_entries="
+  if (!summary_logging) std::cout << "[bridge driver] built L2 access chunk: chunk_entries="
             << l2_accesses.size()
             << " pending_entries=" << pending_access_cycle_by_id.size()
             << " capacity=" << max_entries << std::endl;
@@ -946,7 +946,7 @@ void trafficgen_t::recover_full_bundle_tables(std::uint32_t lane_mask,
               << lane_mask << ',' << lane << ',' << key.first << ',' << key.second << ','
               << bundle.remaining << ',' << bundle.original_count << ',' << bundle.latest_cycle
               << ',' << ((lane_mask & (std::uint32_t{1} << lane)) != 0) << '\n';
-    std::cout << "[bridge driver] bundle-table recovery=" << recovery_number
+    if (!summary_logging) std::cout << "[bridge driver] bundle-table recovery=" << recovery_number
               << " hardware_boundary=" << hardware_boundary_number
               << " gpu_round=" << engine_round_number << " cycle=" << current_cycle
               << " lane=" << lane << " generation=" << key.first << " bundle=" << key.second
@@ -1013,12 +1013,12 @@ void trafficgen_t::assign_replay_lanes_and_bundle_counts() {
       }
     }
 
-    std::cout << "[bridge driver] bundle lane balance";
+    if (!summary_logging) std::cout << "[bridge driver] bundle lane balance";
     for (size_t lane = 0; lane < lane_count; ++lane) {
-      std::cout << " lane" << lane << "=" << balance.bundle_counts[lane]
+      if (!summary_logging) std::cout << " lane" << lane << "=" << balance.bundle_counts[lane]
                 << "b/" << balance.access_counts[lane] << "a";
     }
-    std::cout << std::endl;
+    if (!summary_logging) std::cout << std::endl;
     return;
   }
 
@@ -1073,6 +1073,7 @@ void trafficgen_t::log_engine_round_for_compare(
     const std::vector<trafficgen_issued_access_point_t> &issued_accesses,
     const std::vector<std::uint64_t> &completed_bundle_ids,
     std::uint64_t current_cycle_after_issue) const {
+  if (summary_logging) return;
   if (engine_round_number == 0) {
     return;
   }
@@ -1168,9 +1169,9 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
       gpu_model_socket_client->recv_message<SchedulerRoundMessage>();
 
   ++engine_round_number;
-  current_round_all_l2_trace_steps = message.allL2TraceSteps;
+  if (!summary_logging) current_round_all_l2_trace_steps = message.allL2TraceSteps;
   current_round_blocked_warp_ids = message.blockedWarpIds;
-  log_socket_round_inputs_for_compare(message.allL2TraceSteps,
+  if (!summary_logging) log_socket_round_inputs_for_compare(message.allL2TraceSteps,
                                       message.blockedWarpIds, socket_round_log_root,
                                       engine_round_number);
 
@@ -1185,6 +1186,10 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     const auto launch = launch_records.find(access.launch_id);
     if (launch == launch_records.end() || launch->second.registry_id != access.registry_id)
       throw std::runtime_error("TrafficGen access has unknown launch/registry identity");
+    // Protocol v2 reports first-round acceptance after its memory results.
+    const auto &slot = launch_slots.at(launch->second.slot);
+    if (slot.launch_id != access.launch_id || slot.status < SUBMITTED || slot.status > DISPATCHED)
+      throw std::runtime_error("TrafficGen access for inactive launch");
     access.address = wire_access.mAddress;
     access.cycle_count = wire_access.mCycleCount;
     access.m_subpartition = checked_u32(
@@ -1219,7 +1224,6 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
   accumulated_issued_accesses.clear();
   accumulated_completed_bundle_ids.clear();
 
-  refresh_pending_access_blocked_annotations();
   if (use_rtl_engine) {
     assign_replay_lanes_and_bundle_counts();
     build_next_l2_access_chunk();
@@ -1228,7 +1232,7 @@ void trafficgen_t::receive_schedule_from_gpu_model() {
     assign_replay_lanes_and_bundle_counts();
   }
 
-  std::cout << "[bridge driver] received schedule from gpu_model_socket: "
+  if (!summary_logging) std::cout << "[bridge driver] received schedule from gpu_model_socket: "
             << "new_l2_accesses=" << message.allL2TraceSteps.size()
             << " pending_l2_accesses=" << pending_access_cycle_by_id.size()
             << " upload_accesses=" << l2_accesses.size()
@@ -1257,17 +1261,17 @@ size_t trafficgen_t::process_completed_bundle_ids_stream() {
   }
   if (total_bytes != 0) {
     auto &xdma = simif.get_cpu_managed_stream_io();
-    auto stream_bytes = make_aligned_bytes(total_bytes);
+    auto *stream_bytes = completed_scratch.get(total_bytes, completed_window_bytes);
     xdma_read_exact(
         xdma,
         bram_base + raw_completed_bundle_ids_offset,
-        stream_bytes.get(),
+        stream_bytes,
         total_bytes,
         "XDMA read while reading completedBundleIds");
-    std::memcpy(completed_bundle_ids.data(), stream_bytes.get(), valid_bytes);
+    std::memcpy(completed_bundle_ids.data(), stream_bytes, valid_bytes);
   }
 
-  std::cout << "[bridge driver] completedBundleIds count="
+  if (!summary_logging) std::cout << "[bridge driver] completedBundleIds count="
             << completed_bundle_count << std::endl;
   return total_bytes;
 }
@@ -1315,15 +1319,15 @@ trafficgen_t::process_issued_access_writeback_stream() {
     }
     summed_count += lane_count;
     if (lane_bytes == 0) continue;
-    auto lane_data = make_aligned_bytes(lane_bytes);
+    auto *lane_data = issued_scratch.get(lane_bytes, bank_stride_bytes);
     xdma_read_exact(
         xdma,
         bram_base + raw_issued_access_writeback_store_offset + lane * bank_stride_bytes,
-        lane_data.get(), lane_bytes,
+        lane_data, lane_bytes,
         "XDMA read while reading banked issuedAccessWriteback");
     for (std::uint32_t idx = 0; idx < lane_count; ++idx) {
       const auto *words = reinterpret_cast<const std::uint64_t *>(
-          lane_data.get() + static_cast<std::size_t>(idx) * STREAM_WIDTH_BYTES);
+          lane_data + static_cast<std::size_t>(idx) * STREAM_WIDTH_BYTES);
       auto access = unpack_issued_access(words);
       issued_access_writeback_entries.push_back(access);
     }
@@ -1338,7 +1342,7 @@ trafficgen_t::process_issued_access_writeback_stream() {
                    });
   issued_access_writeback_bytes_received = total_bytes;
 
-  std::cout << "[bridge driver] issuedAccessWriteback count="
+  if (!summary_logging) std::cout << "[bridge driver] issuedAccessWriteback count="
             << issued_access_writeback_count << std::endl;
   return total_bytes;
 }
@@ -1350,8 +1354,8 @@ void trafficgen_t::write_schedule_to_bram() {
 
   // instead of a blocked warp map in the RTL engine, we annotate the pending and upload accesses with 
   // the blocked warp status from current round's blocked warp IDs
-  refresh_pending_access_blocked_annotations();
-  refresh_upload_access_blocked_annotations();
+  // build_next_l2_access_chunk already annotated both pending and copied
+  // upload entries. No scheduler update occurs between construction and upload.
 
   // using this lets it run in metasim and on FPGA because of how simif abstracts away the details of stream I/O for XDMA
   auto &xdma = simif.get_cpu_managed_stream_io();
@@ -1367,29 +1371,32 @@ void trafficgen_t::write_schedule_to_bram() {
     throw std::runtime_error("TrafficGen access window is not lane divisible");
   }
   const std::size_t bank_stride_bytes = access_window_bytes / lane_count;
-  std::vector<std::vector<const trafficgen_l2_access_t *>> lanes(lane_count);
-  std::map<bundle_key_t, std::size_t> upload_bundle_owners;
+  upload_lanes.resize(lane_count);
+  for(auto&lane:upload_lanes)lane.clear();
+  auto&lanes=upload_lanes;
+  upload_bundle_checks.clear();
+  if(l2_accesses.size()>upload_bundle_checks.bucket_count()*upload_bundle_checks.max_load_factor())
+    upload_bundle_checks.reserve(l2_accesses.size());
   for (const auto &access : l2_accesses) {
     if (access.assigned_lane >= lane_count) {
       throw std::runtime_error("TrafficGen access has invalid replay lane");
     }
     if (use_rtl_engine) {
       const bundle_key_t key{access.bundle_generation, access.m_bundle_id};
-      const auto persistent_owner = bundle_lane_owners.find(key);
-      if (persistent_owner == bundle_lane_owners.end() ||
-          persistent_owner->second != access.assigned_lane) {
-        throw std::runtime_error("TrafficGen access disagrees with bundle lane owner");
+      auto checked=upload_bundle_checks.find(key);
+      if(checked==upload_bundle_checks.end()) {
+        const auto persistent_owner=bundle_lane_owners.find(key);
+        if(persistent_owner==bundle_lane_owners.end() || persistent_owner->second!=access.assigned_lane)
+          throw std::runtime_error("TrafficGen access disagrees with bundle lane owner");
+        const auto member_count=bundle_member_counts.find(key);
+        if(member_count==bundle_member_counts.end() || member_count->second!=access.bundle_issue_count)
+          throw std::runtime_error("TrafficGen access has inconsistent bundle member count");
+        checked=upload_bundle_checks.emplace(key,std::make_pair(persistent_owner->second,member_count->second)).first;
       }
-      const auto [owner, inserted] =
-          upload_bundle_owners.emplace(key, access.assigned_lane);
-      if (!inserted && owner->second != access.assigned_lane) {
+      if(checked->second.first!=access.assigned_lane)
         throw std::runtime_error("TrafficGen upload splits a bundle across lanes");
-      }
-      const auto member_count = bundle_member_counts.find(key);
-      if (member_count == bundle_member_counts.end() ||
-          member_count->second != access.bundle_issue_count) {
+      if(checked->second.second!=access.bundle_issue_count)
         throw std::runtime_error("TrafficGen access has inconsistent bundle member count");
-      }
     }
     lanes[access.assigned_lane].push_back(&access);
   }
@@ -1400,9 +1407,9 @@ void trafficgen_t::write_schedule_to_bram() {
     }
     write_upload_lane_count(lane, static_cast<std::uint32_t>(lanes[lane].size()));
     if (lane_bytes == 0) continue;
-    auto packed = make_aligned_bytes(lane_bytes);
-    std::memset(packed.get(), 0, lane_bytes);
-    auto *packed_words = reinterpret_cast<std::uint64_t *>(packed.get());
+    auto* packed = upload_scratch.get(lane_bytes,bank_stride_bytes);
+    std::memset(packed, 0, lane_bytes);
+    auto *packed_words = reinterpret_cast<std::uint64_t *>(packed);
     for (std::size_t idx = 0; idx < lanes[lane].size(); ++idx) {
       pack_l2_access(
           *lanes[lane][idx],
@@ -1411,24 +1418,24 @@ void trafficgen_t::write_schedule_to_bram() {
     }
     auto &previous = last_lane_upload_bytes.at(lane);
     if (previous.size() == lane_bytes &&
-        std::memcmp(previous.data(), packed.get(), lane_bytes) == 0) {
-      std::cout << "[bridge driver] reusing unchanged L2 access lane=" << lane
+        std::memcmp(previous.data(), packed, lane_bytes) == 0) {
+      if (!summary_logging) std::cout << "[bridge driver] reusing unchanged L2 access lane=" << lane
                 << " entries=" << lanes[lane].size()
                 << " bytes=" << lane_bytes << std::endl;
       continue;
     }
-    std::cout << "[bridge driver] uploading L2 access lane=" << lane
+    if (!summary_logging) std::cout << "[bridge driver] uploading L2 access lane=" << lane
               << " entries=" << lanes[lane].size()
               << " bytes=" << lane_bytes << std::endl;
     xdma_write_exact(
         xdma,
         bram_base + raw_access_store_offset + lane * bank_stride_bytes,
-        packed.get(), lane_bytes,
+        packed, lane_bytes,
         "XDMA write while uploading banked TrafficGen L2 accesses");
     // Remember only fully successful writes. All lane counts and upload commit
     // metadata are still published, including when every payload is unchanged.
-    previous.assign(packed.get(), packed.get() + lane_bytes);
-    std::cout << "[bridge driver] uploaded L2 access lane=" << lane
+    previous.assign(packed, packed + lane_bytes);
+    if (!summary_logging) std::cout << "[bridge driver] uploaded L2 access lane=" << lane
               << std::endl;
   }
 
@@ -1479,15 +1486,15 @@ void trafficgen_t::tick_impl() {
         that already has a pending access in the traffic generator
       */
 
-      const auto reservations = build_reserved_subpartitions_from_pending();
-      std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
+      auto reservations = build_reserved_subpartitions_from_pending();
+      if (!summary_logging) std::cout << "[bridge driver] built reservedSubPartitionsByCycle from pending accesses: cycles="
                 << reservations.size()
                 << " pending_accesses=" << pending_access_cycle_by_id.size() << std::endl;
 
       // send the reservedSubPartitionsByCycle snapshot to gpu_model via socket
-      round_input_reserved_subpartitions =
+      if (!summary_logging) round_input_reserved_subpartitions =
           ordered_reservations(reservations);
-      send_reserved_subpartitions_snapshot(reservations);
+      send_reserved_subpartitions_snapshot(std::move(reservations));
 
       // read the L2 access schedule, blocked warp IDs, and min issue cycle from gpu_model via socket
       receive_schedule_from_gpu_model();
@@ -1516,7 +1523,7 @@ void trafficgen_t::tick_impl() {
     // once the upload is complete, signal target to start round and unpause target clock
     if (read(mmio_addrs.upload_ready)) {
 
-      std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
+      if (!summary_logging) std::cout << "[bridge driver] upload completed, entering traffic issuing stage" << std::endl;
 
       write(mmio_addrs.start_round, 1);
       write(mmio_addrs.resume_target, 1);
@@ -1588,6 +1595,9 @@ void trafficgen_t::tick_impl() {
         if (point.cycle_issued > target_cycle_after_issue)
           throw std::runtime_error("TrafficGen issue lies after result cycle");
       bundle_tracker.record_issued(issued_access_writeback_entries);
+      for (const auto &point : issued_access_writeback_entries)
+        if (point.is_write) ++summary_writes; else ++summary_reads;
+      summary_completed_bundles += completed_bundle_count;
       const std::vector<std::uint64_t> fresh_completed(completed_bundle_ids.begin(),
                                                        completed_bundle_ids.begin() + completed_bundle_count);
       bundle_tracker.complete(fresh_completed);
@@ -1631,7 +1641,7 @@ void trafficgen_t::tick_impl() {
         }
 
         if (round_exit_reason == kRoundExitCapacity) {
-          std::cout << "[bridge driver] capacity exit at cycle="
+          if (!summary_logging) std::cout << "[bridge driver] capacity exit at cycle="
                     << target_cycle_after_issue
                     << ", refilling accessStore from pending accesses="
                     << pending_access_cycle_by_id.size() << std::endl;
@@ -1698,4 +1708,23 @@ void trafficgen_t::tick_impl() {
   }
 }
 
-void trafficgen_t::finish() {}
+void trafficgen_t::write_summary() const {
+  if (!summary_logging) return;
+  const auto temporary = round_log_root / "summary.json.tmp";
+  std::ofstream out(temporary);
+  if (!out) throw std::runtime_error("TrafficGen cannot open summary");
+  out << "{\n  \"format_version\": 1, \"socket_protocol\": 2, \"status\": \""
+      << (session_failed ? "failed" : session_complete ? "complete" : "incomplete")
+      << "\",\n  \"final_cycle\": " << last_reported_cycle
+      << ", \"rounds\": " << engine_round_number
+      << ", \"original_reads\": " << summary_reads << ", \"original_writes\": " << summary_writes
+      << ", \"completed_bundles\": " << summary_completed_bundles
+      << ", \"completed_launches\": " << summary_completed_launches
+      << ", \"rejected_launches\": " << summary_rejected_launches
+      << ", \"pending_requests\": " << pending_access_cycle_by_id.size()
+      << ", \"pending_bundles\": " << bundle_tracker.size() << "\n}\n";
+  out.close();
+  if (!out) throw std::runtime_error("TrafficGen failed writing summary");
+  std::filesystem::rename(temporary, round_log_root / "summary.json");
+}
+void trafficgen_t::finish() { write_summary(); }

@@ -7,6 +7,7 @@
 #include "trafficgen_bundle_recovery.h"
 #include "trafficgen_bundle_tracking.h"
 #include "trafficgen_socket_protocol.h"
+#include "trafficgen_host_scratch.h"
 
 #include <array>
 #include <cstddef>
@@ -167,6 +168,10 @@ private:
   const uint64_t completed_window_bytes;
   const bool use_rtl_engine;
   const std::size_t lane_count;
+  bool summary_logging = false;
+  std::uint64_t summary_reads = 0, summary_writes = 0, summary_completed_bundles = 0;
+  std::uint64_t summary_completed_launches = 0, summary_rejected_launches = 0;
+  void write_summary() const;
   std::uint16_t socket_port = 50051;
   std::uint64_t min_issue_cycle = 0;
   std::filesystem::path round_log_root;
@@ -204,6 +209,19 @@ private:
   // Access BRAM is written only by this host driver; commit resets its read
   // cursors without changing payload bytes. Empty entries mean no cached write.
   std::vector<std::vector<std::uint8_t>> last_lane_upload_bytes;
+  // Storage is owned by this driver and reused only after synchronous XDMA completes.
+  TrafficGenHostScratch upload_scratch, issued_scratch, completed_scratch;
+  std::vector<std::vector<const trafficgen_l2_access_t *>> upload_lanes;
+  struct bundle_key_hash_t {
+    std::size_t operator()(const bundle_key_t&key)const {
+      const auto a=std::hash<std::uint32_t>{}(key.first);
+      const auto b=std::hash<std::uint64_t>{}(key.second);
+      return a^(b+0x9e3779b97f4a7c15ULL+(a<<6)+(a>>2));
+    }
+  };
+  // Values cache both persistent checks for this immutable upload preparation.
+  std::unordered_map<bundle_key_t,std::pair<std::size_t,std::size_t>,bundle_key_hash_t>
+      upload_bundle_checks;
   bool upload_written_to_bram = false;
   trafficgen_state_t state = trafficgen_state_t::IDLE;
   std::unique_ptr<socket_client_t> gpu_model_socket_client;
@@ -242,7 +260,7 @@ private:
   void connect_gpu_model_socket();
   void reset_workload_state();
   void send_reserved_subpartitions_snapshot(
-      const L2SubpartitionReservationsByCycle &reservations);
+      L2SubpartitionReservationsByCycle reservations);
   void receive_schedule_from_gpu_model();
   void refresh_pending_access_blocked_annotations();
   void refresh_upload_access_blocked_annotations();

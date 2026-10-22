@@ -15,3 +15,6 @@ link=(-L"$boost_root/lib" -Wl,-rpath,"$boost_root/lib" -lboost_serialization)
 "$compiler" "${common[@]}" "$bridges/bridges/test/TrafficGenDriverSessionTest.cc" \
   "$bridges/bridges/trafficgen.cc" "$gpu_root/src/socket_transport.cpp" "${link[@]}" -o "$build/session"
 timeout 45s "$build/session"
+"$compiler" "${common[@]}" -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$bridges/bridges/test/TrafficGenHostScratchTest.cc" -o "$build/scratch"
+"$build/scratch"
