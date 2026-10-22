@@ -72,3 +72,5 @@ These tests use metasim only. They do not program or interrupt an FPGA workload.
 The six-panel plot helper accepts the captured kernel directory, the standalone
 prediction CSV, and the metasim scheduler's `issued_accesses.csv`. It checks exact
 request identities before plotting and labels the RTL column as metasim.
+
+Measured results: [Ampere validation report](VALIDATION.md).
