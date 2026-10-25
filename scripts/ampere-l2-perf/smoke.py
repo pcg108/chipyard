@@ -15,6 +15,41 @@ from common import ValidationFailure, digest, evidence, generated_dir, require, 
 PROFILES = {'INT8': {'int8_rounds': 8, 'fp32_rounds': 0}}
 
 
+def backend_activity(summary):
+    """Confirm real target work exercised every requested backend in the ROI.
+
+    Classification may happen in a later window than acceptance; only compare
+    the per-requester hit/miss sums with the corresponding global events.
+    """
+    windows=[interval for interval in summary['intervals'] if interval['kind']=='window']
+    require(len(windows)==1,'Expected one combined-smoke measurement window')
+    banks={};totals={}
+    for counter in windows[0]['counters']:
+        if counter['gauge']:continue
+        bank=banks.setdefault(counter['bank'],{})
+        require(counter['name'] not in bank,'Duplicate smoke counter identity')
+        bank[counter['name']]=int(counter['delta'])
+        totals[counter['name']]=totals.get(counter['name'],0)+int(counter['delta'])
+    requesters=('rocket','saturn','gemmini_int8','trafficgen','other')
+    for bank,counts in banks.items():
+        for outcome in ('tag_hits','tag_misses'):
+            names=[r+'_'+outcome for r in requesters]
+            require(outcome in counts and all(name in counts for name in names),
+                    f'Missing requester-classification counters for bank {bank}')
+            classified=sum(counts[name] for name in names)
+            require(classified==counts[outcome],
+                    f'Bank {bank} {outcome}: requester sum {classified} != global {counts[outcome]}')
+    activity={}
+    for requester in requesters[:-1]:
+        required=[requester+'_'+event for event in ('accepted','completed','tag_hits','tag_misses')]
+        require(all(name in totals for name in required),f'Missing backend counters for {requester}')
+        counts={event:totals[requester+'_'+event] for event in ('accepted','completed','tag_hits','tag_misses')}
+        require(counts['accepted']>0 and counts['completed']>0 and counts['tag_hits']+counts['tag_misses']>0,
+                f'Combined smoke did not observe accepted, completed and classified {requester} requests: {counts}')
+        activity[requester]=counts
+    return activity
+
+
 def int8_main(source):
     """Keep the four-hart/launch exercise while removing every FP32 call."""
     for old, new in (
@@ -158,9 +193,13 @@ def run(args):
         try:
             scheduler = subprocess.Popen(scheduler_command, cwd=work, env=env, stdout=slog, stderr=subprocess.STDOUT)
             # Do not connect to probe a server that accepts exactly one client.
-            time.sleep(1)
-            if scheduler.poll() is not None:
-                raise RuntimeError('Scheduler exited before simulator startup; inspect scheduler.log')
+            deadline = time.monotonic() + 30
+            while 'waiting for a client' not in (work/'scheduler.log').read_text(errors='replace'):
+                if scheduler.poll() is not None:
+                    raise RuntimeError('Scheduler exited before simulator startup; inspect scheduler.log')
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Scheduler did not become ready within 30 seconds; inspect scheduler.log')
+                time.sleep(.05)
             result = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
                                     stdout=mlog, stderr=subprocess.STDOUT, timeout=args.timeout)
             require(result.returncode == 0, f'Metasimulator exited {result.returncode}; inspect metasim.log')
@@ -183,10 +222,12 @@ def run(args):
     subprocess.run([sys.executable, str(Path(__file__).with_name('check-snapshots.py')),
                     '--prefix', str(work/'l2perf'), '--window-id', '663202',
                     '--output', str(work/'l2perf-check.json')], check=True)
+    activity=backend_activity(json.loads((work/'l2perf.summary.json').read_text()))
     return {'status': 'passed', 'design': args.design, 'target': args.target, 'lanes': lanes,
             'harts': 4, 'saturn_harts': 4, 'dual_array_rounds': 8 if args.design == 'B' else 0,
             'int8_array_rounds': PROFILES[args.design]['int8_rounds'],
             'fp32_array_rounds': PROFILES[args.design]['fp32_rounds'],
+            'backend_activity': activity,
             'completed_launches': completed, 'rtl': evidence(generated / 'FireSim-generated.sv'),
             'driver_header': evidence(generated / 'FireSim-generated.const.h'),
             'metasimulator': evidence(simulator), 'scheduler': evidence(model), 'firmware': evidence(elf)}

@@ -86,8 +86,8 @@ class L2PerfMSHRSpec extends AnyFlatSpec with ChiselScalatestTester {
         d.io.schedule.valid.expect(true.B); d.io.schedule.ready.poke(true.B); d.clock.step()
         d.io.schedule.ready.poke(false.B)
       }
-      def grant(denied:Boolean=false): Unit = {
-        d.io.sinkd.bits.denied.poke(denied.B); d.io.sinkd.valid.poke(true.B)
+      def grant(denied:Boolean=false,last:Boolean=true): Unit = {
+        d.io.sinkd.bits.denied.poke(denied.B); d.io.sinkd.bits.last.poke(last.B); d.io.sinkd.valid.poke(true.B)
         d.clock.step(); d.io.sinkd.valid.poke(false.B)
       }
 
@@ -96,7 +96,12 @@ class L2PerfMSHRSpec extends AnyFlatSpec with ChiselScalatestTester {
       perf.classified.expect(true.B); perf.hit.expect(false.B); perf.upgrade.expect(false.B)
       perf.hitProbe.expect(false.B); perf.cleanReplacement.expect(false.B); commitPlan()
       perf.refillWait.expect(true.B); d.io.schedule.bits.a.valid.expect(true.B)
-      scheduleOnce(); grant(); perf.refillWait.expect(false.B)
+      for(_ <- 0 until 5) { perf.refillWait.expect(true.B); d.clock.step() }
+      scheduleOnce()
+      for(_ <- 0 until 7) { perf.refillWait.expect(true.B); d.clock.step() }
+      grant(last=false); perf.refillWait.expect(true.B)
+      for(_ <- 0 until 3) { perf.refillWait.expect(true.B); d.clock.step() }
+      grant(); perf.refillWait.expect(false.B)
       d.io.schedule.bits.d.valid.expect(true.B); d.io.schedule.bits.reload.expect(true.B)
       d.io.schedule.ready.poke(true.B)
       d.io.allocate.valid.poke(true.B); d.io.allocate.bits.repeat.poke(true.B)
@@ -115,12 +120,22 @@ class L2PerfMSHRSpec extends AnyFlatSpec with ChiselScalatestTester {
       d.io.schedule.bits.a.valid.expect(true.B); d.io.schedule.bits.a.bits.param.expect(2.U) // BtoT
       perf.refillWait.expect(true.B)
 
+      // AcquirePerm from the sole B owner upgrades permission without probing
+      // that requesting owner, and remains an execution-time tag hit.
+      reset(); d.io.allocate.bits.param.poke(2.U); d.io.allocate.bits.size.poke(7.U)
+      allocate(opcode=7,source=0); directory(hit=true,state=1,clients=1,tag=2)
+      perf.classified.expect(true.B); perf.hit.expect(true.B); perf.upgrade.expect(true.B)
+      perf.hitProbe.expect(false.B); commitPlan()
+      d.io.schedule.bits.a.valid.expect(true.B); d.io.schedule.bits.a.bits.param.expect(2.U)
+      d.io.schedule.bits.b.valid.expect(false.B)
+
       // A non-owning Get hits a line held TRUNK by the CPU and requires a child probe.
       reset(); allocate(); directory(hit=true,state=2,clients=1,tag=2)
       perf.hit.expect(true.B); perf.hitProbe.expect(true.B); perf.upgrade.expect(false.B); commitPlan()
       perf.probeWait.expect(true.B); d.io.schedule.bits.b.valid.expect(true.B)
       d.io.schedule.bits.b.bits.param.expect(1.U) // toB
       scheduleOnce()
+      for(_ <- 0 until 5) { perf.probeWait.expect(true.B); d.clock.step() }
       d.io.sinkc.bits.tag.poke(2.U); d.io.sinkc.bits.param.poke(0.U) // TtoB
       d.io.sinkc.valid.poke(true.B); d.clock.step(); d.io.sinkc.valid.poke(false.B)
       perf.probeWait.expect(false.B); perf.cleanReplacement.expect(false.B); perf.dirtyReplacement.expect(false.B)
@@ -142,6 +157,7 @@ class L2PerfMSHRSpec extends AnyFlatSpec with ChiselScalatestTester {
       d.clock.step(); d.io.schedule.ready.poke(false.B)
       perf.dirtyReplacement.expect(false.B) // exactly one eviction event
       perf.probeWait.expect(true.B)
+      for(_ <- 0 until 7) { perf.probeWait.expect(true.B); d.clock.step() }
       d.io.sinkc.bits.last.poke(true.B); d.io.sinkc.valid.poke(true.B); d.clock.step()
       d.io.sinkc.valid.poke(false.B); perf.probeWait.expect(false.B)
 

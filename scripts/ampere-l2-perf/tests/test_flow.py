@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -11,6 +12,10 @@ spec=importlib.util.spec_from_file_location('utilization',PKG/'check-utilization
 utilization=importlib.util.module_from_spec(spec);spec.loader.exec_module(utilization)
 spec=importlib.util.spec_from_file_location('snapshots',PKG/'check-snapshots.py')
 snapshots=importlib.util.module_from_spec(spec);spec.loader.exec_module(snapshots)
+spec=importlib.util.spec_from_file_location('smoke',PKG/'smoke.py')
+smoke=importlib.util.module_from_spec(spec);spec.loader.exec_module(smoke)
+spec=importlib.util.spec_from_file_location('set_experiments',PKG/'run-set-experiments.py')
+sets=importlib.util.module_from_spec(spec);spec.loader.exec_module(sets)
 
 class BuildGateTest(unittest.TestCase):
     def test_missing_and_failed_validation_cannot_build(self):
@@ -53,5 +58,62 @@ class BuildGateTest(unittest.TestCase):
         lookup['trafficgen_completed'].update(end=1,delta=1)
         lookup['instrumentation_errors']['end']=1
         with self.assertRaises(ValidationFailure):snapshots.check_interval(counters)
+
+    def test_interval_summary_must_match_frozen_raw_endpoints_and_schema(self):
+        schema={'schema_version':1,'counter_width':64,'counters':[
+            {'bank':0,'requester':'trafficgen','name':'accepted','unit':'transactions','gauge':False},
+            {'bank':0,'requester':'all','name':'outstanding','unit':'entries','gauge':True}]}
+        records={}
+        for sequence,cycle,accepted,outstanding in ((0,100,12,3),(1,200,19,2)):
+            records[sequence]=[]
+            for counter,value in zip(schema['counters'],(accepted,outstanding)):
+                records[sequence].append({'schema_version':'1','sequence':str(sequence),'window_id':'9',
+                    'target_cycle':str(cycle),'bank':'0','requester':counter['requester'],
+                    'counter':counter['name'],'unit':counter['unit'],
+                    'kind':'gauge' if counter['gauge'] else 'cumulative','value':str(value)})
+        interval={'window_id':9,'start_sequence':0,'end_sequence':1,'start_cycle':100,'end_cycle':200,
+                  'counters':[dict(schema['counters'][0],start=12,end=19,delta=7),
+                              dict(schema['counters'][1],start=3,end=2)]}
+        snapshots.check_raw_endpoints(interval,records,schema)
+        # A fabricated summary can retain correct delta arithmetic and still
+        # report the wrong absolute vectors; only binding raw endpoints catches it.
+        changed=copy.deepcopy(interval);changed['counters'][0].update(start=22,end=29)
+        with self.assertRaises(ValidationFailure):snapshots.check_raw_endpoints(changed,records,schema)
+        for field,value in (('start_cycle',101),('window_id',10),('end_sequence',2)):
+            changed=copy.deepcopy(interval);changed[field]=value
+            with self.assertRaises(ValidationFailure):snapshots.check_raw_endpoints(changed,records,schema)
+        for field,value in (('gauge',False),('unit','transactions'),('requester','rocket')):
+            changed=copy.deepcopy(interval);changed['counters'][1][field]=value
+            with self.assertRaises(ValidationFailure):snapshots.check_raw_endpoints(changed,records,schema)
+        changed=copy.deepcopy(records);changed[1][1]['kind']='cumulative'
+        with self.assertRaises(ValidationFailure):snapshots.check_raw_endpoints(interval,changed,schema)
+
+    def test_backend_coverage_requires_every_backend_and_correct_classification(self):
+        requesters=('rocket','saturn','gemmini_int8','trafficgen','other')
+        counters=[]
+        for requester in requesters:
+            for event,value in (('accepted',2),('completed',1),('tag_hits',1),('tag_misses',0)):
+                counters.append({'bank':0,'name':requester+'_'+event,'gauge':False,
+                                 'delta':value if requester!='other' else 0})
+        counters.extend([{'bank':0,'name':'tag_hits','gauge':False,'delta':4},
+                         {'bank':0,'name':'tag_misses','gauge':False,'delta':0}])
+        summary={'intervals':[{'kind':'window','counters':counters}]}
+        # Acceptance need not equal classification inside an arbitrary window.
+        self.assertEqual(len(smoke.backend_activity(summary)),4)
+        counters[-2]['delta']=5
+        with self.assertRaises(ValidationFailure):smoke.backend_activity(summary)
+        counters[-2]['delta']=4
+        next(c for c in counters if c['name']=='gemmini_int8_completed')['delta']=0
+        with self.assertRaises(ValidationFailure):smoke.backend_activity(summary)
+
+    def test_serialization_requires_a_measured_increase(self):
+        accepted='same_set_other_line_secondary_accepted'
+        blocked='same_set_other_line_secondary_blocked_cycles'
+        dispersed={accepted:10,blocked:20}
+        with self.assertRaises(ValidationFailure):sets.compare_serialization(dispersed,dict(dispersed))
+        with self.assertRaises(ValidationFailure):sets.compare_serialization(dispersed,{accepted:9,blocked:19})
+        result=sets.compare_serialization(dispersed,{accepted:11,blocked:0})
+        self.assertEqual(result[accepted]['increase'],1)
+        self.assertEqual(result[blocked]['increase'],-20)
 
 if __name__=='__main__':unittest.main()

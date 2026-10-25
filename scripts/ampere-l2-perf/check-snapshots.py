@@ -34,10 +34,50 @@ def check_interval(counters):
         require(int(values['instrumentation_errors']['start'])==int(values['instrumentation_errors']['end'])==0,
                 'Cache instrumentation reported an accounting error in bank'+str(bank))
 
+def identity(bank,requester,name):
+    return int(bank),requester,name
+
+def check_raw_endpoints(interval,records,schema):
+    """Bind JSON interval values to the independently emitted frozen CSV rows."""
+    descriptor_map={identity(c['bank'],c['requester'],c['name']):c for c in schema['counters']}
+    require(len(descriptor_map)==len(schema['counters']),'Duplicate schema counter identity')
+    require(schema['schema_version']==1 and schema['counter_width']==64,'Invalid counter schema')
+    endpoints={}
+    for endpoint in ('start','end'):
+        sequence=int(interval[endpoint+'_sequence'])
+        require(sequence in records,'Interval references missing raw snapshot sequence '+str(sequence))
+        rows=records[sequence]
+        require(rows and all(int(row['schema_version'])==schema['schema_version'] and
+                    int(row['sequence'])==sequence and int(row['window_id'])==int(interval['window_id']) and
+                    int(row['target_cycle'])==int(interval[endpoint+'_cycle']) for row in rows),
+                'Interval '+endpoint+' metadata differs from raw snapshot '+str(sequence))
+        by_identity={identity(row['bank'],row['requester'],row['counter']):row for row in rows}
+        require(len(by_identity)==len(rows) and by_identity.keys()==descriptor_map.keys(),
+                'Raw snapshot counter identities differ from schema')
+        for key,row in by_identity.items():
+            descriptor=descriptor_map[key]
+            require(type(descriptor['gauge']) is bool and row['unit']==descriptor['unit'] and
+                    row['kind']==('gauge' if descriptor['gauge'] else 'cumulative'),
+                    'Raw snapshot counter type/unit differs from schema: '+str(key))
+            require(0<=int(row['value'])<=MASK,'Raw value exceeds unsigned 64-bit range')
+        endpoints[endpoint]=by_identity
+    counters={identity(c['bank'],c['requester'],c['name']):c for c in interval['counters']}
+    require(len(counters)==len(interval['counters']) and counters.keys()==descriptor_map.keys(),
+            'Interval counter identities differ from raw snapshots/schema')
+    for key,counter in counters.items():
+        descriptor=descriptor_map[key]
+        require(type(counter['gauge']) is bool and counter['gauge']==descriptor['gauge'] and
+                counter['unit']==descriptor['unit'],'Interval counter type/unit differs from schema: '+str(key))
+        require(not counter['gauge'] or 'delta' not in counter,'Gauge must not have a cumulative delta')
+        for endpoint in ('start','end'):
+            require(int(counter[endpoint])==int(endpoints[endpoint][key]['value']),
+                    'Interval '+endpoint+' value differs from raw snapshot: '+str(key))
+
 def check(prefix, window_id):
     prefix=Path(prefix)
     raw=Path(str(prefix)+'.csv'); summary=Path(str(prefix)+'.summary.json')
     data=json.loads(summary.read_text())
+    schema_path=Path(str(prefix)+'.schema.json');schema=json.loads(schema_path.read_text())
     require(data['schema_version']==1 and data['complete'] and not data['errors'],
             'Incomplete/invalid marker collection')
     require(data['boundary_convention']=='[START,STOP)', 'Wrong boundary convention')
@@ -68,7 +108,14 @@ def check(prefix, window_id):
     require(sum(i['kind']=='window' for i in intervals)==1, 'Expected exactly one whole window')
     require(sum(i['kind']=='drain' for i in intervals)==1, 'Drain was not recorded separately')
     require(sum(i['kind']=='snapshot' for i in intervals)>=2, 'Intermediate snapshots missing')
+    sequences=sorted(records)
+    expected={(sequences[0],sequences[1],'snapshot'),(sequences[1],sequences[2],'snapshot'),
+              (sequences[0],sequences[3],'window'),(sequences[3],sequences[4],'drain')}
+    require(len(intervals)==len(expected) and
+            {(int(i['start_sequence']),int(i['end_sequence']),i['kind']) for i in intervals}==expected,
+            'Interval boundaries do not match the raw marker sequence')
     for interval in intervals:
+        check_raw_endpoints(interval,records,schema)
         require(int(interval['window_id'])==window_id, 'Interval identity mismatch')
         for counter in interval['counters']:
             if not counter['gauge']:
@@ -79,7 +126,7 @@ def check(prefix, window_id):
     require(int(window['start_cycle'])==cycles[0] and int(window['end_cycle'])==cycles[3],
             'Whole-window boundaries changed by intermediate snapshots')
     return {'status':'passed','window_id':window_id,'markers':kinds,'target_cycles':cycles,
-            'counters_per_snapshot':len(vectors[0]),'raw':evidence(raw),'summary':evidence(summary)}
+            'counters_per_snapshot':len(vectors[0]),'raw':evidence(raw),'summary':evidence(summary),'schema':evidence(schema_path)}
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)

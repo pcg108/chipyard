@@ -28,7 +28,7 @@ private class L2PerfMemoryGate(implicit p: Parameters) extends LazyModule {
 }
 
 private class L2PerfHarness(enabled: Boolean)(implicit p: Parameters) extends LazyModule {
-  val names = Seq("Core 0 DCache", "Core 0 Vector Load", "stream-reader", "trafficgenmem0")
+  val names = Seq("Core 0 DCache", "Core 0 Vector Load", "stream-reader", "trafficgenmem0", "serial_tl_test")
   val clients = names.zipWithIndex.map { case (name, i) =>
     TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters(
       name = name, sourceId = IdRange(0, 8),
@@ -78,8 +78,8 @@ private class L2PerfHarness(enabled: Boolean)(implicit p: Parameters) extends La
     val outerCFirst = IO(Output(Bool()))
     val (inner, ei) = cacheInput.in.head
     val (outer, eo) = cacheOutput.out.head
-    innerAFirst := inner.a.fire && ei.first(inner.a)
-    innerDLast := inner.d.fire && ei.last(inner.d) && inner.d.bits.opcode =/= TLMessages.ReleaseAck
+    innerAFirst := inner.a.fire && ei.first(inner.a) && inner.a.bits.opcode =/= TLMessages.Hint
+    innerDLast := inner.d.fire && ei.last(inner.d) && inner.d.bits.opcode =/= TLMessages.ReleaseAck && inner.d.bits.opcode =/= TLMessages.HintAck
     outerAFirst := outer.a.fire && eo.first(outer.a)
     outerDData := outer.d.fire && eo.hasData(outer.d.bits)
     outerCData := outer.c.fire && eo.hasData(outer.c.bits)
@@ -102,6 +102,21 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       var independentAccepted=0L; var independentCompleted=0L
       var independentRefills=0L; var independentRefillBeats=0L
       var independentWritebacks=0L; var independentWritebackBeats=0L
+      var independentProbes=0L
+      val requesterNames=Seq("rocket","saturn","gemmini_int8","trafficgen","other")
+      val acceptedByClient=Array.fill(d.client.size)(BigInt(0))
+      val completedByClient=Array.fill(d.client.size)(BigInt(0))
+      val expectedOpcode=Array.fill(8)(BigInt(0))
+      val aRemaining=Array.fill(d.client.size)(0)
+      val dRemaining=Array.fill(d.client.size)(0)
+      var expectedRequestedBytes=BigInt(0)
+      var expectedHintAccepted=BigInt(0); var expectedHintCompleted=BigInt(0)
+      var expectedOutstandingIntegral=BigInt(0)
+      var simultaneousAcceptComplete=0
+      val activeSources=mutable.Set.empty[(Int,Int)]
+      val cpuAcquires=mutable.Map.empty[Int,BigInt]
+      val cpuPermissions=mutable.Map.empty[BigInt,Int] // Grant param: toT=0, toB=1
+      var holdProbeResponses=false
       val responses = mutable.ArrayBuffer.empty[(Int,Int,Int,BigInt)]
       val probePending = mutable.Queue.empty[(Int,BigInt)]
       var coherentDirty = false
@@ -126,27 +141,60 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       d.control.a.bits.mask.poke(255.U)
       d.blockMemoryA.poke(false.B); d.blockMemoryD.poke(false.B)
       var grantAck: Option[BigInt] = None
-      var grantBeats=0
       var ctrlResponses=0
       var ctrlData=BigInt(0)
       var markerRecords=Vector.empty[(Int,BigInt,BigInt,BigInt)]
       def step(): Unit = {
+        val outstandingBefore=acceptedByClient.sum-completedByClient.sum
+        expectedOutstandingIntegral+=outstandingBefore
         val cpu=d.client(0)
         cpu.e.valid.poke(grantAck.nonEmpty.B); cpu.e.bits.sink.poke(grantAck.getOrElse(BigInt(0)).U)
-        if (probeActive.isEmpty && probePending.nonEmpty) { probeActive=Some(probePending.dequeue()); cBeat=0 }
+        if (!holdProbeResponses && probeActive.isEmpty && probePending.nonEmpty) { probeActive=Some(probePending.dequeue()); cBeat=0 }
         cpu.c.valid.poke(probeActive.nonEmpty.B)
         probeActive.foreach { case (param,addr) =>
           val dirty=coherentDirty && addr==coherentLine
           cpu.c.bits.opcode.poke((if(dirty) 5 else 4).U)
-          cpu.c.bits.param.poke((if(coherentDirty) 1 else 2).U) // TtoN / BtoN
+          val permission=cpuPermissions.getOrElse(addr,2)
+          val report=if(permission==0) { if(param==2)1 else if(param==1)0 else 3 }
+            else if(permission==1) { if(param==2)2 else 4 } else 5
+          cpu.c.bits.param.poke(report.U)
           cpu.c.bits.address.poke(addr.U); cpu.c.bits.size.poke(7.U)
           cpu.c.bits.data.poke(dirtyData.U)
         }
         if(cpu.e.valid.peek().litToBoolean && cpu.e.ready.peek().litToBoolean) grantAck=None
-        if(cpu.b.valid.peek().litToBoolean) probePending.enqueue((cpu.b.bits.param.peek().litValue.toInt,cpu.b.bits.address.peek().litValue))
+        if(cpu.b.valid.peek().litToBoolean && cpu.b.ready.peek().litToBoolean) {
+          independentProbes+=1
+          probePending.enqueue((cpu.b.bits.param.peek().litValue.toInt,cpu.b.bits.address.peek().litValue))
+        }
         if(cpu.c.valid.peek().litToBoolean && cpu.c.ready.peek().litToBoolean) {
+          val (param,addr)=probeActive.get
+          val dirty=coherentDirty && addr==coherentLine
           cBeat+=1
-          if(!coherentDirty || cBeat==4) { probeActive=None;coherentDirty=false }
+          if(!dirty || cBeat==4) {
+            if(param==2)cpuPermissions.remove(addr)
+            else if(param==1 && cpuPermissions.contains(addr))cpuPermissions(addr)=1
+            if(dirty)coherentDirty=false
+            probeActive=None
+          }
+        }
+        // Software packet tracking uses only handshakes at the named client ports.
+        // It is independent of Scheduler/MSHR event increment expressions.
+        d.client.zipWithIndex.foreach { case(b,i) =>
+          if(b.a.valid.peek().litToBoolean && b.a.ready.peek().litToBoolean) {
+            val op=b.a.bits.opcode.peek().litValue.toInt
+            val size=b.a.bits.size.peek().litValue.toInt
+            if(aRemaining(i)==0) {
+              val source=b.a.bits.source.peek().litValue.toInt
+              assert(!activeSources((i,source)),s"Client $i reused source $source before completion")
+              activeSources.add((i,source))
+              val bytes=BigInt(1)<<size
+              if(op==5)expectedHintAccepted+=1
+              else { acceptedByClient(i)+=1;expectedOpcode(op)+=1;expectedRequestedBytes+=bytes }
+              aRemaining(i)=if(op<=3)math.max(1,(1<<size)/32)-1 else 0
+              if(i==0 && (op==6 || op==7))cpuAcquires(b.a.bits.source.peek().litValue.toInt)=b.a.bits.address.peek().litValue
+              transcript += ((cycle,-i-1,BigInt(op),b.a.bits.address.peek().litValue))
+            } else aRemaining(i)-=1
+          }
         }
         if(d.innerAFirst.peek().litToBoolean) independentAccepted+=1
         if(d.innerDLast.peek().litToBoolean) independentCompleted+=1
@@ -154,7 +202,10 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         if(d.outerDData.peek().litToBoolean) independentRefillBeats+=1
         if(d.outerCFirst.peek().litToBoolean) independentWritebacks+=1
         if(d.outerCData.peek().litToBoolean) independentWritebackBeats+=1
+        if(d.innerAFirst.peek().litToBoolean && d.innerDLast.peek().litToBoolean)simultaneousAcceptComplete+=1
         if(enabled) {
+          d.perf.banks(0).events(L2PerfEvents.index("outstanding_requests")).expect(outstandingBefore.U)
+          d.perf.banks(0).events(L2PerfEvents.index("outstanding_request_entry_cycles")).expect(outstandingBefore.U)
           L2PerfEvents.descriptors.zipWithIndex.foreach { case (desc,i) =>
             val value=d.perf.banks(0).events(i).peek().litValue
             val key=s"${desc.requester}:${desc.name}"
@@ -168,11 +219,18 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
             val opcode=b.d.bits.opcode.peek().litValue.toInt
             val src=b.d.bits.source.peek().litValue.toInt
             val data=b.d.bits.data.peek().litValue
-            responses += ((i,src,opcode,data)); transcript += ((cycle,i,BigInt(opcode),data))
+            val metadata=BigInt(opcode)|(BigInt(src)<<8)|(b.d.bits.param.peek().litValue<<16)|(b.d.bits.size.peek().litValue<<24)|(b.d.bits.sink.peek().litValue<<32)
+            responses += ((i,src,opcode,data)); transcript += ((cycle,i,metadata,data))
             assert(!b.d.bits.denied.peek().litToBoolean && !b.d.bits.corrupt.peek().litToBoolean)
-            if(opcode==4 || opcode==5) {
-              grantBeats+=1
-              if(opcode==4 || grantBeats==4) { grantAck=Some(b.d.bits.sink.peek().litValue);grantBeats=0 }
+            val responseBeats=if(opcode==1 || opcode==5)math.max(1,(1<<b.d.bits.size.peek().litValue.toInt)/32) else 1
+            val last=if(dRemaining(i)==0) { dRemaining(i)=responseBeats-1;responseBeats==1 }
+              else { dRemaining(i)-=1;dRemaining(i)==0 }
+            if(last && opcode!=6)assert(activeSources.remove((i,src)),s"Unexpected response for client $i source $src")
+            if(last && opcode==2)expectedHintCompleted+=1
+            if(last && opcode!=2 && opcode!=6)completedByClient(i)+=1
+            if((opcode==4 || opcode==5) && last) {
+              grantAck=Some(b.d.bits.sink.peek().litValue)
+              cpuPermissions(cpuAcquires.remove(src).get)=b.d.bits.param.peek().litValue.toInt
             }
           }
         }
@@ -213,6 +271,23 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         until(b.a.ready.peek().litToBoolean);step();b.a.valid.poke(false.B)
         until(ctrlResponses>n);ctrlData
       }
+      def total(name:String):BigInt=counts("all:"+name)
+      // After the backing response/probe is deliberately held, these occupancies
+      // follow from the independent outstanding requests in this directed phase.
+      def steady(cycles:Int,outstanding:Int,mshrs:Int,queued:Int,refills:Int,probes:Int=0):Unit={
+        val increments=Seq("outstanding_request_entry_cycles"->outstanding,
+          "normal_mshr_entry_cycles"->mshrs,"secondary_queue_entry_cycles"->queued,
+          "refill_wait_entry_cycles"->refills,"probe_wait_entry_cycles"->probes)
+        val before=increments.map {case(n,_)=>n->total(n)}.toMap
+        for(_ <- 0 until cycles) {
+          if(enabled)Seq("outstanding_requests"->outstanding,"normal_mshr_occupancy"->mshrs,
+            "secondary_queue_occupancy"->queued).foreach {case(n,v)=>
+              d.perf.banks(0).events(L2PerfEvents.index(n)).expect(v.U)
+            }
+          step()
+        }
+        if(enabled)increments.foreach {case(n,v)=>assert(total(n)-before(n)==BigInt(cycles)*v,s"Incorrect settled $n integral")}
+      }
       idle(32)
       // A cold Put, partial update, and repeated Gets have independently known outcomes.
       val initial=BigInt("77"*32,16)
@@ -223,11 +298,29 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       val merged=BigInt("77"*16+"aa"*16,16)
       assert(txn(1,4,0x400).head._4==merged)
       assert(txn(3,4,0x400).head._4==merged)
+      assert(txn(4,4,0x400).head._4==merged)
       assert(independentRefills==before)
       if(enabled) {
         assert(counts("all:tag_misses")==1,"A cold Put must be classified as a miss")
-        assert(counts("all:tag_hits")==3,"Partial write and repeated Gets must hit the allocated line")
+        assert(counts("all:tag_hits")==4,"Partial write and repeated Gets must hit the allocated line")
+        requesterNames.foreach { r =>
+          val expectedMiss=if(r=="trafficgen")1 else 0
+          val expectedHit=if(r=="rocket")0 else 1
+          assert(counts(s"$r:${r}_tag_misses")==expectedMiss,s"Wrong first-phase miss attribution to $r")
+          assert(counts(s"$r:${r}_tag_hits")==expectedHit,s"Wrong first-phase hit attribution to $r")
+        }
       }
+      // Keep a warm-line request stream active across responses, reusing each
+      // source only after its previous response. This exercises simultaneous
+      // request/completion updates and validates source reuse independently.
+      val burstBase=responses.size
+      for(i <- 0 until 24) {
+        val source=i%8
+        until(!activeSources((3,source)))
+        send(3,4,0x400,source=source)
+      }
+      until(responses.size>=burstBase+24);idle(16)
+      assert(responses.drop(burstBase).forall(_._4==merged))
       // Four-beat write counts as one demand, not four.
       val writeBase=responses.size
       (0 until 4).foreach(i=>send(2,0,0x800,size=7,data=BigInt(i+1)))
@@ -236,37 +329,80 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       // Logical atomic swap uses the existing allocated line.
       txn(2,3,0x800,size=3,param=3,data=42,mask=255)
       assert((txn(3,4,0x800).head._4 & ((BigInt(1)<<64)-1))==42)
-      // Hold backing D while requests for equal and colliding sets accumulate.
+      val old=txn(2,2,0x800,size=3,param=4,data=5,mask=255).head._4 // Arithmetic ADD
+      assert((old & ((BigInt(1)<<64)-1))==42)
+      assert((txn(3,4,0x800).head._4 & ((BigInt(1)<<64)-1))==47)
+      assert(txn(4,5,0x800,size=7).head._3==2) // HintAck is not demand completion
+      // AcquirePerm returns a one-beat Grant and a subsequent non-owner Get must
+      // wait for an actual child probe. Hold that response for a known interval.
+      val cpuHitsBefore=counts("rocket:rocket_tag_hits")
+      assert(txn(0,7,0x800,size=7,param=1).head._3==4)
+      if(enabled)assert(counts("rocket:rocket_tag_hits")==cpuHitsBefore+1)
+      holdProbeResponses=true
+      val probeBase=responses.size;val probeHitsBefore=total("hits_requiring_child_probes")
+      send(3,4,0x800)
+      until(probePending.nonEmpty);idle(4)
+      steady(13,outstanding=1,mshrs=1,queued=0,refills=0,probes=1)
+      holdProbeResponses=false;until(responses.size>probeBase);idle(20)
+      assert((responses(probeBase)._4 & ((BigInt(1)<<64)-1))==47)
+      if(enabled)assert(total("hits_requiring_child_probes")==probeHitsBefore+1)
+      // Hold backing D in an initially unused set (no dirty victim acknowledgement
+      // can block the first outer acquire) while equal/colliding requests accumulate.
       d.blockMemoryD.poke(true.B)
-      val queuedBase=responses.size
-      send(3,4,0x1000,source=0); send(1,4,0x1000,source=1)
-      send(2,4,0x1200,source=2); send(3,4,0x1400,source=3)
-      idle(50);d.blockMemoryD.poke(false.B)
-      until(responses.size>=queuedBase+4);idle(32)
-      // Fill the shared queue behind a blocked refill. The source remains valid
-      // when the cache stops accepting it; release backing memory after 160 cycles.
-      d.blockMemoryD.poke(true.B)
-      val pressureBase=responses.size
-      val pressure=d.client(3)
-      var nextSource=0
-      for(tick <- 0 until 160) {
-        pressure.a.valid.poke((nextSource<8).B)
-        pressure.a.bits.opcode.poke(4.U);pressure.a.bits.size.poke(5.U)
-        pressure.a.bits.source.poke((nextSource%8).U)
-        pressure.a.bits.address.poke((0x4000+nextSource*512).U)
-        val accepted=nextSource<8 && pressure.a.ready.peek().litToBoolean
-        step();if(accepted)nextSource+=1
+      val queuedBase=responses.size;val refillBase=independentRefills
+      val sameBefore=total("same_line_secondary_accepted");val otherBefore=total("same_set_other_line_secondary_accepted")
+      send(3,4,0x1080,source=0);until(independentRefills>refillBase);idle(8)
+      steady(9,outstanding=1,mshrs=1,queued=0,refills=1)
+      send(1,4,0x1080,source=1);idle(8)
+      if(enabled) {
+        assert(total("same_line_secondary_accepted")==sameBefore+1)
+        assert(total("same_set_other_line_secondary_accepted")==otherBefore)
       }
-      pressure.a.valid.poke(false.B);d.blockMemoryD.poke(false.B)
-      while(nextSource<8){send(3,4,0x4000+nextSource*512,source=nextSource);nextSource+=1}
-      until(responses.size>=pressureBase+8);idle(32)
+      steady(11,outstanding=2,mshrs=1,queued=1,refills=1)
+      send(2,4,0x1280,source=2);idle(8)
+      if(enabled) {
+        assert(total("same_line_secondary_accepted")==sameBefore+1)
+        assert(total("same_set_other_line_secondary_accepted")==otherBefore+1)
+      }
+      steady(7,outstanding=3,mshrs=1,queued=2,refills=1)
+      d.blockMemoryD.poke(false.B)
+      until(responses.size>=queuedBase+3);idle(32)
+      // Fill the queue twice: the held sixth request is first a different line,
+      // then the active line. This independently distinguishes both blocked labels.
+      for(sameBlocked <- Seq(false,true)) {
+        d.blockMemoryD.poke(true.B)
+        val pressureBase=responses.size
+        val base=if(sameBlocked)0x7000 else 0x4000
+        val sameBlockedBefore=total("same_line_secondary_blocked_cycles")
+        val otherBlockedBefore=total("same_set_other_line_secondary_blocked_cycles")
+        val pressure=d.client(3)
+        def address(source:Int)=if(sameBlocked && source==5)base else base+source*512
+        var nextSource=0
+        for(tick <- 0 until 160) {
+          pressure.a.valid.poke((nextSource<8).B)
+          pressure.a.bits.opcode.poke(4.U);pressure.a.bits.size.poke(5.U)
+          pressure.a.bits.source.poke((nextSource%8).U)
+          pressure.a.bits.address.poke(address(nextSource).U)
+          val accepted=nextSource<8 && pressure.a.ready.peek().litToBoolean
+          step();if(accepted)nextSource+=1
+        }
+        if(enabled) {
+          val sameDelta=total("same_line_secondary_blocked_cycles")-sameBlockedBefore
+          val otherDelta=total("same_set_other_line_secondary_blocked_cycles")-otherBlockedBefore
+          assert(if(sameBlocked)sameDelta>0 && otherDelta==0 else otherDelta>0 && sameDelta==0,
+            s"Incorrect blocked conflict class: same=$sameDelta other=$otherDelta")
+        }
+        pressure.a.valid.poke(false.B);d.blockMemoryD.poke(false.B)
+        while(nextSource<8){send(3,4,address(nextSource),source=nextSource);nextSource+=1}
+        until(responses.size>=pressureBase+8);idle(32)
+      }
       // Independent clients issue concurrently, then stop accepting D to back up the cache.
       d.client.foreach(_.d.ready.poke(false.B)); d.blockMemoryA.poke(true.B)
       d.client.zipWithIndex.foreach {case(b,i)=>
         b.a.bits.opcode.poke(4.U);b.a.bits.size.poke(5.U);b.a.bits.source.poke(0.U)
         b.a.bits.address.poke((0x2000+i*128).U);b.a.bits.mask.poke("hffffffff".U);b.a.valid.poke(true.B)
       }
-      var waiting=Set(0,1,2,3);val parallelBase=responses.size
+      var waiting=d.client.indices.toSet;val parallelBase=responses.size
       var parallelCycles=0
       while(waiting.nonEmpty && parallelCycles<1000){
         if(parallelCycles==40)d.blockMemoryA.poke(false.B)
@@ -277,7 +413,7 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       }
       assert(waiting.isEmpty,"Parallel requests did not progress after releasing backpressure")
       d.blockMemoryA.poke(false.B);d.client.foreach(_.d.ready.poke(true.B))
-      until(responses.size>=parallelBase+4);idle(32)
+      until(responses.size>=parallelBase+d.client.size);idle(32)
       // A child acquires write permission and returns dirty data only after a replacement probe.
       txn(0,6,0x3000,size=7,param=1);coherentDirty=true;coherentLine=0x3000
       val dirtyBeforeChild=counts("all:dirty_replacements")
@@ -297,10 +433,21 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         // Counter names are resolved by semantic descriptors, not internal increment expressions.
         def count(name:String,requester:String="all")=counts(s"$requester:$name")
         def gauge(name:String)=gauges(s"all:$name")
-        // Additional family assertions below are filled once schema names are finalized.
         assert(count("instrumentation_errors")==0)
         assert(Seq("demand_get","demand_put","demand_acquire_block","demand_acquire_perm","demand_atomic","demand_other").map(count(_)).sum==independentAccepted)
+        assert(acceptedByClient.sum==independentAccepted && completedByClient.sum==independentCompleted)
+        assert(count("demand_get")==expectedOpcode(4))
+        assert(count("demand_put")==expectedOpcode(0)+expectedOpcode(1))
+        assert(count("demand_atomic")==expectedOpcode(2)+expectedOpcode(3))
+        assert(count("demand_acquire_block")==expectedOpcode(6))
+        assert(count("demand_acquire_perm")==expectedOpcode(7))
+        assert(count("demand_other")==0)
+        assert(count("demand_requested_bytes")==expectedRequestedBytes)
+        assert(count("hint_accepted")==expectedHintAccepted && expectedHintAccepted==1)
+        assert(count("hint_completed")==expectedHintCompleted && expectedHintCompleted==1)
         assert(count("demand_completed")==independentCompleted)
+        assert(count("outstanding_request_entry_cycles")==expectedOutstandingIntegral)
+        assert(simultaneousAcceptComplete>0,"The scenario must exercise simultaneous accepted request and completion")
         assert(count("tag_hits")+count("tag_misses")==independentAccepted)
         assert(count("refill_transactions")==independentRefills)
         assert(count("refill_data_bytes")==independentRefillBeats*32)
@@ -310,7 +457,7 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         assert(count("same_line_secondary_accepted")>0)
         assert(count("same_set_other_line_secondary_accepted")>0)
         assert(count("dirty_replacements")>0)
-        assert(count("probes_sent")>0)
+        assert(count("probes_sent")==independentProbes && independentProbes>0)
         assert(count("flush_invalidations")==1)
         assert(count("normal_mshr_full_cycles")>0)
         assert(count("normal_mshr_allocation_stall_cycles")>0)
@@ -320,7 +467,12 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         val classes=Seq("rocket","saturn","gemmini_int8","trafficgen","other")
         assert(classes.map(c=>count(s"${c}_accepted",c)).sum==independentAccepted)
         assert(classes.map(c=>count(s"${c}_completed",c)).sum==independentCompleted)
-        classes.take(4).foreach(c=>assert(count(s"${c}_accepted",c)>0,s"Missing requester $c"))
+        classes.zipWithIndex.foreach {case(c,i)=>
+          assert(count(s"${c}_accepted",c)==acceptedByClient(i),s"Wrong accepted attribution to $c")
+          assert(count(s"${c}_completed",c)==completedByClient(i),s"Wrong completion attribution to $c")
+          assert(count(s"${c}_tag_hits",c)+count(s"${c}_tag_misses",c)==acceptedByClient(i),s"Wrong outcome attribution to $c")
+          assert(acceptedByClient(i)>0,s"Missing requester $c")
+        }
         ctrlWrite32(0x100,0x23456789L);ctrlWrite32(0x104,1)
         ctrlWrite(0x108,1);assert(ctrlRead(0x118)==1)
         ctrlWrite(0x108,2);ctrlWrite(0x108,2)

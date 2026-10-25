@@ -40,7 +40,7 @@ def main():
     shutil.copy2(Path(__file__).with_name('l2_perf.h'),out/'l2_perf.h')
     prefix=ROOT/'.conda-env/riscv-tools/bin/riscv64-unknown-elf-'
     cc=str(prefix)+'gcc'
-    flags=['-march=rv64gcv','-mabi=lp64d','-mcmodel=medany','-O2','-fno-common','-fno-builtin',
+    flags=['-march=rv64gcv','-mabi=lp64d','-mcmodel=medany','-O2','-fno-tree-vectorize','-fno-common','-fno-builtin',
            '-I'+str(bare),'-I'+str(hello),'-I'+str(out),'-DTRAFFICGEN_TEST_CASE=1',
            '-DTRAFFICGEN_SINGLE_REGISTRY_ID=1106']
     commands=[]; objects=[]

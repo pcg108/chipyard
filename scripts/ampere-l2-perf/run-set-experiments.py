@@ -67,7 +67,7 @@ int main(void) {
     bare=ROOT/'software/firemarshal/test/bare';hello=ROOT/'scripts/trafficgen/workloads/trafficgen-hello'
     cc=str(ROOT/'.conda-env/riscv-tools/bin/riscv64-unknown-elf-gcc')
     elf=out/'sets.elf'
-    command=[cc,'-march=rv64gcv','-mabi=lp64d','-mcmodel=medany','-O2','-fno-common','-fno-builtin',
+    command=[cc,'-march=rv64gcv','-mabi=lp64d','-mcmodel=medany','-O2','-fno-tree-vectorize','-fno-common','-fno-builtin',
       '-I'+str(bare),'-I'+str(hello),'-I'+str(Path(__file__).parent),'-T',str(bare/'link.ld'),
       '-static','-nostdlib','-nostartfiles',str(c),str(bare/'crt.S'),str(bare/'syscalls.c'),'-lgcc','-o',str(elf)]
     subprocess.run(command,check=True)
@@ -111,6 +111,20 @@ def metrics(prefix):
             totals[counter['name']]=totals.get(counter['name'],0)+int(counter['delta'])
     return totals
 
+def compare_serialization(dispersed,colliding):
+    # Same-set/different-line events may be either accepted into the shared
+    # queue or blocked while it is full. Keep event counts and bank-cycle counts
+    # separate; they are not quantities that can be added together.
+    names=('same_set_other_line_secondary_accepted','same_set_other_line_secondary_blocked_cycles')
+    require(all(name in dispersed and name in colliding for name in names),
+            'Missing same-set serialization counters')
+    comparison={name:{'dispersed':dispersed[name],'colliding':colliding[name],
+                      'increase':colliding[name]-dispersed[name]} for name in names}
+    require(any(value['increase']>0 for value in comparison.values()),
+            'Concurrent colliding sets did not increase accepted secondary conflicts or blocked bank-cycles '
+            'over the matched dispersed workload: '+json.dumps(comparison,sort_keys=True))
+    return comparison
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--work',type=Path,required=True);p.add_argument('--model',type=Path,required=True)
@@ -135,11 +149,9 @@ def main():
                 'Set conflicts did not increase TrafficGen misses')
         require(good['trafficgen_tag_hits']>bad['trafficgen_tag_hits'],
                 'Dispersed locality did not increase TrafficGen hits')
-    concurrent=runs['concurrent-colliding']['metrics']
-    require(concurrent['same_set_other_line_secondary_accepted']>0 or
-            concurrent['same_set_other_line_secondary_blocked_cycles']>0,
-            'Concurrent collision run did not exercise set serialization')
-    save(a.work/'result.json',{'status':'passed','runs':runs,'address_geometry':
+    comparison=compare_serialization(runs['concurrent-dispersed']['metrics'],
+                                     runs['concurrent-colliding']['metrics'])
+    save(a.work/'result.json',{'status':'passed','runs':runs,'serialization_comparison':comparison,'address_geometry':
         {'line_bytes':128,'banks':16,'sets_per_bank':128,'working_lines_per_bank_per_cta':32}})
 
 if __name__=='__main__':main()

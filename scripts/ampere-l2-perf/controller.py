@@ -27,7 +27,7 @@ def stages(w,model,model_root):
                                               'result':str(result) if result else None}
     result=[stage('preflight',py+[PKG/'preflight.py','--work',w,'--model',model,'--model-root',model_root],w/'results/preflight.json'),
       stage('flow-tests',py+['-m','unittest','discover','-s',PKG/'tests','-v']),
-      stage('focused-rtl',env+['sbt','chipyard/testOnly chipyard.example.L2PerfSpec chipyard.example.L2PerfAccumulatorSpec chipyard.example.L2PerfMSHRSpec']),
+      stage('focused-rtl',env+['sbt','chipyard/testOnly chipyard.example.L2PerfSpec chipyard.example.L2PerfAccumulatorSpec chipyard.example.L2PerfMSHRSpec chipyard.example.L2PerfArraySpec']),
       stage('bridge-collector',env+['bash',PKG/'collector-test.sh',w/'results/bridge-collector']),
       stage('processor-fix-regressions',env+[sys.executable,ROOT/'tests/rtl_fixes/run.py','--suite','all',
            '--work',w/'results/processor-fixes','--jobs','4','--guarded-child'],w/'results/processor-fixes/summary-all.json')]
@@ -125,6 +125,10 @@ def run(args):
         state.update(values,updated_at=datetime.now(timezone.utc).isoformat(),
                      controller_pid=os.getpid(),controller_elapsed_seconds=time.monotonic()-started)
         save(status_path,state)
+    # Historical failure evidence remains in stage/archive records. The live
+    # top-level fields describe this explicit restart, not the previous attempt.
+    for stale in ('error','action','failure_classification','exit_code','guard','diagnostics'):
+        state.pop(stale,None)
     update(status='running')
     os.environ['L2_PERF_WORK']=str(w)
     try:
@@ -195,7 +199,7 @@ def run(args):
                 totals=re.findall(r'Total number of tests run:\s*(\d+)',text)
                 require(totals and sum(map(int,totals))>0 and 'All tests passed.' in text,
                         'No verified passing Scala tests in '+str(log))
-                required_suites=['L2PerfSpec','L2PerfAccumulatorSpec','L2PerfMSHRSpec'] if name=='focused-rtl' else [
+                required_suites=['L2PerfSpec','L2PerfAccumulatorSpec','L2PerfMSHRSpec','L2PerfArraySpec'] if name=='focused-rtl' else [
                     'TrafficGenLineOwnershipSpec','TrafficGenTargetCycleSpec','TrafficGenLaunchSlotsSpec','TrafficGenTLControlSpec']
                 require(all(re.search(r'\b'+suite+r':',text) for suite in required_suites),
                         'A required RTL suite was not executed: '+str(log))
