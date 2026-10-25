@@ -133,4 +133,9 @@ void l2perf_t::finish() {
   failed = failed || !collector.errors.empty();
   write_summary(); csv.flush();
   for (const auto &error : collector.errors) std::cerr << "L2Perf: " << error << '\n';
+  if (!csv) throw std::runtime_error("L2Perf CSV write failed during finish");
+  // FireSim captures simulation_run()'s exit code before calling bridge finish().
+  // Setting failed alone would let a missing final boundary print PASSED/exit 0.
+  // Preserve the final summary and CSV first, then propagate failure explicitly.
+  if (failed) throw std::runtime_error("L2Perf final collection failed; see " + prefix + ".summary.json");
 }

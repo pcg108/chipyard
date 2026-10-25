@@ -125,5 +125,32 @@ int main(int argc, char **argv) {
   after_reset = record(6, l2perf::DRAIN_END, 6, 1, 0);
   after_reset.marker_sequence = 3; idle_reset.accept(after_reset);
   idle_reset.finish(); assert(idle_reset.complete());
-  std::cout << "PASS L2Perf real driver: frozen indexed/split reads, snapshots, wrap, gauge, drain, repeated/empty windows, missing/invalid/reset/lost records\n";
+  // FireSim does not re-read bridge exit codes after finish(). Therefore missing
+  // final boundaries must throw from the real driver's finish, after preserving
+  // the final evidence, even if no tick-time hardware error occurred.
+  for (bool include_stop : {false, true}) {
+    Mock incomplete;
+    incomplete.records = {record(0, l2perf::START, 0, 0, 0)};
+    if (include_stop) incomplete.records.push_back(record(1, l2perf::STOP, 4, 3, 1));
+    const std::string output = std::string(argv[1]) +
+        (include_stop ? "-missing-drain" : "-missing-stop");
+    l2perf_t unfinished(incomplete, incomplete.mmio, 0,
+        {std::string("+l2perf-output0=") + output}, counters);
+    unfinished.init();
+    assert(unfinished.exit_code() == 0 && !unfinished.terminate());
+    bool propagated = false;
+    try { unfinished.finish(); }
+    catch (const std::runtime_error &error) {
+      propagated = std::string(error.what()).find("final collection failed") != std::string::npos;
+    }
+    assert(propagated && unfinished.terminate() && unfinished.exit_code() != 0);
+    assert(incomplete.head == incomplete.records.size());
+    std::ifstream failure_summary(output + ".summary.json");
+    const std::string evidence((std::istreambuf_iterator<char>(failure_summary)), {});
+    assert(evidence.find("\"finished\":true") != std::string::npos);
+    assert(evidence.find("\"complete\":false") != std::string::npos);
+    assert(evidence.find(include_stop ? "drain window missing DRAIN_END" :
+                                        "measurement window missing STOP") != std::string::npos);
+  }
+  std::cout << "PASS L2Perf real driver: frozen indexed/split reads, snapshots, wrap, gauge, drain, repeated/empty windows, missing/invalid/reset/lost records and final-boundary failure propagation\n";
 }
