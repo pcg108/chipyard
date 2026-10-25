@@ -52,6 +52,32 @@ def archive_source(out,work):
             records.append(item)
     save(out/'source-repositories.json',records)
 
+def archive_completed_telemetry(status,destination):
+    """The packaging guard cannot finish until this process has returned."""
+    destination.mkdir()
+    included=[];excluded=[]
+    for name,entry in status['stages'].items():
+        if name=='package':
+            excluded.append({'stage':name,'observed_status':entry.get('status'),
+              'guard':entry.get('guard'),
+              'reason':'Packaging is still executing; its final guard result does not exist yet.'})
+            continue
+        if 'guard' not in entry:continue
+        require(entry.get('status')=='passed','Cannot package incomplete prior-stage telemetry: '+name)
+        guard=Path(entry['guard'])
+        # A completed prior stage must have both files. Missing evidence remains
+        # a hard error instead of silently omitting measurements.
+        for filename in ('guard-result.json','memory.jsonl'):
+            require((guard/filename).is_file(),'Missing completed-stage telemetry: '+str(guard/filename))
+        target=destination/name;target.mkdir()
+        for filename in ('guard-result.json','memory.jsonl'):
+            shutil.copy2(guard/filename,target/filename)
+        included.append(name)
+    save(destination/'collection.json',{'included_completed_stages':included,
+      'excluded_stages':excluded,'packaging_final_telemetry_included':False,
+      'final_controller_status_path':'control/status.json',
+      'note':'The workspace controller writes final packaging telemetry after this package returns.'})
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--work',type=Path,required=True)
     a=p.parse_args();w=a.work.resolve();out=w/'deliverables'
@@ -121,12 +147,7 @@ def main():
         if name!='package' and entry.get('status')=='passed' and 'log' in entry:
             shutil.copy2(entry['log'],validation_logs/(name+'.log'))
     shutil.copy2(w/'results/processor-fixes/summary-all.json',out/'validation/processor-fixes-summary.json')
-    telemetry=out/'resource-records';telemetry.mkdir()
-    for name,entry in status['stages'].items():
-        if 'guard' not in entry:continue
-        dest=telemetry/name;dest.mkdir()
-        for file in ('guard-result.json','memory.jsonl'):
-            shutil.copy2(Path(entry['guard'])/file,dest/file)
+    archive_completed_telemetry(status,out/'resource-records')
     patches=out/'source-patches';patches.mkdir()
     (patches/'chipyard.patch').write_bytes(subprocess.check_output(['git','-C',str(ROOT),'diff','--binary','HEAD']))
     for entry in submodule_records(ROOT):
@@ -145,7 +166,9 @@ def main():
     save(out/'hardware.json',record)
     (out/'README.txt').write_text('Ampere L2 performance-counter U250 image, physical30MHz / modeled500MHz.\n'
       'Four Rockets, four Saturns, one INT8Gemmini on hart0/custom2,16TrafficGen lanes.\n'
-      'No FPGA was programmed by this experiment. See hardware.json and final-reports.json for acceptance evidence.\n\n'
+      'No FPGA was programmed by this experiment. See hardware.json and final-reports.json for acceptance evidence.\n'
+      'controller-status.json is the status captured during packaging; resource-records contains completed prior stages.\n'
+      'The packaging guard finishes after archive creation and is intentionally excluded; see resource-records/collection.json.\n\n'
       'The source-manifest records actual checked-out commits, including manually cloned submodules.\n'
       'source-bundles contains self-contained HEAD histories for Chipyard and components changed since the baseline.\n'
       'To recover a bundled repository: git init DEST; git -C DEST fetch /absolute/PATH.bundle HEAD;\n'
