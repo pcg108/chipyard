@@ -380,7 +380,7 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
         var nextSource=0
         for(tick <- 0 until 160) {
           pressure.a.valid.poke((nextSource<8).B)
-          pressure.a.bits.opcode.poke(4.U);pressure.a.bits.size.poke(5.U)
+          pressure.a.bits.opcode.poke(4.U);pressure.a.bits.param.poke(0.U);pressure.a.bits.size.poke(5.U)
           pressure.a.bits.source.poke((nextSource%8).U)
           pressure.a.bits.address.poke(address(nextSource).U)
           val accepted=nextSource<8 && pressure.a.ready.peek().litToBoolean
@@ -399,7 +399,7 @@ class L2PerfSpec extends AnyFlatSpec with ChiselScalatestTester {
       // Independent clients issue concurrently, then stop accepting D to back up the cache.
       d.client.foreach(_.d.ready.poke(false.B)); d.blockMemoryA.poke(true.B)
       d.client.zipWithIndex.foreach {case(b,i)=>
-        b.a.bits.opcode.poke(4.U);b.a.bits.size.poke(5.U);b.a.bits.source.poke(0.U)
+        b.a.bits.opcode.poke(4.U);b.a.bits.param.poke(0.U);b.a.bits.size.poke(5.U);b.a.bits.source.poke(0.U)
         b.a.bits.address.poke((0x2000+i*128).U);b.a.bits.mask.poke("hffffffff".U);b.a.valid.poke(true.B)
       }
       var waiting=d.client.indices.toSet;val parallelBase=responses.size
