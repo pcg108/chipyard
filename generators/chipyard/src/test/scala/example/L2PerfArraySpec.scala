@@ -95,7 +95,7 @@ class L2PerfArraySpec extends AnyFlatSpec with ChiselScalatestTester {
     val outer=TLClientPortParameters(Seq(TLClientParameters(
       name="L2",sourceId=IdRange(0,8),supportsProbe=line)))
     InclusiveCacheParameters(
-      CacheParameters(level=2,ways=2,sets=4,blockBytes=128,beatBytes=32),
+      CacheParameters(level=2,ways=2,sets=4,blockBytes=128,beatBytes=32,hintsSkipProbe=false),
       InclusiveCacheMicroParameters(writeBytes=8,memCycles=8,portFactor=4), control=true,
       new TLEdgeIn(inner,managers(RegionType.CACHED),p,UnlocatableSourceInfo),
       new TLEdgeOut(outer,managers(RegionType.UNCACHED),p,UnlocatableSourceInfo))
